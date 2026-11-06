@@ -705,6 +705,11 @@ void *dm_game_menu(void) {
 
 #pragma mark - entry point
 
+// The shared app's game framework (build_app.py DM_FRAMEWORK_ONLY) compiles this file only for the
+// in-game menu above: the shell shows its own settings before Play, and ShellGlue.m has its
+// dm_show_launcher.
+#ifndef NSPB_SHELL_FRAMEWORK
+
 // A capture IPA (the run-time shader capture done on the device instead of a Mac) sets
 // DM_GLSLC_CAPTURE / DM_VK_CAPTURE / DM_GL_CAPTURE in its dm/env.txt to a folder relative to
 // Documents, which is the working directory at that point. The Vulkan and GL captures write
@@ -758,3 +763,4 @@ bool dm_show_launcher(void *view_controller, void (*done)(void)) {
     fprintf(stderr, "launcher: %lu settings shown\n", (unsigned long)settings.count);
     return true;
 }
+#endif  // NSPB_SHELL_FRAMEWORK

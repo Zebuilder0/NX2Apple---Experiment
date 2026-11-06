@@ -1,0 +1,5 @@
+# The Impactor commit the Windows launcher's signing tool (plumesign.exe) is built from: build-qt.yml clones it, checks the
+# commit, applies hardening.patch and runs `cargo build -p plumesign --release --locked --target x86_64-pc-windows-gnu`.
+repo	https://github.com/claration/impactor
+version	2.7.2
+commit	b13d99559febd63e3710dfdd0ef8cdd78d10ae13

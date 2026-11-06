@@ -115,6 +115,7 @@ The upstream file is never edited, so the daily sync cannot conflict with this w
 | `which`, `python3`, `ctypes.CDLL(None)` | `sitecustomize.py` rewrites them at the subprocess boundary |
 | app icon via `actool` | Pillow, five sizes |
 | `codesign` ad-hoc + entitlements | skipped, since the sideloader re-signs the IPA anyway |
+| `build_shell.sh` (the shared app) | the app comes ready-made in the zip, games go in as frameworks, `plumesign` signs (see [Install on an iPhone or iPad](#install-on-an-iphone-or-ipad-the-shared-app)) |
 | the IPA's Unix `x` bit | `win/fix_ipa_modes.py` rewrites the zip's central directory in place |
 
 ## What you need to install
@@ -262,6 +263,48 @@ broken IPA:
 Games whose shaders are in the RomFS — Mario Wonder, Odyssey, Mario Kart 8 Deluxe, the Zelda
 titles, Metroid Dread — do not need any of that.
 
+## Install on an iPhone or iPad (the shared app)
+
+With **Shared app** chosen, a Windows build works like the Mac launcher's **iPhone / iPad** target: the game goes into
+one app on the device that holds all your games, signed with your own Apple ID, with no sideloader to run by hand.
+
+**Once:** Settings → Device dependencies (also in the setup) has four rows for it, all optional for building:
+
+| Row | What it is | What you do |
+|---|---|---|
+| Apple device service (iTunes) | Apple Mobile Device Support, the USB service every iPhone tool on Windows needs | **Get iTunes** opens Apple's page. Install iTunes from apple.com, not the Microsoft Store. Plug the device in and tap Trust |
+| Signing tool (Impactor) | `tools\plumesign.exe`, built from [Impactor](https://github.com/claration/impactor) with [our patch](impactor/README.md) | Nothing, the zip carries it |
+| Apple ID for signing | Impactor's own session in `%APPDATA%\PlumeImpactor` | **Sign in…** opens Impactor's console window: Apple ID, password (hidden), code. The launcher never sees the password. **Sign out** removes the session |
+| Shared app (ready-made) | `shell\DmShell.app`, the empty app built on GitHub's macOS runner (`tools/build_shell_template.sh`) | Nothing, the zip carries it |
+
+On the device, turn on Developer Mode once (Settings → Privacy & Security) when iOS asks after the first install.
+
+**Each build:** the game is built as `DmGame<title ID>.framework` (`--shell-framework`, `win/build_app.py`
+`DM_FRAMEWORK_ONLY`: the same compile, linked as a dylib with its own engine host), its data is packed as before, then
+`device_model.py` runs `win/install.py`:
+
+1. copy the empty app and put every built game's framework into its `Frameworks/` (`shell.py`, games listed in
+   `shell.json` in the shell cache folder, the Mac launcher's format),
+2. `plumesign sign --apple-id --udid <device> --register-and-install`: signs the app and the frameworks, registers the
+   device, asks Apple for Increased Memory Limit (the app's executable requests it), installs over USB
+   (`win/signer.py`, every line of its output is redacted before it reaches the log),
+3. copy the game data the device lacks into the app's `Documents/games/<title ID>/` (`win/device.py`: usbmuxd,
+   lockdownd, house_arrest and AFC, standard library only), through a `.part` file renamed at the end.
+
+The bundle ID is `org.nxnative.shell.<team ID>` every time, so installing again keeps the saves and the game data.
+
+**Update launcher:** the same button (it says **Update launcher** once the device has the app) signs and installs the
+app again without a build, with every game in it. With **Update the launcher when a device connects** on (Settings,
+the default), a device that has the app from this PC is signed and installed again by itself when it is plugged in
+and the signature is 5 days old (a free Apple ID's lasts 7) or the games changed. The Mac launcher has the same switch.
+
+**Export IPA** in the same card packs the shared app with every game, unsigned, for AltStore, SideStore or another tool.
+**One game, all inside** is unchanged.
+
+Limits: an Apple ID with several developer teams makes `plumesign` ask which one, which the launcher cannot answer.
+A free Apple ID allows 3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here was tried on a
+device from this fork yet: `tests/test_device_install.py` runs the whole install against a pretend device.
+
 ## Run a build
 
 ```bat
@@ -270,7 +313,7 @@ python -m nspb_qt.win.driver D:\Games\MarioWonder -k D:\keys\prod.keys
 
 The options are the upstream script's (`-h`). The IPA is unsigned, as on a Mac: sign it with
 Sideloadly (Windows), AltStore, or similar, and enable the Increased Memory Limit capability if
-the tool offers it. The IPA name and the RomFS archive come out where the macOS build puts them.
+the tool offers it. In the app, **Shared app** signs and installs for you instead (above). The IPA name and the RomFS archive come out where the macOS build puts them.
 
 ## Open risks
 

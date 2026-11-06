@@ -24,6 +24,7 @@ struct SettingsPage: View {
     @AppStorage(ConsolePrompt.startKey) private var startInConsole = false   // ConsoleCoordinator.swift (#336)
     @AppStorage(BuildNotice.defaultsKey) private var notifyBuilds = true   // BuildNotifications.swift
     @AppStorage(ReturnAfterPlay.defaultsKey) private var returnAfterPlay = true   // ReturnAfterPlay.swift
+    @AppStorage(AutoResign.defaultsKey) private var autoUpdateLauncher = true   // LauncherView+AutoResign.swift
     @EnvironmentObject var loc: Localizer
 
     var body: some View {
@@ -37,7 +38,8 @@ struct SettingsPage: View {
             DiagnosticsButton(report: diagnostics, game: library.selected)
         }
         AppCard(updates: updates, buildRunning: build.running, notify: $notifyBuilds, notifyAvailable: BuildNotice.hasBundleID,
-                returnAfterPlay: $returnAfterPlay, onRunSetup: onRunSetup, uninstallPlan: uninstallPlan)
+                returnAfterPlay: $returnAfterPlay, autoUpdateLauncher: $autoUpdateLauncher, onRunSetup: onRunSetup,
+                uninstallPlan: uninstallPlan)
     }
 
     private func uninstallPlan() -> Uninstall.Plan {

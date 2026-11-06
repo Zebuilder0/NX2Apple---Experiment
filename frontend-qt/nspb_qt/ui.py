@@ -39,6 +39,7 @@ from .build_notes import TEXT, TITLE, stale_reason
 from .i18n import Lang
 from .model import Dep, DepState, Model
 from .sheets import CheatsDialog, DeleteGameDialog, FreeSpaceDialog, OnboardingDialog
+from .win.signer import redact as _redact
 from .widgets import (
     CardGroup,
     CardPageHeading,
@@ -217,6 +218,9 @@ class MainWindow(QMainWindow):
         self.m.appUpdateFound.connect(self._on_app_update)
         self.m.appRelaunching.connect(QApplication.quit)
         self.m.libraryChanged.connect(self._refresh_library)
+        self.m.devicesChanged.connect(self._refresh_install_card)
+        if pu.IS_WIN:
+            self.m.depsChanged.connect(self.m.refresh_devices)
 
         if self.m.log_path:
             self._append_log(self.m.t('log.at', str(self.m.log_path)) + '\n\n')
@@ -1069,6 +1073,43 @@ class MainWindow(QMainWindow):
         grp.add_row(r_kind)
         grp.add_divider()
 
+        # Windows, shared app: install on a connected device (device_model.py)
+        self.win_dev_container = QWidget()
+        wd_outer = QVBoxLayout(self.win_dev_container)
+        wd_outer.setContentsMargins(0, 0, 0, 0)
+        wd_outer.setSpacing(0)
+        r_dev = QWidget()
+        rd_lay = QHBoxLayout(r_dev)
+        rd_lay.setContentsMargins(18, 11, 18, 11)
+        rd_lay.setSpacing(10)
+        self.win_dev_dot = _dot(style.NEUTRAL_DOT)
+        rd_lay.addWidget(self.win_dev_dot)
+        wd_col = QVBoxLayout()
+        wd_col.setSpacing(3)
+        self.win_dev_title = QLabel(self.m.t('shell.modeInstall'))
+        self.win_dev_title.setObjectName('rowTitle')
+        self.win_dev_note = QLabel(self.m.t('win.install.note'))
+        self.win_dev_note.setObjectName('muted')
+        self.win_dev_note.setWordWrap(True)
+        wd_col.addWidget(self.win_dev_title)
+        wd_col.addWidget(self.win_dev_note)
+        rd_lay.addLayout(wd_col, 1)
+        self.win_dev_combo = QComboBox()
+        self.win_dev_combo.setObjectName('launcherDropdown')
+        self.win_dev_combo.setMinimumWidth(184)
+        self.win_dev_combo.currentIndexChanged.connect(self._on_win_device_changed)
+        rd_lay.addWidget(self.win_dev_combo)
+        self.win_dev_refresh_btn = QPushButton(self.m.t('dev.refresh'))
+        self.win_dev_refresh_btn.clicked.connect(self.m.refresh_devices)
+        rd_lay.addWidget(self.win_dev_refresh_btn)
+        self.win_install_btn = QPushButton(self.m.t('win.install.button'))
+        self.win_install_btn.setObjectName('creamPill')
+        self.win_install_btn.clicked.connect(lambda: self.m.install_on_device())
+        rd_lay.addWidget(self.win_install_btn)
+        wd_outer.addWidget(r_dev)
+        wd_outer.addWidget(make_divider())
+        grp.add_row(self.win_dev_container)
+
         # Step 1: Export IPA
         r_s1 = QWidget()
         rs1_lay = QHBoxLayout(r_s1)
@@ -1088,6 +1129,10 @@ class MainWindow(QMainWindow):
         self.step1_reveal_btn.clicked.connect(lambda: pu.reveal(self._effective_ipa_path()))
         self.step1_reveal_btn.hide()
         rs1_lay.addWidget(self.step1_reveal_btn)
+        self.win_export_btn = QPushButton(self.m.t('shell.step1Button'))   # Windows: the shared app with every game, unsigned
+        self.win_export_btn.clicked.connect(self._export_shell_ipa)
+        self.win_export_btn.hide()
+        rs1_lay.addWidget(self.win_export_btn)
         grp.add_row(r_s1)
         grp.add_divider()
 
@@ -1206,11 +1251,69 @@ class MainWindow(QMainWindow):
         self.drive_choose_btn.setText(self.m.t('shell.driveChoose'))
         self.drive_copy_btn.setText(self.m.t('shell.driveCopy'))
         self.step3_container.setVisible(not one)
+        self._refresh_win_device_row(one)
         arch_p = self._effective_archive_path()
         has_arch = bool(arch_p and os.path.isdir(arch_p))
         self.step3_open_romfs_btn.setToolTip(self.m.t('msg.archiveAt', arch_p) if has_arch else '')
         self.step3_open_romfs_btn.setVisible(has_arch)
         self.drive_copy_btn.setEnabled(has_arch)
+
+    def _refresh_win_device_row(self, one: bool) -> None:
+        """Windows, shared app: the device to install on, and Install or Update launcher."""
+        t = self.m.t
+        show = pu.IS_WIN and not one
+        self.win_dev_container.setVisible(show)
+        self.win_export_btn.setVisible(show)
+        if not show:
+            return
+        self.win_dev_title.setText(t('shell.modeInstall'))
+        self.win_dev_refresh_btn.setText(t('dev.refresh'))
+        self.win_export_btn.setText(t('shell.step1Button'))
+        self.win_dev_combo.blockSignals(True)
+        self.win_dev_combo.clear()
+        for d in self.m.devices:
+            self.win_dev_combo.addItem(self.m.device_label(d), d.udid)
+        idx = next((i for i, d in enumerate(self.m.devices) if d.udid == self.m.install_udid), 0)
+        if self.m.devices:
+            self.win_dev_combo.setCurrentIndex(idx)
+        else:
+            self.win_dev_combo.addItem(t('dev.none'), '')
+        self.win_dev_combo.blockSignals(False)
+        ready = self.m.device_install_ready
+        udid = self.m.install_udid if self.m.devices else ''
+        from .win import install as wi
+        state = wi.Devices(Path(self.m.shell_cache_path)).get(udid) if udid else None
+        self.win_install_btn.setText(t('win.install.update' if state and state.bundle else 'win.install.button'))
+        self.win_install_btn.setEnabled(ready and bool(udid) and not self.m.running)
+        if not ready:
+            note, dot = t('win.install.needsSetup'), style.AMBER
+        elif not self.m.devices:
+            note, dot = self.m.devices_note or t('win.devices.none'), style.NEUTRAL_DOT
+        elif state and state.signed:
+            import time as _time
+            note = t('win.install.signedAgo', _time.strftime('%Y-%m-%d', _time.localtime(state.signed)))
+            dot = style.GREEN
+        else:
+            note, dot = t('win.install.note'), style.GREEN
+        self.win_dev_note.setText(note)
+        _set_dot(self.win_dev_dot, dot)
+
+    def _on_win_device_changed(self, idx: int) -> None:
+        udid = self.win_dev_combo.itemData(idx)
+        if udid:
+            self.m.set_install_device(str(udid))
+            self._refresh_install_card()
+
+    def _export_shell_ipa(self) -> None:
+        start = os.path.join(self.m.out_dir or str(Path.home()), 'NX2Apple.ipa')
+        dest, _ = QFileDialog.getSaveFileName(self, self.m.t('win.export.title'), start, 'IPA (*.ipa)')
+        if not dest:
+            return
+        ok, msg = self.m.export_shell_ipa(dest)
+        self.footer.setText(msg)
+        self.m.log(msg + '\n')
+        if ok:
+            pu.reveal(dest)
 
     def _pick_drive_folder(self) -> None:
         d = QFileDialog.getExistingDirectory(self, self.m.t('shell.driveChoose'), self._drive_folder or str(Path.home()))
@@ -1601,7 +1704,7 @@ class MainWindow(QMainWindow):
             app_version=APP_VERSION,
             repo_path=self.m.repo_path,
             deps=self.m.deps,
-            last_log=self.log.toPlainText(),
+            last_log=_redact(self.log.toPlainText()),
         )
         cb = QApplication.clipboard()
         if cb:
@@ -1659,6 +1762,28 @@ class MainWindow(QMainWindow):
         rn_lay.addWidget(self.notif_switch)
         grp.add_row(r_notif)
         grp.add_divider()
+
+        # Row 2.5 (Windows): update the launcher when a device connects (device_model.py)
+        if pu.IS_WIN:
+            r_auto = QWidget()
+            ra_lay = QHBoxLayout(r_auto)
+            ra_lay.setContentsMargins(18, 12, 18, 12)
+            ra_lay.addWidget(_dot(style.NEUTRAL_DOT))
+            acol = QVBoxLayout()
+            acol.setSpacing(2)
+            self.auto_title_lbl = QLabel(self.m.t('settings.autoUpdateLauncher'))
+            self.auto_title_lbl.setObjectName('rowTitle')
+            self.auto_note_lbl = QLabel(self.m.t('win.settings.autoUpdateNote'))
+            self.auto_note_lbl.setObjectName('muted')
+            self.auto_note_lbl.setWordWrap(True)
+            acol.addWidget(self.auto_title_lbl)
+            acol.addWidget(self.auto_note_lbl)
+            ra_lay.addLayout(acol, 1)
+            self.auto_switch = LauncherSwitch(self.m.auto_update_launcher)
+            self.auto_switch.toggled.connect(self.m.set_auto_update_launcher)
+            ra_lay.addWidget(self.auto_switch)
+            grp.add_row(r_auto)
+            grp.add_divider()
 
         # Row 3: Run setup again (OnboardingDialog)
         r_setup = QWidget()
@@ -2019,6 +2144,14 @@ class MainWindow(QMainWindow):
             b.setEnabled(not d.installing)
             b.clicked.connect(lambda _=False, dep=d: self.m.install_dep(dep))
             r.addWidget(b)
+        elif d.id == 'amds' and not d.ok:
+            b = QPushButton(t('win.dep.amds.get'))
+            b.clicked.connect(self.m.open_itunes_page)
+            r.addWidget(b)
+        elif d.id == 'apple_id' and any(x.id == 'signer' and x.ok for x in self.m.deps):
+            b = QPushButton(t('win.dep.appleId.signOut' if d.ok else 'win.dep.appleId.signIn'))
+            b.clicked.connect(self.m.sign_out_apple_id if d.ok else self.m.sign_in_apple_id)
+            r.addWidget(b)
         elif not d.ok and d.id == 'xcode':
             b = QPushButton(t('dep.openAppStore'))
             b.clicked.connect(lambda: QDesktopServices.openUrl(
@@ -2032,7 +2165,8 @@ class MainWindow(QMainWindow):
             r.addWidget(pb)
         outer.addLayout(r)
 
-        guide_key = {'ios_sdk': 'dep.guide.iossdk', 'metal': 'dep.guide.metal'}.get(d.id)
+        guide_key = {'ios_sdk': 'dep.guide.iossdk', 'metal': 'dep.guide.metal',
+                     'apple_id': 'win.dep.appleId.guide'}.get(d.id)
         if not d.ok and guide_key:
             guide = QLabel(t(guide_key))
             guide.setObjectName('muted')

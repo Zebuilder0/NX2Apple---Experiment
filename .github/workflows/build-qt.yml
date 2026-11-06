@@ -20,8 +20,78 @@ permissions:
   contents: write
 
 jobs:
+  # The empty shared app the Windows launcher puts every game into and signs on the PC (frontend-qt/nspb_qt/shell.py).
+  # Its Swift (the frontend-ios package) compiles only with Xcode, so it is built here, unsigned, with an ad-hoc signature
+  # that carries the Increased Memory Limit request (frontend-qt/tools/build_shell_template.sh).
+  shell-template:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Engine (tools/engine.py sync)
+        run: python3 tools/engine.py -q sync
+      - name: XcodeGen and fontTools
+        run: |
+          command -v xcodegen || brew install xcodegen
+          python3 -m pip install --user --break-system-packages fonttools > /dev/null
+      - name: Build the empty shared app
+        run: |
+          frontend-qt/tools/build_shell_template.sh "$RUNNER_TEMP/shell"
+          tar -czf shell-template.tgz -C "$RUNNER_TEMP/shell" DmShell.app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shell-template
+          path: shell-template.tgz
+          if-no-files-found: error
+
+  # The signing tool: Impactor's plumesign at the commit frontend-qt/impactor/pin names, with frontend-qt/impactor/
+  # hardening.patch, built from source the way Impactor's own release builds it for Windows (mingw-w64, x86_64-pc-windows-gnu).
+  plumesign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Impactor at the pinned commit, with the patch
+        run: |
+          set -euo pipefail
+          repo=$(awk -F'\t' '$1 == "repo" {print $2}' frontend-qt/impactor/pin)
+          commit=$(awk -F'\t' '$1 == "commit" {print $2}' frontend-qt/impactor/pin)
+          git init -q impactor
+          git -C impactor fetch -q --depth 1 "$repo" "$commit"
+          git -C impactor checkout -q FETCH_HEAD
+          got=$(git -C impactor rev-parse HEAD)
+          [ "$got" = "$commit" ] || { echo "::error::Impactor is at $got, the pin says $commit"; exit 1; }
+          git -C impactor apply --check ../frontend-qt/impactor/hardening.patch
+          git -C impactor apply ../frontend-qt/impactor/hardening.patch
+          if grep -n 'danger_accept_invalid_certs(true)' impactor/3rdparty/omnisette/src/*.rs; then
+            echo "::error::the anisette clients still accept any certificate"; exit 1
+          fi
+      - name: Toolchain (mingw-w64, nasm, the Windows target)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mingw-w64 nasm
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build plumesign.exe
+        working-directory: impactor
+        run: |
+          cargo build -p plumesign --release --locked --target x86_64-pc-windows-gnu
+          mkdir -p ../plumesign-out
+          cp target/x86_64-pc-windows-gnu/release/plumesign.exe ../plumesign-out/
+          cp ../frontend-qt/impactor/LICENSE-impactor.txt ../frontend-qt/impactor/README.md ../plumesign-out/
+          sha256sum ../plumesign-out/plumesign.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plumesign
+          path: plumesign-out/
+          if-no-files-found: error
+
   build:
     runs-on: windows-latest
+    needs: [shell-template, plumesign]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -155,6 +225,11 @@ jobs:
             --hidden-import nspb_qt.win.build_app \
             --hidden-import nspb_qt.win.fix_ipa_modes \
             --hidden-import nspb_qt.win.doctor \
+            --hidden-import nspb_qt.win.device \
+            --hidden-import nspb_qt.win.signer \
+            --hidden-import nspb_qt.win.install \
+            --hidden-import nspb_qt.shell \
+            --hidden-import nspb_qt.device_model \
             --collect-data PySide6 \
             --hidden-import PySide6.QtCore \
             --hidden-import PySide6.QtGui \
@@ -217,11 +292,30 @@ jobs:
           done
           du -sh "NX2Apple" 2>/dev/null || true
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shell-template
+          path: artifacts/shell
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plumesign
+          path: artifacts/plumesign
+
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           cd frontend-qt/dist
           cp -r ../wheels "NX2Apple/wheels"
+          # Installing on an iPhone or iPad (frontend-qt/nspb_qt/shell.py, win/signer.py): the empty shared app and the
+          # signing tool, beside NX2Apple.exe, where the launcher looks for them
+          mkdir -p NX2Apple/shell NX2Apple/tools
+          tar -xzf ../../artifacts/shell/shell-template.tgz -C NX2Apple/shell
+          test -f NX2Apple/shell/DmShell.app/Info.plist
+          cp ../../artifacts/plumesign/plumesign.exe NX2Apple/tools/
+          cp ../../artifacts/plumesign/LICENSE-impactor.txt NX2Apple/tools/plumesign-LICENSE.txt
+          cp ../../artifacts/plumesign/README.md NX2Apple/tools/plumesign-README.md
+          NX2Apple/tools/plumesign.exe --help > /dev/null
           # The engine tree goes inside the app folder: the launcher finds it at
           # <exe_dir>/engine (and also at <exe_dir>/../engine) and skips the repo/sync route entirely.
           cp -r ../../engine-tree "NX2Apple/engine"

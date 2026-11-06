@@ -14,6 +14,11 @@ Same unsigned all-in-one IPA, without Xcode:
 `sips` → app icon            Pillow
 `codesign` ad-hoc + entitle  skipped, with a note: an unsigned IPA is re-signed by the
                               sideloader anyway, and there is no `codesign` here
+`DM_FRAMEWORK_ONLY=<folder>`  the shared app's game framework (route C, `--shell-framework`):
+                              the same compile, linked as `DmGame<title ID>.framework` (a
+                              dylib) with the sources `project-framework.yml`'s `DmShellGame`
+                              target lists, read from that file so an upstream change stops
+                              the build; `GameMenu.swift` is `ios/Launcher.m`'s ObjC port
 ============================  ============================================================
 
 The environment is the same one `build_ipa.sh` reads (`GAME`, `W`, `PATCHED`, `ROMFS`,
@@ -76,6 +81,79 @@ PACK_SKIPS = ('Payload/DmIOS.app/msl', 'Payload/DmIOS.app/aoc',
               'Payload/DmIOS.app/romfs', 'Payload/DmIOS.app/romfs.img',
               'Payload/DmIOS.app/romfs.id', 'Payload/DmIOS.app/html',
               'Payload/DmIOS.app/jit')
+
+
+MH_DYLIB = 6
+
+#: The `DmShellGame` sources (project-framework.yml) that are not compiled from their own file here:
+#: the host (`Gen/src`, `Gen/main/main.c`) comes from `host_sources()`, `Gen/embed.S` is generated,
+#: `Gen/framework/*` are resources, and the two Swift files are `ios/Launcher.m`'s in-game menu
+#: (`GameMenu.swift`, `dm_game_menu`) and the types it reads (`LauncherSettings.swift`).
+_FW_COVERED = {'Gen/embed.S', 'Gen/src', 'Gen/main/main.c',
+               'Sources/GameMenu.swift', 'Sources/LauncherSettings.swift'}
+
+
+def framework_sources(repo: Path) -> list[Path]:
+    """The ObjC sources of the shared app's game framework, as `project-framework.yml` lists them
+    for the `DmShellGame` target. A path this build does not know (a new Swift file, a new folder)
+    stops the build with the file to update, instead of a framework that misses a symbol."""
+    yml = repo / 'dm' / 'ios' / 'project-framework.yml'
+    try:
+        lines = yml.read_text(encoding='utf-8').splitlines()
+    except OSError as e:
+        die(f'cannot read {yml}: {e}')
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == '  DmShellGame:')
+    except StopIteration:
+        die(f'{yml} has no DmShellGame target: update framework_sources() in build_app.py')
+    out: list[Path] = []
+    in_sources = False
+    for ln in lines[start + 1:]:
+        if ln.strip() and not ln.startswith('    '):
+            break                                   # the next target or top-level key
+        if ln.startswith('    ') and not ln.startswith('     '):
+            in_sources = ln.strip() == 'sources:'
+            continue
+        m = re.match(r'\s*- path: (\S+)', ln)
+        if not (in_sources and m):
+            continue
+        rel = m.group(1)
+        if rel in _FW_COVERED or rel.startswith('Gen/framework/'):
+            continue
+        if rel.endswith('.m') and rel.split('/')[0] in ('Sources', 'framework'):
+            f = (repo / 'dm' / 'ios' / rel).resolve()
+            if not f.is_file():
+                die(f'{yml} lists {rel}, which does not exist')
+            out.append(f)
+            continue
+        die(f'{yml} lists {rel} for the game framework, which the Windows build does not compile: '
+            'update framework_sources() in frontend-qt/nspb_qt/win/build_app.py')
+    if not out:
+        die(f'{yml}: no sources found for DmShellGame: update framework_sources() in build_app.py')
+    return out
+
+
+def framework_info_plist(*, executable: str, bundle_id: str, name: str, version: str,
+                         sdk_ver: str, sdk_build: str, deployment: str) -> dict:
+    """The game framework's `Info.plist`: the keys Xcode writes for `DmShellGame`."""
+    return {
+        'CFBundleDevelopmentRegion': 'en',
+        'CFBundleExecutable': executable,
+        'CFBundleIdentifier': bundle_id,
+        'CFBundleInfoDictionaryVersion': '6.0',
+        'CFBundleName': executable,
+        'CFBundleDisplayName': name,
+        'CFBundlePackageType': 'FMWK',
+        'CFBundleShortVersionString': version,
+        'CFBundleVersion': version,
+        'CFBundleSupportedPlatforms': ['iPhoneOS'],
+        'DTPlatformName': 'iphoneos',
+        'DTPlatformVersion': sdk_ver,
+        'DTSDKName': f'iphoneos{sdk_ver}',
+        'DTSDKBuild': sdk_build,
+        'MinimumOSVersion': deployment,
+        'UIDeviceFamily': [1, 2],
+    }
 
 
 def _shader_lib_module(repo: Path):
@@ -385,12 +463,19 @@ _HOST_MAIN: Path | None = None
 
 def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: Path,
          deployment: str, embed_flags: list[str], rt_obj: Path | None,
-         lld_dir: Path | None, bundle_id: str = 'org.nxnative.app') -> None:
-    """Link the app, then prove the result is an arm64 iOS executable and sign its entitlements."""
-    entitle = os.environ.get('NSPB_ENTITLEMENTS', '1') != '0'
+         lld_dir: Path | None, bundle_id: str = 'org.nxnative.app',
+         dylib_install_name: str | None = None) -> None:
+    """Link the app, then prove the result is an arm64 iOS executable and sign its entitlements.
+
+    With `dylib_install_name` it links a framework's dylib instead: a framework holds no
+    entitlements (the shared app asks for them), so it gets only the linker's ad-hoc signature,
+    which the signing tool replaces with the player's."""
+    entitle = os.environ.get('NSPB_ENTITLEMENTS', '1') != '0' and not dylib_install_name
+    kind = (('-dynamiclib', f'-Wl,-install_name,{dylib_install_name}', '-Wl,-adhoc_codesign')
+            if dylib_install_name else ('-Wl,-rpath,@executable_path/Frameworks',))
     args = [str(clang), '-target', f'arm64-apple-ios{deployment}', '-isysroot', str(sdk),
             '-fuse-ld=lld', '-fobjc-arc', '-o', str(out), *map(str, objs),
-            '-Wl,-rpath,@executable_path/Frameworks', '-lobjc', '-lSystem',
+            *kind, '-lobjc', '-lSystem',
             *(('-Wl,-adhoc_codesign',) if entitle else ()),
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
     if rt_obj:
@@ -403,14 +488,14 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('link failed (see the linker output above)')
-    check_executable(out)
+    check_executable(out, MH_DYLIB if dylib_install_name else tc.MH_EXECUTE)
     if entitle:
         ents = {'com.apple.developer.kernel.increased-memory-limit': True}
         sig_n = macho_sign.sign(out, bundle_id, ents)
         t(f'sign: ad-hoc with Increased Memory Limit entitlement ({sig_n} B)')
 
 
-def check_executable(path: Path) -> None:
+def check_executable(path: Path, want: int = tc.MH_EXECUTE) -> None:
     """Reject a link output that is not a plain arm64 iOS executable.
 
     The reference implementation validates the same three properties, and they catch the two
@@ -424,8 +509,9 @@ def check_executable(path: Path) -> None:
         die(f'{path.name} is not 64-bit Mach-O (magic 0x{magic:08x})')
     if cputype != tc.CPU_TYPE_ARM64:
         die(f'{path.name} is not arm64 (cputype 0x{cputype:08x})')
-    if filetype != tc.MH_EXECUTE:
-        die(f'{path.name} is not an executable (filetype {filetype})')
+    if filetype != want:
+        die(f'{path.name} is not ' + ('a dylib' if want == MH_DYLIB else 'an executable')
+            + f' (filetype {filetype})')
     plat = tc.macho_platform(data)
     if plat is not None and plat != tc.PLATFORM_IOS:
         die(f'{path.name} targets platform {plat}, not iOS')
@@ -581,7 +667,21 @@ def main(argv: list[str] | None = None) -> int:
             name = py(repo / 'dm/tools/nacp.py', nacp)
         except SystemExit:
             die(f'no game name in {nacp} (set DM_DISPLAY_NAME)')
-    version = env.get('DM_APP_VERSION') or '1.0'
+    version = env.get('DM_APP_VERSION') or ''
+    # The shared app's game framework (route C): `--shell-framework <folder>` upstream, DM_FRAMEWORK_ONLY here
+    fw_only = env.get('DM_FRAMEWORK_ONLY') or ''
+    fw_name = f'DmGame{game.upper()}'
+    if not version and fw_only:
+        # build_ipa.sh's default: the packed version's display version, which the manifest and the
+        # game data's identity both carry
+        vnacp = romfs.parent / 'control.nacp'
+        if not vnacp.is_file():
+            vnacp = w / 'data/v0/control.nacp'
+        try:
+            version = py(repo / 'dm/tools/nacp.py', '--version', vnacp)
+        except SystemExit:
+            t(f'no display version in {vnacp}: the app version is 1.0')
+    version = version or '1.0'
     bundle_id = env.get('DM_BUNDLE_ID') or f'org.nxnative.{game.lower()}'
     show_fps = env.get('DM_SHOW_FPS', '0') in ('1', 'YES', 'yes', 'TRUE', 'true')
     lang = env.get('DM_LANG') or 'en-US'
@@ -651,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
 
     base = w / 'build/ios/win'
     gen, app = base / 'Gen', base / 'Payload/DmIOS.app'
+    if fw_only:
+        app = base / 'fw' / f'{fw_name}.framework'
     shutil.rmtree(app, ignore_errors=True)
     (gen / 'profile').mkdir(parents=True, exist_ok=True)
     app.mkdir(parents=True)
@@ -750,27 +852,37 @@ def main(argv: list[str] | None = None) -> int:
     if env.get('DM_ENV_FILE'):
         shutil.copy2(env['DM_ENV_FILE'], dmres / 'env.txt')
 
-    (dmres / 'font').mkdir()
-    font = tc.std_font() or die('no standard font: set STD_FONT to a TTF with broad Unicode '
-                                'coverage')
-    shutil.copy2(font, dmres / 'font/standard.ttf')
-    t(f'standard font: {font} (upstream copies macOS\'s Arial Unicode; Windows fonts have '
-      f'different CJK coverage)')
-    letter = tc.letter_font()
-    if not letter:
-        die('no bold TTF for the button icons: set LETTER_FONT')
-    py(repo / 'dm/tools/make_ext_font.py', dmres / 'font/nintendo_ext.ttf', letter)
+    if not fw_only:   # a game framework has no fonts: the shared app's dm/font serves every game (build_ipa.sh)
+        (dmres / 'font').mkdir()
+        font = tc.std_font() or die('no standard font: set STD_FONT to a TTF with broad Unicode '
+                                    'coverage')
+        shutil.copy2(font, dmres / 'font/standard.ttf')
+        t(f'standard font: {font} (upstream copies macOS\'s Arial Unicode; Windows fonts have '
+          f'different CJK coverage)')
+        letter = tc.letter_font()
+        if not letter:
+            die('no bold TTF for the button icons: set LETTER_FONT')
+        py(repo / 'dm/tools/make_ext_font.py', dmres / 'font/nintendo_ext.ttf', letter)
 
     # --- the source list and the compile
     global _HOST_MAIN
     _HOST_MAIN = (repo / 'dm/host/main.c').resolve()
     files, incs = host_sources(repo, gen / 'profile')
-    ios_sources = sorted((repo / 'dm/ios/Sources').glob('*.m'))
-    files += [p.resolve() for p in ios_sources]
+    if fw_only:
+        # DmShellGame's own list (ShellGlue.m stands in for main.m and Launcher.swift), and
+        # Launcher.m for GameMenu.swift's dm_game_menu (NSPB_SHELL_FRAMEWORK leaves its
+        # dm_show_launcher out: ShellGlue.m has the shell's)
+        files += framework_sources(repo)
+    else:
+        ios_sources = sorted((repo / 'dm/ios/Sources').glob('*.m'))
+        files += [p.resolve() for p in ios_sources]
     files.append((HERE / 'ios/Launcher.m').resolve())
     files.append(es.resolve())
     # our Launcher.m replaces Launcher.swift and adds no Swift file; nothing else to exclude
     frameworks = framework_list(sdk, files)
+    if fw_only and 'UserNotifications' not in frameworks and \
+            (sdk / 'System/Library/Frameworks/UserNotifications.framework').is_dir():
+        frameworks.append('UserNotifications')   # DmShellGame's OTHER_LDFLAGS
 
     rt_obj = None
     if compat_rt_needed(clang):
@@ -783,6 +895,18 @@ def main(argv: list[str] | None = None) -> int:
         if r.returncode:
             print(r.stderr, file=sys.stderr)
             die('compat_rt.c did not compile (it stands in for Darwin\'s compiler-rt)')
+
+    if fw_only:
+        objs = compile_all(clang, sdk, files, incs, base / 'obj', deployment,
+                           extra=['-DNSPB_SHELL_FRAMEWORK=1'])
+        link(clang, sdk, objs, frameworks, app / fw_name, deployment,
+             flags.split() if flags else [], rt_obj, lld_dir,
+             dylib_install_name=f'@rpath/{fw_name}.framework/{fw_name}')
+        return finish_framework(repo=repo, env=env, app=app, fw_only=Path(fw_only), fw_name=fw_name,
+                                game=game, name=name, version=version, pkg=pkg, mods=mods,
+                                patched=patched, romfs=romfs, marker=marker, msl_ios=msl_ios,
+                                msldir=msldir, chain=v, bundle_id=bundle_id, sdk_ver=sdk_ver,
+                                sdk_build=sdk_build, deployment=deployment)
 
     objs = compile_all(clang, sdk, files, incs, base / 'obj', deployment)
     link(clang, sdk, objs, frameworks, app / 'DmIOS', deployment,
@@ -847,6 +971,75 @@ def main(argv: list[str] | None = None) -> int:
     fixed = fix_ipa_modes.fix(out_ipa, ['Payload/DmIOS.app/DmIOS'])
     t(f'IPA modes: {fixed}')
     t(f'done: {out_ipa} ({out_ipa.stat().st_size / 2**30:.2f} GiB)')
+    return 0
+
+
+def finish_framework(*, repo: Path, env, app: Path, fw_only: Path, fw_name: str, game: str,
+                     name: str, version: str, pkg: str, mods: list[str], patched: Path,
+                     romfs: Path, marker: str, msl_ios: Path, msldir: str, chain: str,
+                     bundle_id: str, sdk_ver: str, sdk_build: str, deployment: str) -> int:
+    """The rest of build_ipa.sh's DM_FRAMEWORK_ONLY mode: the profile, the manifest and the
+    Info.plist into the linked framework, then its shader libraries and icon, and the whole
+    folder into `<fw_only>/DmGame<title ID>.framework` (replaced only once it is complete)."""
+    py(repo / 'dm/games/game.py', 'profile', game, app / 'profile.tsv')
+    copy_romfs = env.get('DM_COPY_ROMFS') or ('YES' if env.get('DM_FULL_ROMFS') else 'NO')
+    romfs_id = ''
+    if copy_romfs == 'NO' and romfs.is_file():
+        romfs_id = py(repo / 'dm/tools/romfs_image.py', '--identity', romfs, game, version, pkg or '')
+    nro = patched / 'nro.tsv'
+    py(repo / 'dm/ios/tools/gen_manifest.py', app / 'game.manifest.json', '--game', game,
+       '--name', name, '--display-version', version, '--package-version', pkg or '',
+       '--modules', ' '.join(mods), *(['--nro-table', nro] if nro.is_file() else []),
+       '--chain', f'b-{chain}', '--romfs-marker', marker, '--romfs-identity', romfs_id,
+       '--framework-name', fw_name, '--loader', 'FH')
+    with open(app / 'Info.plist', 'wb') as f:
+        plistlib.dump(framework_info_plist(executable=fw_name, bundle_id=f'{bundle_id}.game',
+                                           name=name, version=version, sdk_ver=sdk_ver,
+                                           sdk_build=sdk_build, deployment=deployment),
+                      f, fmt=plistlib.FMT_BINARY)
+    t(f'framework: {app.name} (modules {" ".join(mods)}, profile.tsv, game.manifest.json)')
+
+    fw_only.mkdir(parents=True, exist_ok=True)
+    out = fw_only / f'{fw_name}.framework'
+    tmp = fw_only / f'.{fw_name}.framework.tmp'
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(app, tmp)
+    # An NVN game's libraries may be the one file b-<chain>.img: it goes in as msl/<MSLDIR>.img,
+    # where the host reads it, as stage_resources.sh copies it into an app
+    lib = msl_ios / msldir
+    image = Path(str(lib) + '.img')
+    slib = _shader_lib_module(repo)
+    stamp = getattr(slib, 'STAMP', 'inputs.tsv') if slib is not None else 'inputs.tsv'
+    if image.is_file() and not (lib / stamp).is_file():   # shader_lib.view(): the image when the folder is gone
+        lib = image
+    (tmp / 'msl').mkdir()
+    if lib.is_file():
+        shutil.copy2(lib, tmp / 'msl' / f'{msldir}.img')
+    elif lib.is_dir():
+        shutil.copytree(lib, tmp / 'msl' / msldir)
+    else:
+        die(f'shader libraries {msl_ios / msldir}: not found')
+    # no pipeline archive (pso/): Apple's Windows Metal tools have no metal-tt, so the device
+    # builds the bases on its first start (driver.py forces DM_PSO_GPUS=none)
+    icon = Path(env.get('DM_ICON') or '')
+    if not icon.is_file():
+        icon = romfs.parent / 'icon.jpg'
+    if icon.is_file():
+        try:
+            from PIL import Image
+            Image.open(icon).convert('RGB').resize((512, 512), Image.LANCZOS).save(tmp / 'icon.png', 'PNG')
+        except Exception as e:      # Pillow missing or an unreadable icon: the library shows no art
+            t(f'no library icon: {e}')
+    import json
+    m = json.loads((tmp / 'game.manifest.json').read_text(encoding='utf-8'))
+    if m.get('framework_executable') != fw_name:
+        die(f'{tmp}/game.manifest.json does not name {fw_name}')
+    shutil.rmtree(out, ignore_errors=True)
+    if out.exists():
+        die(f'cannot replace {out} (a file in it is open?)')
+    os.replace(tmp, out)
+    size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
+    t(f'done: {out} ({size / 2**20:.0f} MB; the shared app embeds it)')
     return 0
 
 

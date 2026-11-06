@@ -621,6 +621,42 @@ class OnboardingDialog(QDialog):
                 grp.add_row(r)
             self.body_layout.addWidget(grp)
 
+            # Windows: what installing on an iPhone or iPad needs (device_model.py), optional
+            dev_rows = [d for d in self.m.deps if d.id in ('amds', 'signer', 'apple_id', 'shell_template')]
+            if pu.IS_WIN and dev_rows:
+                head = QLabel(self.m.t('win.setup.devices'))
+                head.setObjectName('muted')
+                self.body_layout.addWidget(head)
+                g2 = CardGroup()
+                for idx, d in enumerate(dev_rows):
+                    if idx > 0:
+                        g2.add_divider()
+                    r = QWidget()
+                    rl = QHBoxLayout(r)
+                    rl.setContentsMargins(18, 10, 18, 10)
+                    rl.addWidget(StatusDot(style.GREEN if d.ok else style.AMBER))
+                    tl = QLabel(self.m.t(d.title_key))
+                    tl.setObjectName('rowTitle')
+                    rl.addWidget(tl, 1)
+                    if d.id == 'amds' and not d.ok:
+                        b = QPushButton(self.m.t('win.dep.amds.get'))
+                        b.clicked.connect(self.m.open_itunes_page)
+                        rl.addWidget(b)
+                    elif d.id == 'apple_id' and not d.ok:
+                        b = QPushButton(self.m.t('win.dep.appleId.signIn'))
+                        b.clicked.connect(self.m.sign_in_apple_id)
+                        rl.addWidget(b)
+                    else:
+                        st = QLabel(self.m.t('onboarding.ready') if d.ok else self.m.t('onboarding.failed'))
+                        st.setObjectName('muted')
+                        rl.addWidget(st)
+                    g2.add_row(r)
+                self.body_layout.addWidget(g2)
+                note = QLabel(self.m.t('win.dep.appleId.guide'))
+                note.setObjectName('muted')
+                note.setWordWrap(True)
+                self.body_layout.addWidget(note)
+
             if any(not d.ok and d.install for d in self.m.deps):
                 ibtn = QPushButton(self.m.t('dep.installAll'))
                 ibtn.clicked.connect(self.m.install_all_missing)

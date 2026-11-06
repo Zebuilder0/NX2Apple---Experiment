@@ -17,6 +17,7 @@ from PySide6.QtCore import QSettings, Q_ARG, QMetaObject, QObject, Qt, QThread, 
 
 from . import app_update
 from . import build_failure as bf
+from .device_model import DeviceMixin
 from . import engine
 from . import input_staging
 from . import inputs
@@ -67,7 +68,7 @@ class Stage:
 
 # ---------------------------------------------------------------- the model
 
-class Model(QObject):
+class Model(QObject, DeviceMixin):
     """Everything the window reads, and every action it can take.
 
     Long work runs on a thread and reports through signals, so the window never blocks: Qt
@@ -83,6 +84,8 @@ class Model(QObject):
     appUpdateFound = Signal(str, str)     # tag, url
     appRelaunching = Signal()
     libraryChanged = Signal()
+    devicesChanged = Signal()             # Windows: the connected iPhones and iPads (device_model.py)
+    autoInstallRequested = Signal(str)    # Windows: a device to update the launcher on (its UDID)
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -151,6 +154,7 @@ class Model(QObject):
             self.log_path.write_text('', encoding='utf-8')
         except OSError:
             self.log_path = None
+        self._device_init()
 
     # ---- strings
 
@@ -660,6 +664,9 @@ class Model(QObject):
         if note := wtc.host_arch_note():
             out.append(Dep('host_arch', 'dep.hostArch', 'dep.hostArch.hint',
                            DepState.OK, note))
+        # Installing on an iPhone or iPad from this PC (device_model.py): optional rows, a build
+        # and the IPA export work without them
+        out.extend(self._device_rows())
         return out
 
 
@@ -1067,6 +1074,8 @@ class Model(QObject):
         if detail.startswith('dep.metal.other:'):
             _, got, tested = detail.split(':', 2)
             return self.t('dep.metal.other', got, tested)
+        if detail.startswith('win.dep.') and ' ' not in detail:   # the device rows' markers (device_model.py)
+            return self.t(detail)
         return detail
 
     def _clear_installing(self, dep: Dep) -> None:
@@ -1656,14 +1665,20 @@ class Model(QObject):
         # RomFS is inside it, so the archive step is skipped below.
         self.ipa_path = self.archive_path = self.mac_app_path = ''
         mac_app = self.target == 'mac-app'
+        self.effective_work_dir = work_dir if has_work_dir else str(Path(base_dir if folder is not None else input_dir, f'{tid_hex}_build'))
+        # Windows, shared app: the game's framework for the shared app (route C), which the
+        # install puts into the ready-made app and signs (device_model.py). The Mac launcher
+        # does the same with Xcode.
+        shell_fw = pu.IS_WIN and not mac_app and self.ipa_kind == 'shared'
         if mac_app:
             args += ['--platform', 'mac-app']
             self.mac_app_path = str(Path(self.out_dir or base_dir, f'{tid_hex}.app'))
             args += ['-o', self.mac_app_path]
+        elif shell_fw:
+            args += ['--shell-framework', str(Path(self.effective_work_dir, 'shell-framework'))]
         elif self.out_dir:
             self.ipa_path = str(Path(self.out_dir, f'{tid_hex}.ipa'))
             args += ['-o', self.ipa_path]
-        self.effective_work_dir = work_dir if has_work_dir else str(Path(base_dir if folder is not None else input_dir, f'{tid_hex}_build'))
         if self.bc_on_cpu and not mac_app:
             try:
                 Path(self.effective_work_dir).mkdir(parents=True, exist_ok=True)
@@ -1752,6 +1767,10 @@ class Model(QObject):
                 if self.ipa_kind == 'oneGame':
                     self._record_library_ios_completion()
                     self.finished.emit(True, self.t('shell.oneGameDone', self.ipa_path))
+                elif shell_fw:
+                    work_dir_ = self.effective_work_dir
+                    self.pack_archive(then=lambda ok_: self.after_framework_build(work_dir_, self.archive_path)
+                                      if ok_ else self.finished.emit(False, self.t('msg.archiveFailed')))
                 else:
                     self.pack_archive()
             else:
@@ -1820,6 +1839,7 @@ class Model(QObject):
                                  install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
+        self.cancel_install()
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
 
@@ -1862,7 +1882,9 @@ class Model(QObject):
 
     # ---- the archive step (what makes a 16 GB game installable)
 
-    def pack_archive(self) -> None:
+    def pack_archive(self, then: Callable[[bool], None] | None = None) -> None:
+        """Pack the game data next to the output (`romfs/romfs.img`). `then(ok)` replaces the
+        finished signal when more follows (the install of the shared app on Windows)."""
         work = getattr(self, 'effective_work_dir', '')
         extract = Path(work, 'extract')
         versions = []
@@ -1875,6 +1897,9 @@ class Model(QObject):
                     except ValueError:
                         pass
         if not versions:
+            if then:
+                then(True)
+                return
             self.finished.emit(True, self.t('msg.archiveSkipped', str(extract)))
             return
         ver_dir = versions[-1][1]
@@ -1928,6 +1953,9 @@ class Model(QObject):
             if ok:
                 self._record_library_ios_completion()
             self.stagesChanged.emit()
+            if then:
+                then(ok)
+                return
             self.finished.emit(ok, '' if ok else self.t('msg.archiveFailed'))
 
         threading.Thread(target=work_, daemon=True).start()

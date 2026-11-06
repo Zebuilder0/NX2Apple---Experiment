@@ -130,6 +130,7 @@ class Ld64Test(unittest.TestCase):
         for k in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'):
             os.environ.pop(k, None)
         os.environ['LOCALAPPDATA'] = str(self.root / 'local')
+        os.environ['PATH'] = str(self.root / 'no-tools')   # a clang or ld64.lld of this machine is not the test's
 
     def tearDown(self) -> None:
         self.env.stop()
@@ -255,6 +256,7 @@ class CheckAllTest(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ['LOCALAPPDATA'] = str(self.root / 'local')
         os.environ['ProgramFiles'] = str(self.root / 'PF')
+        os.environ['PATH'] = str(self.root / 'no-tools')   # a clang or ld64.lld of this machine is not the test's
         self.which = mock.patch.object(tc.shutil, 'which', return_value=None)
         self.which.start()
 
@@ -759,7 +761,13 @@ class DriverPatchTest(unittest.TestCase):
         self.assertTrue(self.mod.apple_silicon())
 
     def test_check_prereqs_raises_with_a_report(self) -> None:
-        with self.assertRaises(self.mod.BuildError) as ctx:
+        # a PC with no toolchain: this machine's own clang or ld64.lld on PATH is not the test's
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {'PATH': tmp, 'LOCALAPPDATA': tmp, 'ProgramFiles': tmp}), \
+                mock.patch.object(tc.shutil, 'which', return_value=None), \
+                self.assertRaises(self.mod.BuildError) as ctx:
+            for k in ('NSPB_LLVM_DIR', 'NSPB_IOS_SDK', 'NSPB_METAL_DIR', 'NSPB_TOOLCHAIN_JSON', 'ProgramFiles(x86)'):
+                os.environ.pop(k, None)
             self.mod.check_prereqs({}, Path('missing/dmsh_xlate'), mac=False)
         msg = str(ctx.exception)
         self.assertIn('missing on this PC', msg)

@@ -11,17 +11,19 @@ package struct AppCard: View {
     let notify: Binding<Bool>
     let notifyAvailable: Bool   // false without an app bundle, e.g. under swift run
     let returnAfterPlay: Binding<Bool>
+    let autoUpdateLauncher: Binding<Bool>?   // AutoResign: sign the app on a connected device again (nil: no row)
     let onRunSetup: (() -> Void)?   // the guided first-run setup, again (nil where there is none)
     let uninstallPlan: () -> Uninstall.Plan
     @EnvironmentObject var loc: Localizer
 
     package init(updates: AppUpdateStore, buildRunning: Bool, notify: Binding<Bool>, notifyAvailable: Bool, returnAfterPlay: Binding<Bool>,
-                 onRunSetup: (() -> Void)?, uninstallPlan: @escaping () -> Uninstall.Plan) {
+                 autoUpdateLauncher: Binding<Bool>? = nil, onRunSetup: (() -> Void)?, uninstallPlan: @escaping () -> Uninstall.Plan) {
         self.updates = updates
         self.buildRunning = buildRunning
         self.notify = notify
         self.notifyAvailable = notifyAvailable
         self.returnAfterPlay = returnAfterPlay
+        self.autoUpdateLauncher = autoUpdateLauncher
         self.onRunSetup = onRunSetup
         self.uninstallPlan = uninstallPlan
     }
@@ -72,6 +74,14 @@ package struct AppCard: View {
                     .padTarget("set.returnAfterPlay", scope: "main") { returnAfterPlay.wrappedValue.toggle() }
             }
             CardDivider()
+            if let autoUpdateLauncher {
+                // The shared app on a device connected by cable, signed and installed again before its profile runs out (AutoResign)
+                CardRow(loc.t("settings.autoUpdateLauncher"), detail: loc.t("settings.autoUpdateLauncherNote")) {
+                    Toggle("", isOn: autoUpdateLauncher).toggleStyle(LauncherSwitchStyle()).labelsHidden()
+                        .padTarget("set.autoUpdateLauncher", scope: "main") { autoUpdateLauncher.wrappedValue.toggle() }
+                }
+                CardDivider()
+            }
             CardRow("NX2Apple", detail: String(format: loc.t("app.version"), updates.version),
                 dot: updates.staged != nil ? LauncherPalette.ready : nil) {
                 if updates.busy { ProgressView().controlSize(.small) }

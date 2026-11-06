@@ -205,6 +205,7 @@ struct LauncherView: View {
         .onChange(of: repo.path) { _ in refreshArtwork(); if performStartupChecks { checkTools() } }
         // A clone, pull or update check has finished (the automatic pull at launch among them): the checkout may have moved
         .onReceive(repo.$busy.removeDuplicates().dropFirst()) { busy in if !busy && performStartupChecks { checkTools() } }
+        .onReceive(Self.autoResignTimer) { _ in if performStartupChecks { autoResignTick() } }   // LauncherView+AutoResign.swift
         .onReceive(engine.$syncing.removeDuplicates().dropFirst()) { syncing in if !syncing && performStartupChecks { checkTools() } }   // a sync made or moved the engine (its HEAD is what ToolsAge compares)
         .onChange(of: library.selectedID) { _ in resignNote = nil }   // the last re-sign's note belongs to its game
         .onChange(of: buildProgress) { progress in if m.running { DockProgress.update(progress) } }
@@ -652,6 +653,7 @@ struct LauncherView: View {
         m.resignOnDevice(app: game.iosAppPath, device: game.installedDevice) {
             resignNote = m.doneNote
             signatureExpiry[game.id] = AppSignature.expiration(ofApp: game.iosAppPath, runner: stores.runner)
+            readSignatures()   // the games of the shared app share its profile: every one of them has the new expiry
         }
     }
 
