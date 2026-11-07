@@ -30,6 +30,16 @@ stores, what it logs):
    certificates). The launcher also runs it with `RUST_LOG=info` and removes Apple IDs, device IDs and team IDs
    from its own log and from Copy diagnostics (`nspb_qt/win/signer.py` `redact`).
 
+And three that make the sign-in window work as the launcher opens it (`plumesign account login`, no options):
+
+4. **`account login` alone asks.** It printed its help page when given no option, so the window showed the usage and
+   closed.
+5. **The Apple ID and two-factor prompts are prompts.** They were log lines followed by a bare read, and a log
+   level above info hid them.
+6. **The team is chosen at sign-in.** An Apple ID with several developer teams asked which one at every signing,
+   which the launcher (no window) cannot answer. The sign-in window asks once and keeps the choice, and signing
+   uses it.
+
 What stays as Impactor has it, and the launcher says so in the Apple ID row:
 
 - The password is never sent (Apple's SRP login) and never stored.

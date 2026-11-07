@@ -1571,5 +1571,5 @@
   "win.sign.fail.noAccount": "请先登录 Apple ID：设置、设备依赖、用于签名的 Apple ID。",
   "win.sign.fail.noDevice": "请用数据线连接设备，解锁，如有提示请点“信任”。",
   "win.sign.fail.session": "Apple ID 会话已过期。请在“设置”、“设备依赖”中退出登录后重新登录。",
-  "win.sign.fail.teams": "你的 Apple ID 属于多个开发团队，签名工具无法自行选择。请使用只有一个团队的 Apple ID 登录。"
+  "win.sign.fail.teams": "你的 Apple ID 属于多个开发团队，但尚未选择团队。请退出登录后重新登录，并在登录窗口中选择团队。"
 }

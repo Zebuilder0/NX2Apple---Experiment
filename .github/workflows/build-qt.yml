@@ -316,6 +316,13 @@ jobs:
           cp ../../artifacts/plumesign/LICENSE-impactor.txt NX2Apple/tools/plumesign-LICENSE.txt
           cp ../../artifacts/plumesign/README.md NX2Apple/tools/plumesign-README.md
           NX2Apple/tools/plumesign.exe --help > /dev/null
+          # `account login` alone asks for the Apple ID in its window (frontend-qt/impactor/hardening.patch): before the patch
+          # it printed its help page and quit. With no console to ask in it stops at once, and it must not print the usage
+          out=$(timeout 60 NX2Apple/tools/plumesign.exe account login < /dev/null 2>&1 || true)
+          echo "$out" | head -5
+          if echo "$out" | grep -q "Usage: plumesign"; then
+            echo "::error::plumesign account login prints its help page instead of asking for the Apple ID"; exit 1
+          fi
           # The engine tree goes inside the app folder: the launcher finds it at
           # <exe_dir>/engine (and also at <exe_dir>/../engine) and skips the repo/sync route entirely.
           cp -r ../../engine-tree "NX2Apple/engine"

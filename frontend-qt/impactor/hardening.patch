@@ -32,7 +32,7 @@ index 0b171f3..85de53b 100755
  }
  
 diff --git a/apps/plumesign/src/commands/account.rs b/apps/plumesign/src/commands/account.rs
-index f58c09a..1fc1e94 100644
+index f58c09a..6d487eb 100644
 --- a/apps/plumesign/src/commands/account.rs
 +++ b/apps/plumesign/src/commands/account.rs
 @@ -1,4 +1,3 @@
@@ -40,7 +40,62 @@ index f58c09a..1fc1e94 100644
  use std::path::PathBuf;
  
  use anyhow::{Ok, Result};
-@@ -199,12 +198,12 @@ async fn login(args: LoginArgs) -> Result<()> {
+@@ -38,8 +37,8 @@ pub enum AccountCommands {
+     AppIds(AppIdsArgs),
+ }
+ 
++// NX2Apple: no arg_required_else_help, so `account login` alone asks for the Apple ID, the password and the code
+ #[derive(Debug, Args)]
+-#[command(arg_required_else_help = true)]
+ pub struct LoginArgs {
+     /// Apple ID email
+     #[arg(short = 'u', long = "username", value_name = "EMAIL")]
+@@ -148,19 +147,19 @@ async fn login(args: LoginArgs) -> Result<()> {
+         use plume_core::auth::{TwoFactorAction, TwoFactorMethod};
+ 
+         let can_use_sms = !req.trusted_phone_numbers.is_empty();
+-        match req.method {
+-            TwoFactorMethod::Sms => log::info!("Enter the code sent via SMS: "),
++        // NX2Apple: a prompt of its own (it was a log line, which RUST_LOG can hide)
++        let prompt = match req.method {
++            TwoFactorMethod::Sms => "Code sent by text message",
+             TwoFactorMethod::Device if can_use_sms => {
+-                log::info!("Enter the code sent to your device, or type 'sms' to receive it by text message: ")
++                "Code shown on your Apple device (or type sms to get it by text message)"
+             }
+-            TwoFactorMethod::Device => log::info!("Enter 2FA code: "),
+-        }
+-
+-        let mut input = String::new();
+-        std::io::stdin()
+-            .read_line(&mut input)
++            TwoFactorMethod::Device => "Code shown on your Apple device",
++        };
++        let raw: String = dialoguer::Input::new()
++            .with_prompt(prompt)
++            .interact_text()
+             .map_err(|e| e.to_string())?;
+-        let input = input.trim();
++        let input = raw.trim();
+ 
+         if input.eq_ignore_ascii_case("sms") && can_use_sms {
+             let id = if req.trusted_phone_numbers.len() == 1 {
+@@ -190,21 +189,23 @@ async fn login(args: LoginArgs) -> Result<()> {
+     let username = if let Some(user) = args.username {
+         user
+     } else {
+-        log::info!("Enter Apple ID email: ");
+-        let mut input = String::new();
+-        std::io::stdin().read_line(&mut input)?;
+-        input.trim().to_string()
++        // NX2Apple: a prompt of its own (it was a log line, which RUST_LOG can hide)
++        dialoguer::Input::<String>::new()
++            .with_prompt("Apple ID (email)")
++            .interact_text()?
++            .trim()
++            .to_string()
+     };
+ 
      let password = if let Some(pass) = args.password {
          pass
      } else {
@@ -59,6 +114,61 @@ index f58c09a..1fc1e94 100644
      };
  
      let login_closure = || -> std::result::Result<(String, String), String> {
+@@ -217,9 +218,16 @@ async fn login(args: LoginArgs) -> Result<()> {
+     let settings_path = get_settings_path();
+     let mut settings = AccountStore::load(&Some(settings_path.clone())).await?;
+     settings
+-        .accounts_add_from_session(username, account)
++        .accounts_add_from_session(username.clone(), account)
+         .await?;
+ 
++    // NX2Apple: with several teams, choose the one to sign with now, in this window: signing runs with no window
++    // to ask in (teams() takes the stored one)
++    let session = get_authenticated_account().await?;
++    let team = choose_team(&session).await?;
++    let mut settings = AccountStore::load(&Some(settings_path)).await?;
++    settings.update_account_team(&username, team).await?;
++
+     log::info!("Successfully logged in and account saved.");
+ 
+     Ok(())
+@@ -300,12 +308,35 @@ pub async fn teams(session: &DeveloperSession) -> Result<String> {
+         return Ok(teams[0].team_id.clone());
+     }
+ 
++    // NX2Apple: the team chosen at `account login` when the Apple ID has several, so signing asks nothing
++    let settings = AccountStore::load(&Some(get_settings_path())).await?;
++    if let Some(stored) = settings.selected_account().map(|a| a.team_id().clone()) {
++        if teams.iter().any(|t| t.team_id == stored) {
++            return Ok(stored);
++        }
++    }
++
++    choose_team(session).await
++}
++
++/// NX2Apple: the team to sign with, asked only when the Apple ID has several (Impactor's teams() prompt).
++async fn choose_team(session: &DeveloperSession) -> Result<String> {
++    let teams = session.qh_list_teams().await?.teams;
++
++    if teams.len() == 1 {
++        return Ok(teams[0].team_id.clone());
++    }
++
+     let team_names: Vec<String> = teams
+         .iter()
+         .map(|t| format!("{} ({})", t.name, t.team_id))
+         .collect();
+ 
+-    let selection = Select::new().items(&team_names).default(0).interact()?;
++    let selection = Select::new()
++        .with_prompt("This Apple ID has several teams. Which one signs your apps?")
++        .items(&team_names)
++        .default(0)
++        .interact()?;
+ 
+     Ok(teams[selection].team_id.clone())
+ }
 diff --git a/apps/plumesign/src/main.rs b/apps/plumesign/src/main.rs
 index b0f933d..e36888b 100644
 --- a/apps/plumesign/src/main.rs

@@ -1552,5 +1552,5 @@
   "win.sign.fail.noAccount": "Melde dich zuerst mit deiner Apple-ID an: Einstellungen, Geräteabhängigkeiten, Apple-ID zum Signieren.",
   "win.sign.fail.noDevice": "Schließe das Gerät per Kabel an, entsperre es und tippe auf Vertrauen, falls gefragt.",
   "win.sign.fail.session": "Die Sitzung der Apple-ID ist abgelaufen. Melde dich unter Einstellungen, Geräteabhängigkeiten ab und wieder an.",
-  "win.sign.fail.teams": "Deine Apple-ID gehört zu mehreren Entwicklerteams, und das Signierwerkzeug kann keines selbst wählen. Melde dich mit einer Apple-ID mit nur einem Team an."
+  "win.sign.fail.teams": "Deine Apple-ID gehört zu mehreren Entwicklerteams, und noch keines ist gewählt. Melde dich ab und wieder an und wähle das Team im Anmeldefenster."
 }

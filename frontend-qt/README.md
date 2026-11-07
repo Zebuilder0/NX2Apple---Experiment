@@ -301,8 +301,7 @@ and the signature is 5 days old (a free Apple ID's lasts 7) or the games changed
 **Export IPA** in the same card packs the shared app with every game, unsigned, for AltStore, SideStore or another tool.
 **One game, all inside** is unchanged.
 
-Limits: an Apple ID with several developer teams makes `plumesign` ask which one, which the launcher cannot answer.
-A free Apple ID allows 3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here was tried on a
+Limits: an Apple ID with several developer teams is asked which one in the sign-in window, once. A free Apple ID allows 3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here was tried on a
 device from this fork yet: `tests/test_device_install.py` runs the whole install against a pretend device.
 
 ## Run a build
