@@ -229,6 +229,8 @@ class SignerWrapper(unittest.TestCase):
         self.assertEqual(signer.classify('Error: No account selected. Please login first'), 'win.sign.fail.noAccount')
         self.assertEqual(signer.classify('IO error: not a terminal'), 'win.sign.fail.teams')
         self.assertEqual(signer.classify('something else'), '')
+        self.assertEqual(signer.classify('HTTP status 401 from developerservices2'), 'win.sign.fail.session')
+        self.assertEqual(signer.classify('copied 40192 bytes'), '')      # a 401 inside a number is not one
         cmd = signer.sign_command(Path('p'), Path('a.app'), 'U')
         self.assertEqual(cmd[1:], ['sign', '--package', 'a.app', '--apple-id', '--udid', 'U', '--register-and-install'])
         self.assertEqual(signer.child_env()['RUST_LOG'], 'info')

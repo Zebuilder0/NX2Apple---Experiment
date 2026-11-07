@@ -1546,6 +1546,7 @@
   "win.install.dataFailed": "复制游戏数据中断：%@",
   "win.install.dataFailed.next": "请保持设备连接并解锁，然后再次点“安装到设备”。已复制的部分会保留。",
   "win.install.firstTime": "已安装到 %@。第一次需要在设备上：设置、通用、VPN 与设备管理，点你的 Apple ID 并信任。然后在设置、隐私与安全性中打开开发者模式（设备会重启），再打开 NX2Apple。",
+  "win.install.needsCable": "设备只通过 Wi-Fi 连接。安装需要数据线连接。",
   "win.install.needsSetup": "请先在“设置”的“设备依赖”中完成 Apple 设备相关项目。",
   "win.install.noDevice": "请先选择设备。",
   "win.install.noFramework": "构建已完成，但 %@ 中没有游戏框架。请重新构建游戏。",

@@ -1527,6 +1527,7 @@
   "win.install.dataFailed": "Das Kopieren der Spieldaten wurde unterbrochen: %@",
   "win.install.dataFailed.next": "Lass das Gerät verbunden und entsperrt und drücke erneut Auf Gerät installieren. Was schon kopiert ist, bleibt.",
   "win.install.firstTime": "Auf %@ installiert. Beim ersten Mal auf dem Gerät: Einstellungen, Allgemein, VPN und Geräteverwaltung, deine Apple-ID antippen und ihr vertrauen. Dann den Entwicklermodus unter Einstellungen, Datenschutz und Sicherheit einschalten (das Gerät startet neu) und NX2Apple öffnen.",
+  "win.install.needsCable": "Das Gerät ist nur über WLAN verbunden. Zum Installieren braucht es ein Kabel.",
   "win.install.needsSetup": "Erledige zuerst die Apple-Gerätezeilen unter Einstellungen, Geräteabhängigkeiten.",
   "win.install.noDevice": "Wähle zuerst ein Gerät.",
   "win.install.noFramework": "Der Build ist fertig, aber in %@ liegt kein Spiel-Framework. Baue das Spiel erneut.",

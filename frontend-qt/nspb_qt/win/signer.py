@@ -79,8 +79,8 @@ def child_env() -> dict[str, str]:
 
 def _run(exe: Path, args: list[str], timeout: float = 60) -> tuple[int, str]:
     try:
-        r = subprocess.run([str(exe), *args], capture_output=True, text=True, errors='replace',
-                           env=child_env(), stdin=subprocess.DEVNULL, timeout=timeout,
+        r = subprocess.run([str(exe), *args], capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', env=child_env(), stdin=subprocess.DEVNULL, timeout=timeout,
                            **_no_window())
     except (OSError, subprocess.SubprocessError) as e:
         return -1, str(e)
@@ -187,15 +187,16 @@ FAILURES = (
     ('anisette', 'win.sign.fail.network'),
     ('error sending request', 'win.sign.fail.network'),
     ('dns error', 'win.sign.fail.network'),
-    ('401', 'win.sign.fail.session'),
+    (re.compile(r'\b401\b'), 'win.sign.fail.session'),
     ('Unauthorized', 'win.sign.fail.session'),
 )
 
 
 def classify(output: str) -> str:
     """The en.json key that explains a failed sign-and-install, '' when nothing matches."""
+    low = output.lower()
     for needle, key in FAILURES:
-        if needle.lower() in output.lower():
+        if needle.search(output) if isinstance(needle, re.Pattern) else needle.lower() in low:
             return key
     return ''
 

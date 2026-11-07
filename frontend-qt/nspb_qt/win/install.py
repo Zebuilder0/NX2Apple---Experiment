@@ -136,6 +136,9 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     dev = next((d for d in devices if d.udid == udid), None)
     if dev is None:
         return Outcome(False, ('win.install.notConnected',), 'win.sign.fail.noDevice')
+    if not dev.wired:
+        # the signing tool installs over a cable only ("Device is not connected via USB")
+        return Outcome(False, ('win.install.needsCable',), 'win.sign.fail.noDevice')
     if not dv.is_paired(udid):
         # the signing tool installs only on a device that trusts this PC, and does not ask itself
         return Outcome(False, ('win.install.notPaired',), 'win.install.notPaired.next')
