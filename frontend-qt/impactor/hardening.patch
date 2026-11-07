@@ -16,18 +16,23 @@ index 441531a..741a677 100755
              .default_headers(headers)
              .build()?;
 diff --git a/3rdparty/omnisette/src/remote_anisette_v3.rs b/3rdparty/omnisette/src/remote_anisette_v3.rs
-index 0b171f3..85de53b 100755
+index 0b171f3..8f89ef2 100755
 --- a/3rdparty/omnisette/src/remote_anisette_v3.rs
 +++ b/3rdparty/omnisette/src/remote_anisette_v3.rs
-@@ -178,9 +178,10 @@ impl AnisetteData {
+@@ -178,9 +178,15 @@ impl AnisetteData {
  }
  
  fn make_reqwest() -> Result<Client, AnisetteError> {
-+    // NX2Apple: the anisette server's certificate is verified against the system's roots (it was
-+    // accepted unchecked, so anyone on the network could stand in for the server)
++    // NX2Apple: certificates are checked (they were accepted unchecked, so anyone on the network could
++    // stand in for the server). This client talks to the anisette server, which the system's roots
++    // vouch for, and to Apple's provisioning hosts (gsa.apple.com), whose chain ends in Apple Root CA,
++    // which Windows does not trust by default: the system's roots plus Apple's, as plume_core's client()
      Ok(ClientBuilder::new()
          .http1_title_case_headers()
 -        .danger_accept_invalid_certs(true) // TODO: pin the apple certificate
++        .add_root_certificate(reqwest::Certificate::from_der(include_bytes!(
++            "../../../crates/plume_core/src/apple_root.der"
++        ))?)
          .build()?)
  }
  

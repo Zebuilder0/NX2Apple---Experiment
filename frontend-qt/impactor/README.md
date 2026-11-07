@@ -19,12 +19,14 @@ It does not download Impactor's release binary, which is not signed and has no p
 These came out of a review of Impactor 2.7.2 before it went into the launcher (what it sends where, what it
 stores, what it logs):
 
-1. **Certificate checks are on for the anisette server.** On Windows Impactor gets Apple's device headers
-   ("anisette") from a remote server (`mac-ani.jkcoxson.com`, run by an Impactor and SideStore developer), and it
-   accepted that server's TLS certificate without checking it. Anyone on the network could stand in for the
-   server. It is now checked against the system's roots. Apple's own provisioning hosts (used only with a local
-   Apple library, which Windows does not have) are checked against the system's roots plus Apple's root, as
-   Impactor's main client does.
+1. **Certificate checks are on for the anisette client.** On Windows Impactor gets Apple's device headers
+   ("anisette") from a remote server (`mac-ani.jkcoxson.com`, run by an Impactor and SideStore developer), and
+   the same client then provisions with Apple (`gsa.apple.com`). It accepted every certificate without checking
+   it, so anyone on the network could stand in for either. It now checks them against the system's roots plus
+   Apple Root CA (Impactor's own `crates/plume_core/src/apple_root.der`), as Impactor's main client does: Apple's
+   hosts chain to Apple Root CA, which Windows does not trust by default. (The first version of this patch left
+   Apple's root out, and sign-in stopped with "a root certificate which is not trusted by the trust provider".)
+   Apple's provisioning client for a local Apple library, which Windows does not have, gets the same roots.
 2. **The password prompt is hidden.** `plumesign account login` showed the password as it was typed.
 3. **No debug log by default.** The debug level printed the developer services' replies (team, devices,
    certificates). The launcher also runs it with `RUST_LOG=info` and removes Apple IDs, device IDs and team IDs
