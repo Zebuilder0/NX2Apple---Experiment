@@ -26,6 +26,8 @@ stores, what it logs):
    Apple Root CA (Impactor's own `crates/plume_core/src/apple_root.der`), as Impactor's main client does: Apple's
    hosts chain to Apple Root CA, which Windows does not trust by default. (The first version of this patch left
    Apple's root out, and sign-in stopped with "a root certificate which is not trusted by the trust provider".)
+   In this build every HTTP client uses Windows' own TLS (SChannel, through native-tls: `plume_core` turns that
+   feature on for the one reqwest all crates share), which accepts a chain that ends in a root passed this way.
    Apple's provisioning client for a local Apple library, which Windows does not have, gets the same roots.
 2. **The password prompt is hidden.** `plumesign account login` showed the password as it was typed.
 3. **No debug log by default.** The debug level printed the developer services' replies (team, devices,
