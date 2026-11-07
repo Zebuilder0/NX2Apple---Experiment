@@ -142,11 +142,19 @@ def login_console(exe: Path | None = None) -> subprocess.Popen | None:
     if not exe:
         return None
     if os.name == 'nt':
-        # cmd keeps the window until a key is pressed; the path is quoted for spaces
-        cmd = f'"{exe}" account login & echo. & pause'
-        return subprocess.Popen(['cmd.exe', '/d', '/c', cmd], env=child_env(),
+        line = login_command_line(exe, os.environ.get('ComSpec') or 'cmd.exe')
+        return subprocess.Popen(line, env=child_env(),
                                 creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0x10))
     return subprocess.Popen([str(exe), 'account', 'login'], env=child_env())   # a terminal run (tests, not the Windows app)
+
+
+def login_command_line(exe: Path, comspec: str = 'cmd.exe') -> str:
+    """The sign-in window's command line: cmd runs `plumesign account login`, then waits for a key
+    so the result can be read. It is one string, which Windows gets as it is. A list made Python
+    escape the quotes around the path as \\", cmd took them for part of the name, and a path with
+    a space ("NX2Apple-windows-x64 (2)") was "not recognized as an internal or external command".
+    /s makes cmd remove only the outer pair of quotes after /c, so the path keeps its own."""
+    return f'"{comspec}" /d /s /c ""{exe}" account login & echo. & pause"'
 
 
 def logout(exe: Path | None = None) -> tuple[bool, str]:

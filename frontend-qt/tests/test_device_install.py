@@ -214,6 +214,16 @@ class SignerWrapper(unittest.TestCase):
         self.assertEqual(signer.redact('Installation progress: 50%'), 'Installation progress: 50%')
         self.assertEqual(signer.redact('title 0100ABCD00000000'), 'title 0100ABCD00000000')   # title IDs stay
 
+    def test_the_sign_in_window_keeps_the_quotes_of_a_path_with_spaces(self):
+        exe = r'C:\Users\Jane Doe\Downloads\NX2Apple-windows-x64 (2)\NX2Apple\tools\plumesign.exe'
+        line = signer.login_command_line(exe, r'C:\Windows\system32\cmd.exe')
+        self.assertNotIn('\\"', line)             # no escaped quote: cmd would take it for part of the name
+        self.assertTrue(line.startswith('"C:\\Windows\\system32\\cmd.exe" /d /s /c "'))
+        # what cmd /s /c runs: the text after /c without its first and last quote
+        after = line.split(' /c ', 1)[1]
+        self.assertEqual(after[0] + after[-1], '""')
+        self.assertEqual(after[1:-1], f'"{exe}" account login & echo. & pause')
+
     def test_masked_and_classify_and_command(self):
         self.assertEqual(signer.masked('jane@example.com'), 'j…@example.com')
         self.assertEqual(signer.classify('Error: No account selected. Please login first'), 'win.sign.fail.noAccount')
