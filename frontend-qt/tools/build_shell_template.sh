@@ -57,7 +57,6 @@ xcodebuild -project DmShell.xcodeproj -scheme DmShell -configuration Release -de
   || { grep -E 'error:' "$S/build.log" | head -30; echo "xcodebuild failed, log $S/build.log" >&2; exit 1; }
 APP=$S/dd/Build/Products/Release-iphoneos/DmShell.app
 [ -x "$APP/DmShell" ] || { echo "no built app at $APP" >&2; exit 1; }
-rm -rf "$APP/Frameworks"   # the games' frameworks go here on the PC
 # The ad-hoc signature carries the Increased Memory Limit request to the signing tool
 codesign --force --sign - --entitlements Gen/DmShell.entitlements "$APP"
 codesign -d --entitlements - "$APP" 2>&1 | grep -q increased-memory-limit \

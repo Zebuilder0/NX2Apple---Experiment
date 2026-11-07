@@ -20,4 +20,10 @@ final class AutoResignTests: XCTestCase {
         XCTAssertEqual(AutoResign.next([later, soon, nowhere], wired: ["A", "B"], now: now), soon)
         XCTAssertNil(AutoResign.next([soon], wired: [], now: now))
     }
+
+    func testAFailedReSignIsNotStartedAgainSoon() {
+        let soon = AutoResign.Candidate(id: UUID(), device: "B", expiry: now.addingTimeInterval(3600))
+        XCTAssertNil(AutoResign.next([soon], wired: ["B"], tried: ["B": now.addingTimeInterval(-60)], now: now))
+        XCTAssertEqual(AutoResign.next([soon], wired: ["B"], tried: ["B": now.addingTimeInterval(-AutoResign.retryAfter)], now: now), soon)
+    }
 }

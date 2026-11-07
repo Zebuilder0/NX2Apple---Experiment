@@ -39,7 +39,10 @@ class DeviceMixin:
         self._install_cancel = False
         self._auto_seen: set[str] = set()
         self._auto_busy = False
-        self.autoInstallRequested.connect(lambda udid: self.install_on_device(udid, auto=True))
+        # a method of this QObject, not a lambda: the worker thread emits, and the install must start on
+        # the model's own (main) thread
+        self.autoInstallRequested.connect(self._on_auto_install)
+        self._known_udids: set[str] = set()
         if pu.IS_WIN:
             from PySide6.QtCore import QTimer
             self._auto_timer = QTimer(self)
@@ -213,27 +216,40 @@ class DeviceMixin:
             note = self.t(*out.message) if out.message else ''
             if not out.ok and out.failure:
                 note += ' ' + self.t(out.failure)
+            self.log(note + '\n')       # the footer is one line: the log keeps the whole note
             self.finished.emit(out.ok, note)
         threading.Thread(target=work, daemon=True).start()
 
     def cancel_install(self) -> None:
         self._install_cancel = True
 
+    def _on_auto_install(self, udid: str) -> None:
+        self.install_on_device(udid, auto=True)
+
     def _auto_tick(self) -> None:
         """"Update the launcher when a device connects": a device that has the app from this PC
         gets it signed and installed again when the signature is getting old or the games
         changed. Only a cable connection, only when nothing else runs."""
-        if self.running or self._auto_busy or not self.auto_update_launcher or not self.device_install_ready:
+        if self._auto_busy:
             return
         self._auto_busy = True
+        auto = not self.running and self.auto_update_launcher and self.device_install_ready
 
         def work() -> None:
             try:
                 from .win import device as dv, install as wi
                 try:
-                    wired = {d.udid for d in dv.list_devices() if d.wired}
+                    found = dv.list_devices()
                 except dv.DeviceError:
-                    wired = set()
+                    found = []
+                # a device plugged in or out: the install row's list follows without a press of Refresh
+                udids = {d.udid for d in found}
+                if udids != self._known_udids:
+                    self._known_udids = udids
+                    self.refresh_devices()
+                if not auto:
+                    return
+                wired = {d.udid for d in found if d.wired}
                 new = wired - self._auto_seen
                 self._auto_seen = wired
                 if not new:
@@ -251,6 +267,24 @@ class DeviceMixin:
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------------------------------------------------------- the unsigned IPA
+
+    def export_shell_ipa_async(self, dest: str) -> None:
+        """Export IPA off the window's thread: a shared app with several games is gigabytes to zip."""
+        if self.running:
+            return
+        self.running = True
+        self.runningChanged.emit(True)
+
+        def work() -> None:
+            try:
+                ok, msg = self.export_shell_ipa(dest)
+            except Exception as e:      # the run must end visibly
+                ok, msg = False, self.t('shell.exportFailed', str(e))
+            self.log(msg + '\n')
+            self.running = False
+            self.runningChanged.emit(False)
+            self.finished.emit(ok, msg)
+        threading.Thread(target=work, daemon=True).start()
 
     def export_shell_ipa(self, dest: str) -> tuple[bool, str]:
         """The shared app with every game, unsigned, as an IPA for AltStore, SideStore or another

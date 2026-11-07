@@ -215,7 +215,7 @@ class FakeDevice:
                     elif p in self.dirs:
                         rop, body = 2, b'st_size\0 0\0st_ifmt\0S_IFDIR\0'
                     else:
-                        status = 8
+                        status = 4          # a real device answers GetFileInfo on a missing path with READ_ERROR
                 elif op == 0x09:    # MAKE_DIR
                     p = path(data)
                     parts = p.strip('/').split('/')

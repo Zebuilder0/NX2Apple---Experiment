@@ -24,8 +24,16 @@ package enum AutoResign {
         return expiry.timeIntervalSince(now) < window
     }
 
-    /// The first game whose app is due on a device connected by cable now, nil when there is none.
-    package static func next(_ games: [Candidate], wired: Set<String>, now: Date = Date()) -> Candidate? {
-        games.first { !$0.device.isEmpty && wired.contains($0.device) && due(expiry: $0.expiry, now: now) }
+    /// After an automatic re-sign of a device, the next one waits this long, so a re-sign that keeps failing (no network, an
+    /// expired Xcode account) is not started again every two minutes.
+    package static let retryAfter: TimeInterval = 6 * 3600
+
+    /// The first game whose app is due on a device connected by cable now, nil when there is none. `tried` holds when each device
+    /// was last re-signed automatically.
+    package static func next(_ games: [Candidate], wired: Set<String>, tried: [String: Date] = [:], now: Date = Date()) -> Candidate? {
+        games.first {
+            !$0.device.isEmpty && wired.contains($0.device) && due(expiry: $0.expiry, now: now)
+                && (tried[$0.device].map { now.timeIntervalSince($0) >= retryAfter } ?? true)
+        }
     }
 }

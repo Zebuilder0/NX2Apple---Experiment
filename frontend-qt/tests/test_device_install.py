@@ -304,6 +304,7 @@ class InstallEndToEnd(DeviceTestCase):
         finally:
             signer.sign_and_install = orig
         self.assertTrue(out.ok, out)
+        self.assertEqual(out.message[0], 'win.install.firstTime')   # trust the Apple ID, Developer Mode
         self.assertEqual(out.bundle_id, SHELL_ID)
         info = json.loads(self.out.read_text())
         self.assertEqual(info['frameworks'], ['DmGame0100ABCD00000000.framework'])
@@ -322,6 +323,12 @@ class InstallEndToEnd(DeviceTestCase):
         self.assertTrue(wi.needs_update(state, current, now=time.time() + wi.RESIGN_AFTER + 1))
         self.assertTrue(wi.needs_update(state, 'another'))
         self.assertFalse(wi.needs_update(None, current))
+        signer.sign_and_install = sign_and_install
+        try:
+            again = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
+        finally:
+            signer.sign_and_install = orig
+        self.assertEqual((again.ok, again.message[0], again.copied_files), (True, 'dev.installed', 0))
 
     def test_install_stops_early_with_a_reason(self):
         self.assertEqual(wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe).message,
@@ -332,6 +339,10 @@ class InstallEndToEnd(DeviceTestCase):
         lib.save(self.root)
         self.assertEqual(wi.install(self.root, 'other-udid', template=self.tpl, signer_exe=self.exe).message,
                          ('win.install.notConnected',))
+        self.dev.paired = False      # never trusted this PC: stop before the signing tool, with the way out
+        out = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
+        self.assertEqual((out.message, out.failure), (('win.install.notPaired',), 'win.install.notPaired.next'))
+        self.dev.paired = True
         if shell.find_template() is None:     # no app bundled beside this interpreter
             self.assertEqual(wi.install(self.root, self.dev.udid, signer_exe=self.exe).message, ('win.install.noTemplate',))
 

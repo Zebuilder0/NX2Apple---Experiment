@@ -7,6 +7,8 @@ import NXCore
 
 extension LauncherView {
     static let autoResignTimer = Timer.publish(every: 120, on: .main, in: .common).autoconnect()
+    /// When each device was last re-signed automatically (AutoResign.retryAfter)
+    static var autoResignTried: [String: Date] = [:]
 
     func autoResignTick() {
         guard UserDefaults.standard.object(forKey: AutoResign.defaultsKey) as? Bool ?? true, !m.running else { return }
@@ -18,8 +20,9 @@ extension LauncherView {
             guard !m.running else { return }
             let wired = Set(devices.devices.filter { $0.reachable && $0.wired }.map(\.id))
             let candidates = games.map { AutoResign.Candidate(id: $0.id, device: $0.installedDevice, expiry: expiry[$0.id]) }
-            guard let pick = AutoResign.next(candidates, wired: wired),
+            guard let pick = AutoResign.next(candidates, wired: wired, tried: Self.autoResignTried),
                   let game = games.first(where: { $0.id == pick.id }) else { return }
+            Self.autoResignTried[pick.device] = Date()
             resign(game)
         }
     }

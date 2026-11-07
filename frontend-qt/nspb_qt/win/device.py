@@ -56,7 +56,10 @@ AFC_REMOVE_PATH, AFC_MAKE_DIR, AFC_GET_FILE_INFO = 0x08, 0x09, 0x0A
 AFC_FILE_OPEN, AFC_FILE_OPEN_RES, AFC_WRITE, AFC_FILE_CLOSE = 0x0D, 0x0E, 0x10, 0x14
 AFC_RENAME_PATH = 0x18
 AFC_MODE_WRONLY = 3            # "w": write, create, truncate
-AFC_OBJECT_NOT_FOUND = 8
+AFC_READ_ERROR, AFC_OBJECT_NOT_FOUND = 4, 8
+#: What a missing path answers: GetFileInfo says READ_ERROR on a device (pymobiledevice3's stat
+#: maps it to "no such file"), RemovePath says OBJECT_NOT_FOUND
+AFC_MISSING = (AFC_READ_ERROR, AFC_OBJECT_NOT_FOUND)
 AFC_WRITE_CHUNK = 4 << 20
 
 
@@ -169,7 +172,10 @@ class Mux:
     def pair_record(self, udid: str) -> dict | None:
         r = self.request({'MessageType': 'ReadPairRecord', 'PairRecordID': udid})
         data = r.get('PairRecordData')
-        return plistlib.loads(data) if data else None
+        if data:
+            return plistlib.loads(data)
+        return lockdown_folder_record(udid)
+
 
     def connect(self, device_id: int, port: int) -> socket.socket:
         r = self.request({'MessageType': 'Connect', 'DeviceID': device_id,
@@ -178,6 +184,29 @@ class Mux:
             raise DeviceError(f'the device refused a connection to port {port} (usbmuxd result '
                               f'{r.get("Number")}): keep it connected and unlocked')
         return self.sock
+
+
+def lockdown_folder_record(udid: str) -> dict | None:
+    """The pair record iTunes keeps in `%ALLUSERSPROFILE%\\Apple\\Lockdown\\<UDID>.plist`, for an Apple
+    Mobile Device Service that does not hand it out (pymobiledevice3 reads the same file). None
+    when it is not there or this user may not read it."""
+    if sys.platform != 'win32':
+        return None
+    base = Path(os.environ.get('ALLUSERSPROFILE') or r'C:\ProgramData') / 'Apple' / 'Lockdown'
+    try:
+        with open(base / f'{udid}.plist', 'rb') as f:
+            return plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+
+
+def is_paired(udid: str, timeout: float = 5.0) -> bool:
+    """Whether this PC has a pair record for the device (the player tapped Trust once)."""
+    try:
+        with Mux(timeout=timeout) as m:
+            return bool(m.pair_record(udid))
+    except (DeviceError, OSError, ValueError, struct.error):
+        return False
 
 
 def service_running(timeout: float = 2.0) -> bool:
@@ -277,6 +306,13 @@ class Lockdown:
         self.record = record
         self._mux = Mux(timeout=timeout)
         self.conn = PlistSocket(self._mux.connect(device.device_id, LOCKDOWN_PORT))
+        try:
+            self._start_session(record)
+        except BaseException:
+            self.conn.close()          # a refused session must not leave the connection open
+            raise
+
+    def _start_session(self, record: dict) -> None:
         r = self.conn.request({'Label': LABEL, 'Request': 'QueryType'})
         if r.get('Type') != 'com.apple.mobile.lockdown':
             raise DeviceError(f'port {LOCKDOWN_PORT} is not lockdownd ({r.get("Type")})')
@@ -407,7 +443,7 @@ class Afc:
         try:
             _, body = self.op(AFC_GET_FILE_INFO, self._path(path))
         except AfcError as e:
-            if e.code == AFC_OBJECT_NOT_FOUND:
+            if e.code in AFC_MISSING:
                 return None
             raise
         parts = body.split(b'\0')
@@ -424,7 +460,7 @@ class Afc:
         try:
             self.op(AFC_REMOVE_PATH, self._path(path))
         except AfcError as e:
-            if e.code != AFC_OBJECT_NOT_FOUND:
+            if e.code not in AFC_MISSING:
                 raise
 
     def rename(self, src: str, dst: str) -> None:

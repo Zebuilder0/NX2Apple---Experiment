@@ -1309,11 +1309,7 @@ class MainWindow(QMainWindow):
         dest, _ = QFileDialog.getSaveFileName(self, self.m.t('win.export.title'), start, 'IPA (*.ipa)')
         if not dest:
             return
-        ok, msg = self.m.export_shell_ipa(dest)
-        self.footer.setText(msg)
-        self.m.log(msg + '\n')
-        if ok:
-            pu.reveal(dest)
+        self.m.export_shell_ipa_async(dest)   # the footer shows the outcome when it ends (finished)
 
     def _pick_drive_folder(self) -> None:
         d = QFileDialog.getExistingDirectory(self, self.m.t('shell.driveChoose'), self._drive_folder or str(Path.home()))
@@ -2322,6 +2318,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_running(self) -> None:
         t = self.m.t
+        if hasattr(self, 'win_install_btn'):     # Install on device waits for a running build or install
+            self.win_install_btn.setEnabled(self.m.device_install_ready and bool(self.m.devices)
+                                            and not self.m.running)
         if self.m.running:
             self.build_btn.setText(t('build.cancel'))
             self.build_btn.setObjectName('danger')

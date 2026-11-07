@@ -136,6 +136,9 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     dev = next((d for d in devices if d.udid == udid), None)
     if dev is None:
         return Outcome(False, ('win.install.notConnected',), 'win.sign.fail.noDevice')
+    if not dv.is_paired(udid):
+        # the signing tool installs only on a device that trusts this PC, and does not ask itself
+        return Outcome(False, ('win.install.notPaired',), 'win.install.notPaired.next')
     dv.describe(dev)
     name = dev.name or 'iPhone'
 
@@ -198,4 +201,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         state.receipts[title_id.upper()] = stamp
         known.put(udid, state)
         stage('win.install.stage.data', 'done', name, 100)
+    if not prev.bundle:
+        # the first install on this device: iOS opens the app only once the player trusts the
+        # Apple ID's certificate and turns Developer Mode on
+        return Outcome(True, ('win.install.firstTime', name), '', bundle, copied)
     return Outcome(True, ('dev.installed', name), '', bundle, copied)
