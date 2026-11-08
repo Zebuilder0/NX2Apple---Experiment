@@ -326,6 +326,18 @@ games folder makes it the Save to folder, as on the Mac.
 Limits: an Apple ID with several developer teams is asked which one in the sign-in window, once. A free Apple ID allows 3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here was tried on a
 device from this fork yet: `tests/test_device_install.py` runs the whole install against a pretend device.
 
+## The build queue
+
+**Add to queue** beside Build game takes the game chosen on the page with its choices (files, prod.keys, Save to, Play
+on) and empties the game rows for the next one; it works while a build runs. **Start queue** builds the queued games one
+after another (`nspb_qt/queue_model.py`); a game that fails is marked and the queue goes on, and **Stop after this
+game** ends it after the current one. The queue card shows how long the waiting games take and how much free space
+each drive has after all of them, the game chosen above but not yet queued included, in red when it would not fit.
+The estimates start from a default (about 2.6 times the game files plus 2 GB, 15 minutes plus 4 a GB) and then take
+the median of this PC's own finished builds (the drop in free space and the time per GB of game files). Games built
+for the shared app are not installed one by one: when the queue ends, the device under Install on gets one install
+with all of them if it is plugged in. The queue is kept in the settings and survives a restart.
+
 ## Run a build
 
 ```bat

@@ -235,6 +235,7 @@ class MainWindow(QMainWindow):
         self.m.libraryChanged.connect(self._refresh_library)
         self.m.devicesChanged.connect(self._refresh_install_card)
         self.m.newDeviceFound.connect(self._on_new_device)
+        self.m.queueChanged.connect(self._refresh_queue)
         if pu.IS_WIN:
             self.m.depsChanged.connect(self.m.refresh_devices)
         self.transfer_toast = TransferToast(root)
@@ -870,6 +871,10 @@ class MainWindow(QMainWindow):
         # Card 4: Export as IPA / Shared App vs One-Game IPA + Drive Copy (InstallCard, ExportSteps)
         self.install_group = self._build_install_card()
         self.body_col.addWidget(self.install_group)
+
+        # Card 4.5: the build queue (queue_model.py), shown once a game is in it
+        self.queue_group = self._build_queue_card()
+        self.body_col.addWidget(self.queue_group)
 
         # Card 5: Build Log Card, folded as on the Mac (LogCard), opened by a failure
         self.log_group = self._build_log_card()
@@ -1557,6 +1562,12 @@ class MainWindow(QMainWindow):
         self.reveal_app_btn.clicked.connect(lambda: pu.reveal(self.m.mac_app_path))
         self.reveal_app_btn.hide()
         act.addWidget(self.reveal_app_btn)
+        # several games one after another (queue_model.py): this game is queued, the rows empty for the next
+        self.queue_add_btn = QPushButton(self.m.t('queue.add'))
+        self.queue_add_btn.setStyleSheet('QPushButton { border-radius: 25px; font-size: 14px; padding: 12px 24px; '
+                                         'min-height: 26px; }')
+        self.queue_add_btn.clicked.connect(self._add_to_queue)
+        act.addWidget(self.queue_add_btn)
         act.addWidget(self.build_btn)
 
         grp.add_row(r)
@@ -1597,6 +1608,161 @@ class MainWindow(QMainWindow):
         grp.add_row(self.failure_box)
 
         return grp
+
+    def _build_queue_card(self) -> CardGroup:
+        """Queue: the games waiting to be built, what they take, and Start queue."""
+        grp = CardGroup(title=self.m.t('queue.section'))
+        head = QWidget()
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(18, 14, 18, 14)
+        hl.setSpacing(12)
+        self.queue_dot = _dot(style.NEUTRAL_DOT)
+        hl.addWidget(self.queue_dot)
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        self.queue_title = QLabel('')
+        self.queue_title.setObjectName('rowTitle')
+        self.queue_note = QLabel('')
+        self.queue_note.setObjectName('muted')
+        self.queue_note.setWordWrap(True)
+        col.addWidget(self.queue_title)
+        col.addWidget(self.queue_note)
+        hl.addLayout(col, 1)
+        self.queue_clear_btn = QPushButton(self.m.t('queue.clearDone'))
+        self.queue_clear_btn.setObjectName('ghost')
+        self.queue_clear_btn.clicked.connect(self.m.clear_finished)
+        hl.addWidget(self.queue_clear_btn)
+        self.queue_start_btn = QPushButton(self.m.t('queue.start'))
+        self.queue_start_btn.setObjectName('creamPill')
+        self.queue_start_btn.setMinimumWidth(170)
+        self.queue_start_btn.clicked.connect(self._toggle_queue)
+        hl.addWidget(self.queue_start_btn)
+        grp.add_row(head)
+        grp.add_divider()
+        self.queue_rows_host = QWidget()
+        self.queue_rows = QVBoxLayout(self.queue_rows_host)
+        self.queue_rows.setContentsMargins(0, 0, 0, 0)
+        self.queue_rows.setSpacing(0)
+        grp.add_row(self.queue_rows_host)
+        grp.hide()
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(30_000)          # the time left counts down while a queued game builds
+        self._queue_timer.timeout.connect(self._refresh_queue)
+        self._queue_timer.start()
+        return grp
+
+    def _add_to_queue(self) -> None:
+        if self.m.add_to_queue() is not None:
+            self.footer.setText(self.m.t('queue.addedNote'))
+        self._refresh_queue()
+
+    def _toggle_queue(self) -> None:
+        if self.m.queue_running:
+            self.m.stop_queue()
+        else:
+            self._build_run = True
+            self._failed = False
+            self.m.start_queue()
+        self._refresh_queue()
+
+    def _queue_row(self, item) -> QWidget:
+        from .queue_model import format_bytes, format_duration
+        t = self.m.t
+        est = self.m.estimator()
+        r = QWidget()
+        lay = QHBoxLayout(r)
+        lay.setContentsMargins(18, 10, 18, 10)
+        lay.setSpacing(10)
+        color = {'running': style.AMBER, 'done': style.GREEN, 'failed': style.RED}.get(item.state, style.NEUTRAL_DOT)
+        lay.addWidget(_dot(color))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        name = QLabel(item.name)
+        name.setObjectName('rowTitle')
+        col.addWidget(name)
+        if item.state == 'waiting':
+            detail = t('queue.itemEstimate', item.key, format_bytes(item.input_bytes),
+                       format_duration(est.seconds(item), t), format_bytes(est.space(item)))
+        elif item.state == 'running':
+            detail = t('queue.itemRunning', item.key)
+        elif item.state == 'done':
+            detail = t('queue.itemDone', format_duration(item.seconds, t)) + (' · ' + item.note if item.note else '')
+        else:
+            detail = item.note or t('msg.buildFailed')
+        d = QLabel(detail)
+        d.setObjectName('muted')
+        d.setWordWrap(True)
+        col.addWidget(d)
+        lay.addLayout(col, 1)
+        if item.state == 'waiting':
+            for text, step in (('↑', -1), ('↓', 1)):
+                b = QPushButton(text)
+                b.setFixedSize(34, 30)
+                b.setStyleSheet('QPushButton { padding: 0px; font-size: 14px; }')
+                b.setToolTip(t('queue.moveUp' if step < 0 else 'queue.moveDown'))
+                b.clicked.connect(lambda _=False, i=item.id, s=step: self.m.move_in_queue(i, s))
+                lay.addWidget(b)
+            x = QPushButton('✕')
+            x.setObjectName('ghost')
+            x.setFixedSize(34, 30)
+            x.setStyleSheet('QPushButton { padding: 0px; }')
+            x.setToolTip(t('queue.remove'))
+            x.clicked.connect(lambda _=False, i=item.id: self.m.remove_from_queue(i))
+            lay.addWidget(x)
+        return r
+
+    def _refresh_queue(self) -> None:
+        from .queue_model import format_bytes, format_duration
+        t = self.m.t
+        self.queue_add_btn.setText(t('queue.add'))
+        self.queue_add_btn.setEnabled(self.m.can_queue)
+        self.queue_group.set_title(t('queue.section'))
+        queue = self.m.queue
+        self.queue_group.setVisible(bool(queue))
+        if not queue:
+            return
+        while self.queue_rows.count():
+            it = self.queue_rows.takeAt(0)
+            old = it.widget()
+            if old is not None:
+                old.hide()
+                old.setParent(None)
+                old.deleteLater()
+        for n, item in enumerate(queue):
+            if n:
+                self.queue_rows.addWidget(make_divider())
+            self.queue_rows.addWidget(self._queue_row(item))
+        chosen = self.m.current_queue_item()
+        summary = self.m.queue_summary(chosen)
+        waiting = sum(1 for i in queue if i.state in ('waiting', 'running'))
+        if waiting:
+            self.queue_title.setText(t('queue.summary', waiting, format_duration(summary['seconds'], t)))
+        else:
+            self.queue_title.setText(t('queue.allDone'))
+        lines, short = [], False
+        for d in summary['drives']:
+            if d['free'] is None:
+                continue
+            if d['after'] is not None and d['after'] < 0:
+                short = True
+                lines.append(t('queue.spaceShort', format_bytes(-d['after']), d['folder']))
+            else:
+                lines.append(t('queue.space', format_bytes(d['after']), format_bytes(d['free']), d['folder']))
+        if chosen is not None and waiting:
+            lines.append(t('queue.withChosen', chosen.name))
+        if not summary['learned']:
+            lines.append(t('queue.roughEstimate'))
+        self.queue_note.setText('\n'.join(lines))
+        low = any(d['after'] is not None and d['after'] < 10 * 1024 ** 3 for d in summary['drives'])
+        _set_dot(self.queue_dot, style.RED if short else (style.AMBER if low or self.m.queue_running else style.GREEN))
+        has_waiting = any(i.state == 'waiting' for i in queue)
+        self.queue_start_btn.setText(t('queue.stop') if self.m.queue_running else t('queue.start'))
+        self.queue_start_btn.setObjectName('danger' if self.m.queue_running else 'creamPill')
+        self.queue_start_btn.style().unpolish(self.queue_start_btn)
+        self.queue_start_btn.style().polish(self.queue_start_btn)
+        self.queue_start_btn.setEnabled(self.m.queue_running or (has_waiting and not self.m.running))
+        self.queue_clear_btn.setText(t('queue.clearDone'))
+        self.queue_clear_btn.setVisible(any(i.state in ('done', 'failed') for i in queue))
 
     def _build_stages_card(self) -> CardGroup:
         """Progress (ProgressCard): one big bar for the whole run with its percentage, then each stage."""
@@ -2604,6 +2770,7 @@ class MainWindow(QMainWindow):
         self.m.remember_choices()       # the choices last to the next start (Model.restore_choices)
         self._refresh_install_card()
         self._refresh_running()
+        self._refresh_queue()
 
     def _toggle_target(self) -> None:
         if self.m.running or pu.IS_WIN:
@@ -2928,6 +3095,8 @@ class MainWindow(QMainWindow):
 
     def _build_clicked(self) -> None:
         if self.m.running:
+            if self.m.queue_running:     # Cancel during the queue stops the queue too, not just this game
+                self.m.stop_queue()
             self.m.cancel_build()
             return
         self._failed = False

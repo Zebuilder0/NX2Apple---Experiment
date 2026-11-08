@@ -19,6 +19,7 @@ from PySide6.QtCore import QSettings, Q_ARG, QMetaObject, QObject, Qt, QThread, 
 from . import app_update
 from . import build_failure as bf
 from .device_model import DeviceMixin
+from .queue_model import QueueMixin
 from . import engine
 from . import input_staging
 from . import inputs
@@ -78,7 +79,7 @@ class Stage:
 
 # ---------------------------------------------------------------- the model
 
-class Model(QObject, DeviceMixin):
+class Model(QObject, DeviceMixin, QueueMixin):
     """Everything the window reads, and every action it can take.
 
     Long work runs on a thread and reports through signals, so the window never blocks: Qt
@@ -97,6 +98,7 @@ class Model(QObject, DeviceMixin):
     devicesChanged = Signal()             # Windows: the connected iPhones and iPads (device_model.py)
     autoInstallRequested = Signal(str)    # Windows: a device to update the launcher on (its UDID)
     newDeviceFound = Signal(str)          # Windows: a device without the launcher was plugged in (its UDID)
+    queueChanged = Signal()               # the build queue (queue_model.py) changed
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -175,6 +177,7 @@ class Model(QObject, DeviceMixin):
         self._persist_choices = os.environ.get('QT_QPA_PLATFORM') != 'offscreen'
         if self._persist_choices:
             self.restore_choices()
+        self._queue_init()
 
     # ---- the choices kept between starts
 

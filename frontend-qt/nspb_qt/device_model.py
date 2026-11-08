@@ -208,6 +208,11 @@ class DeviceMixin:
             self.log(msg + '\n')
             self.finished.emit(ok, msg)
             return
+        if getattr(self, 'queue_defers_install', lambda: False)():
+            # a queued game: the queue's end installs every game it built at once (queue_model.py)
+            self.queue_built(game.titleID)
+            self.finished.emit(True, self.t('queue.built', game.name))
+            return
         udid = self.install_udid
         if self.device_install_ready and udid and self.device_by_udid(udid) is not None:
             # the games already on the device and this one (a device never installed from this PC gets every game)
