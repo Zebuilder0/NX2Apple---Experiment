@@ -31,6 +31,7 @@ import ssl
 import struct
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -86,6 +87,29 @@ class AppMissing(DeviceError):
     """The app is not installed on the device."""
 
 
+class Cancelled(DeviceError):
+    """The player stopped the copy. Not a failure: the install reports it as stopped."""
+
+
+#: What a broken or unexpected answer raises underneath the protocols: the socket (a timeout, a reset, a pulled
+#: cable), TLS (ssl.SSLError is an OSError), a plist that does not parse (plistlib.InvalidFileException is a
+#: ValueError), a frame cut short. The readers below turn each into DeviceError, so every caller handles one
+#: exception and the device list, the install and the copy never stop on a raw traceback.
+TRANSPORT_ERRORS = (OSError, ValueError, struct.error, EOFError)
+
+
+@contextmanager
+def _transport(what: str):
+    """Run a device exchange: a transport failure becomes a DeviceError that names `what`."""
+    try:
+        yield
+    except DeviceError:
+        raise
+    except TRANSPORT_ERRORS as e:
+        raise DeviceError(f'{what} failed ({e or type(e).__name__}): keep the device connected and unlocked, '
+                          'then try again') from e
+
+
 @dataclass
 class Device:
     udid: str
@@ -106,7 +130,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise DeviceError('the device connection closed')
+            raise DeviceError('the device connection closed: keep the device connected and unlocked, then try again')
         buf += chunk
     return bytes(buf)
 
@@ -152,15 +176,22 @@ class Mux:
                                'kLibUSBMuxVersion': 3, **msg})
         tag = self.tag
         self.tag += 1
-        self.sock.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, tag) + body)
+        with _transport("Apple's USB service"):
+            self.sock.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, tag) + body)
         return tag
 
     def recv(self) -> dict:
-        size, _version, message, _tag = struct.unpack('<IIII', _recv_exact(self.sock, 16))
-        body = _recv_exact(self.sock, size - 16)
-        if message != 8:
-            raise DeviceError(f'usbmuxd sent message type {message}, not a plist')
-        return plistlib.loads(body)
+        with _transport("Apple's USB service"):
+            size, _version, message, _tag = struct.unpack('<IIII', _recv_exact(self.sock, 16))
+            if size < 16 or size > 16 + (64 << 20):
+                raise DeviceError(f'usbmuxd sent a damaged reply ({size} bytes)')
+            body = _recv_exact(self.sock, size - 16)
+            if message != 8:
+                raise DeviceError(f'usbmuxd sent message type {message}, not a plist')
+            r = plistlib.loads(body)
+        if not isinstance(r, dict):
+            raise DeviceError("Apple's USB service sent a reply that is not a dictionary")
+        return r
 
     def request(self, msg: dict) -> dict:
         self.send(msg)
@@ -170,18 +201,24 @@ class Mux:
         r = self.request({'MessageType': 'ListDevices'})
         out: list[Device] = []
         for item in r.get('DeviceList') or []:
-            props = item.get('Properties') or {}
-            udid = props.get('SerialNumber') or ''
+            props = (item.get('Properties') if isinstance(item, dict) else None) or {}
+            udid = str(props.get('SerialNumber') or '')
+            try:
+                number = int(item.get('DeviceID', props.get('DeviceID', 0)))
+            except (TypeError, ValueError):
+                continue                    # an entry without a usable device number cannot be reached
             if udid:
-                out.append(Device(udid=udid, device_id=int(item.get('DeviceID', props.get('DeviceID', 0))),
-                                  connection=props.get('ConnectionType', 'USB')))
+                out.append(Device(udid=udid, device_id=number, connection=str(props.get('ConnectionType', 'USB'))))
         return out
 
     def pair_record(self, udid: str) -> dict | None:
         r = self.request({'MessageType': 'ReadPairRecord', 'PairRecordID': udid})
         data = r.get('PairRecordData')
         if data:
-            return plistlib.loads(data)
+            with _transport("this PC's pairing record"):
+                record = plistlib.loads(data)
+            if isinstance(record, dict):
+                return record
         return lockdown_folder_record(udid)
 
 
@@ -248,13 +285,18 @@ class PlistSocket:
 
     def send(self, msg: dict) -> None:
         body = plistlib.dumps(msg)
-        self.sock.sendall(struct.pack('>I', len(body)) + body)
+        with _transport('the connection to the device'):
+            self.sock.sendall(struct.pack('>I', len(body)) + body)
 
     def recv(self) -> dict:
-        (size,) = struct.unpack('>I', _recv_exact(self.sock, 4))
-        if size > 64 << 20:
-            raise DeviceError(f'a device reply of {size} bytes is not a plist')
-        return plistlib.loads(_recv_exact(self.sock, size))
+        with _transport('the connection to the device'):
+            (size,) = struct.unpack('>I', _recv_exact(self.sock, 4))
+            if size > 64 << 20:
+                raise DeviceError(f'a device reply of {size} bytes is not a plist')
+            r = plistlib.loads(_recv_exact(self.sock, size))
+        if not isinstance(r, dict):
+            raise DeviceError('the device sent a reply that is not a dictionary')
+        return r
 
     def request(self, msg: dict) -> dict:
         self.send(msg)
@@ -291,7 +333,11 @@ def tls_context(record: dict) -> ssl.SSLContext:
     try:
         with os.fdopen(fd, 'wb') as f:
             f.write(bytes(cert) + b'\n' + bytes(key))
-        ctx.load_cert_chain(path)
+        try:
+            ctx.load_cert_chain(path)
+        except (ssl.SSLError, ValueError) as e:
+            raise NotPaired(f'the pair record\'s certificate cannot be used ({e}): unplug the device, plug it in '
+                            'again and tap Trust') from e
     finally:
         try:
             os.unlink(path)
@@ -313,11 +359,16 @@ class Lockdown:
                             'unlock it and tap Trust')
         self.record = record
         self._mux = Mux(timeout=timeout)
-        self.conn = PlistSocket(self._mux.connect(device.device_id, LOCKDOWN_PORT))
+        self.conn: PlistSocket | None = None
         try:
+            self.conn = PlistSocket(self._mux.connect(device.device_id, LOCKDOWN_PORT))
             self._start_session(record)
         except BaseException:
-            self.conn.close()          # a refused session must not leave the connection open
+            # a refused connection or session must not leave the socket open (the 20-second device poll would
+            # leak one per try against a locked or untrusted device). With TLS on, conn holds the socket.
+            if self.conn is not None:
+                self.conn.close()
+            self._mux.close()
             raise
 
     def _start_session(self, record: dict) -> None:
@@ -331,7 +382,8 @@ class Lockdown:
                 raise NotPaired('the device does not trust this PC yet: unlock it and tap Trust')
             raise DeviceError(f'the device refused a session: {r["Error"]}')
         if r.get('EnableSessionSSL'):
-            self.conn.sock = tls_context(record).wrap_socket(self.conn.sock)
+            with _transport('the secure session with the device'):
+                self.conn.sock = tls_context(record).wrap_socket(self.conn.sock)
 
     def close(self) -> None:
         try:
@@ -363,10 +415,19 @@ class Lockdown:
             if r['Error'] == 'PasswordProtected':
                 raise Locked('the device is locked: unlock it and keep it unlocked during the copy')
             raise DeviceError(f'the device refused {name}: {r["Error"]}')
+        try:
+            port = int(r['Port'])
+        except (KeyError, TypeError, ValueError) as e:
+            raise DeviceError(f'the device started {name} without a port') from e
         mux = Mux(timeout=self.timeout)
-        sock = mux.connect(self.device.device_id, int(r['Port']))
-        if r.get('EnableServiceSSL'):
-            sock = tls_context(self.record).wrap_socket(sock)
+        try:
+            sock = mux.connect(self.device.device_id, port)
+            if r.get('EnableServiceSSL'):
+                with _transport(f'the secure connection to {name}'):
+                    sock = tls_context(self.record).wrap_socket(sock)
+        except BaseException:
+            mux.close()                # a refused service must not leave its socket open
+            raise
         return PlistSocket(sock)
 
     def name(self) -> str:
@@ -431,12 +492,15 @@ class Afc:
         answer's operation and body. A failure status raises, with the AFC error code."""
         this = AFC_HEADER.size + len(data)
         whole = this + len(payload)
-        self.sock.sendall(AFC_HEADER.pack(AFC_MAGIC, whole, this, self.packet, operation) + data + payload)
-        self.packet += 1
-        magic, whole, this, _num, rop = AFC_HEADER.unpack(_recv_exact(self.sock, AFC_HEADER.size))
-        if magic != AFC_MAGIC:
-            raise DeviceError('the device sent a damaged file-transfer reply')
-        body = _recv_exact(self.sock, whole - AFC_HEADER.size) if whole > AFC_HEADER.size else b''
+        with _transport('the file transfer'):
+            self.sock.sendall(AFC_HEADER.pack(AFC_MAGIC, whole, this, self.packet, operation) + data + payload)
+            self.packet += 1
+            magic, whole, this, _num, rop = AFC_HEADER.unpack(_recv_exact(self.sock, AFC_HEADER.size))
+            if magic != AFC_MAGIC:
+                raise DeviceError('the device sent a damaged file-transfer reply')
+            if whole - AFC_HEADER.size > 64 << 20:
+                raise DeviceError(f'the device sent a file-transfer reply of {whole} bytes')
+            body = _recv_exact(self.sock, whole - AFC_HEADER.size) if whole > AFC_HEADER.size else b''
         if rop == AFC_STATUS:
             code = struct.unpack_from('<Q', body)[0] if len(body) >= 8 else 0
             if code:
@@ -455,11 +519,17 @@ class Afc:
                 return None
             raise
         parts = body.split(b'\0')
-        return {parts[i].decode(): parts[i + 1].decode() for i in range(0, len(parts) - 1, 2)}
+        return {parts[i].decode(errors='replace'): parts[i + 1].decode(errors='replace')
+                for i in range(0, len(parts) - 1, 2)}
 
     def size(self, path: str) -> int | None:
         st = self.stat(path)
-        return int(st.get('st_size', 0)) if st and st.get('st_ifmt') != 'S_IFDIR' else None
+        if not st or st.get('st_ifmt') == 'S_IFDIR':
+            return None
+        try:
+            return int(st.get('st_size', 0))
+        except ValueError:
+            return None                 # an unreadable size: the file is copied again
 
     def makedirs(self, path: str) -> None:
         self.op(AFC_MAKE_DIR, self._path(path))   # makes the missing parents too
@@ -477,26 +547,43 @@ class Afc:
     def put(self, local: Path, remote: str, progress: Callable[[int], None] | None = None,
             cancelled: Callable[[], bool] | None = None) -> None:
         """Copy a file to `remote` through `remote.part`, renamed at the end: a stopped copy never
-        leaves a file the app could take for whole."""
+        leaves a file the app could take for whole. A stopped or failed copy removes its `.part`, which
+        the app never reads and which would hold gigabytes of the device's space. A stop raises Cancelled."""
         part = remote + '.part'
-        _, body = self.op(AFC_FILE_OPEN, struct.pack('<Q', AFC_MODE_WRONLY) + self._path(part))
-        handle = struct.pack('<Q', struct.unpack_from('<Q', body)[0])
         try:
-            with open(local, 'rb') as f:
+            f = open(local, 'rb')
+        except OSError as e:
+            raise DeviceError(f'cannot read {local}: {e}') from e
+        with f:
+            _, body = self.op(AFC_FILE_OPEN, struct.pack('<Q', AFC_MODE_WRONLY) + self._path(part))
+            if len(body) < 8:
+                raise DeviceError('the device opened a file without a handle')
+            handle = struct.pack('<Q', struct.unpack_from('<Q', body)[0])
+            whole = False
+            try:
                 while True:
                     if cancelled and cancelled():
-                        raise DeviceError('the copy was stopped')
-                    chunk = f.read(AFC_WRITE_CHUNK)
+                        raise Cancelled('the copy was stopped')
+                    try:
+                        chunk = f.read(AFC_WRITE_CHUNK)
+                    except OSError as e:
+                        raise DeviceError(f'cannot read {local}: {e}') from e
                     if not chunk:
                         break
                     self.op(AFC_WRITE, handle, chunk)
                     if progress:
                         progress(len(chunk))
-        finally:
-            try:
-                self.op(AFC_FILE_CLOSE, handle)
-            except (DeviceError, OSError):
-                pass
+                whole = True
+            finally:
+                try:
+                    self.op(AFC_FILE_CLOSE, handle)
+                except DeviceError:
+                    pass
+                if not whole:
+                    try:
+                        self.remove(part)
+                    except DeviceError:
+                        pass            # the connection is gone: the next copy of this file overwrites it
         self.remove(remote)
         self.rename(part, remote)
 
@@ -510,7 +597,11 @@ class AfcError(DeviceError):
 def open_documents(lockdown: Lockdown, bundle_id: str) -> Afc:
     """The app's container over AFC (`VendDocuments`: its Documents are at `/Documents`)."""
     svc = lockdown.service(HOUSE_ARREST)
-    r = svc.request({'Command': 'VendDocuments', 'Identifier': bundle_id})
+    try:
+        r = svc.request({'Command': 'VendDocuments', 'Identifier': bundle_id})
+    except BaseException:
+        svc.close()
+        raise
     if r.get('Error'):
         svc.close()
         if r['Error'] == 'ApplicationLookupFailed':

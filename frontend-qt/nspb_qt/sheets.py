@@ -559,7 +559,7 @@ class OnboardingDialog(QDialog):
 
     #: The steps, in order. Windows adds the iPhone or iPad step (signing and installing on a device), which the Mac
     #: launcher does not need: Xcode does both there.
-    DEVICE_IDS = ('amds', 'signer', 'apple_id', 'shell_template')
+    from .device_model import DEVICE_DEP_IDS as DEVICE_IDS    # one list, with the Settings card's
 
     def steps(self) -> list[str]:
         return ['welcome', 'tools'] + (['device'] if pu.IS_WIN else []) + ['keys', 'games']

@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,11 @@ class Outcome:
     failure: str = ''               # an en.json key with what to do next, '' when none
     bundle_id: str = ''
     copied_files: int = 0
+    stopped: bool = False           # the player stopped it: neither a success nor a failure to explain
+
+
+#: A stage's state when the player stopped the run there (the window shows it neither green nor red).
+STOPPED = 'stopped'
 
 
 @dataclass
@@ -49,34 +55,62 @@ class DeviceState:
     titles: list = field(default_factory=list)     # the title IDs in the app on this device ([]: every built game)
 
 
+#: One writer of devices.json at a time in this app (an install, the automatic update, the window).
+_DEVICES_LOCK = threading.Lock()
+
+
+def _device_state(d) -> DeviceState | None:
+    """One entry of devices.json, None when it is damaged (a hand edit, a cut-off write): that device is then
+    treated as never installed from this PC, and the other devices keep theirs."""
+    if not isinstance(d, dict):
+        return None
+    try:
+        return DeviceState(str(d.get('bundle', '')), float(d.get('signed', 0) or 0), str(d.get('games', '')),
+                           str(d.get('name', '')), {str(k): str(v) for k, v in dict(d.get('receipts') or {}).items()},
+                           [str(t).upper() for t in d.get('titles') or []])
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 class Devices:
     """`<root>/devices.json`."""
 
     def __init__(self, root: Path):
         self.path = Path(root) / 'devices.json'
+        self.items: dict[str, DeviceState] = self._read()
+
+    def _read(self) -> dict[str, DeviceState]:
         try:
             raw = json.loads(self.path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             raw = {}
-        self.items: dict[str, DeviceState] = {}
+        items = {}
         for udid, d in (raw.items() if isinstance(raw, dict) else []):
-            if isinstance(d, dict):
-                self.items[udid] = DeviceState(str(d.get('bundle', '')), float(d.get('signed', 0) or 0),
-                                               str(d.get('games', '')), str(d.get('name', '')),
-                                               dict(d.get('receipts') or {}),
-                                               [str(t).upper() for t in d.get('titles') or []])
+            state = _device_state(d)
+            if state is not None:
+                items[str(udid)] = state
+        return items
 
     def get(self, udid: str) -> DeviceState | None:
         return self.items.get(udid)
 
     def put(self, udid: str, state: DeviceState) -> None:
-        self.items[udid] = state
-        self.save()
+        """Save one device's entry. The file is read again first: an install keeps its Devices for minutes, and its
+        old copy must not write over what another device's install or the window saved meanwhile."""
+        with _DEVICES_LOCK:
+            items = self._read()
+            items[udid] = state
+            self.items = items
+            self._write(items)
 
     def save(self) -> None:
+        with _DEVICES_LOCK:
+            self._write(self.items)
+
+    def _write(self, items: dict[str, DeviceState]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
-        tmp.write_text(json.dumps({u: vars(s) for u, s in self.items.items()}, indent=2, sort_keys=True),
+        tmp.write_text(json.dumps({u: vars(s) for u, s in items.items()}, indent=2, sort_keys=True),
                        encoding='utf-8')
         os.replace(tmp, self.path)
 
@@ -196,8 +230,13 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     `titles` are the games the app holds (a game left out is removed from the app on the device); by default the
     ones it held after the last install from this PC, else every built game.
     `stage(key, state, detail, percent)` reports the steps: key is an en.json key, state
-    'running', 'done' or 'failed'."""
+    'running', 'done', 'failed' or 'stopped'. A stop (`cancelled()`) is checked between the steps and between the
+    games, and stops a copy mid-file: it returns `Outcome(stopped=True)`, never a success."""
     root = Path(root)
+
+    def stop(key: str, bundle_id: str = '', copied: int = 0) -> Outcome:
+        stage(key, STOPPED, t('msg.stopped'), 0)
+        return Outcome(False, ('win.install.stopped',), '', bundle_id, copied, stopped=True)
     template = template or shell.find_template()
     if not template:
         return Outcome(False, ('win.install.noTemplate',), 'win.install.noTemplate.next')
@@ -249,7 +288,7 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     log(f'shared app: {len(games)} game(s): {", ".join(g.name for g in games)}\n')
     stage('win.install.stage.prepare', 'done', f'{len(games)}', 100)
     if cancelled():
-        return Outcome(False, ('msg.stopped',))
+        return stop('win.install.stage.sign')
 
     # 2. sign and install. The signing tool talks to Apple for a while before it installs anything: the step shows
     # the tool's own latest line, so the window moves while the percentage cannot.
@@ -266,6 +305,11 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         if step:
             stage('win.install.stage.sign', 'running', step, last_pct[0])
     r = signer.sign_and_install(app, dev.device_id, log=sign_log, exe=exe, started=started, progress=on_progress)
+    if not r.ok and cancelled():
+        # Stop ends the signing tool (device_model.cancel_install): its exit is the stop, not a failure to explain.
+        # A stop that came after the tool finished keeps its install: the app is on the device, so it is remembered
+        # below and the copy loop then stops before the first game.
+        return stop('win.install.stage.sign')
     if not r.ok:
         last = next((ln for ln in reversed(r.output.splitlines()) if ln.strip()), '')
         stage('win.install.stage.sign', 'failed', last[:160], 0)
@@ -294,7 +338,7 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     plan = CopyPlan([(tid, names.get(tid.upper(), names.get(tid, tid)), folder) for tid, folder in data])
     for number, (title_id, folder) in enumerate(data, 1):
         if cancelled():
-            break
+            return stop('win.install.stage.data', bundle, copied)
         stamp = data_stamp(folder)
         force = ['romfs.img'] if stamp and state.receipts.get(title_id.upper()) != stamp else []
         stage('win.install.stage.data', 'running', name, 0)
@@ -309,6 +353,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         try:
             n, game_bytes = dv.copy_game_data(dev, bundle, title_id, Path(folder), force=force, log=log,
                                               cancelled=cancelled, progress=on_copy)
+        except dv.Cancelled:
+            return stop('win.install.stage.data', bundle, copied)
         except dv.DeviceError as e:
             stage('win.install.stage.data', 'failed', str(e)[:160], 0)
             return Outcome(False, ('win.install.dataFailed', str(e)), 'win.install.dataFailed.next', bundle)

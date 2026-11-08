@@ -27,6 +27,7 @@ from . import library as lib
 from . import platform_util as pu
 from .i18n import Lang
 from .l10n import t
+from .signals import emit_safely
 
 
 # ---------------------------------------------------------------- dependency rows
@@ -59,6 +60,15 @@ class Dep:
 
 
 # ---------------------------------------------------------------- build stages
+
+def app_settings() -> QSettings:
+    """The launcher's settings: the player's own, or an ini file in NSPB_STATE_DIR when that is set (a portable copy,
+    the tests' sandbox), so the settings always live with the rest of the state (library.default_state_dir)."""
+    state = os.environ.get('NSPB_STATE_DIR')
+    if state:
+        return QSettings(str(Path(state) / 'settings.ini'), QSettings.IniFormat)
+    return QSettings('NS Port Builder', 'NSPortBuilder')
+
 
 def archive_folder(output: str, key: str) -> Path:
     """Where a game's data is packed: <output>/games/<title ID>/ (romfs.img and aoc/), one folder per game."""
@@ -107,9 +117,9 @@ class Model(QObject, DeviceMixin, QueueMixin):
     ask_file: Callable[[str], str] | None = None
     _metal_zip: Path | None = None
 
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.settings = QSettings('NS Port Builder', 'NSPortBuilder')
+        self.settings = settings if settings is not None else app_settings()
         self.lang = Lang.initial()
         self.repo_path = self._find_repo()
         self.python_path, self.python_ok, self.python_ver = pu.find_python()
@@ -117,7 +127,13 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.deps: list[Dep] = []
         self.deps_checked = False
         self.stages: list[Stage] = []
+        # One run at a time (begin_run / end_run): a build with its archive step and the install after it, an install,
+        # an IPA export. `running` lasts until the run's real end, so nothing else starts in between.
         self.running = False
+        self.run_kind = ''              # 'build', 'install' or 'export': what the activity bar says runs
+        self.run_stopped = False        # the last run ended because the player stopped it (not a failure)
+        self._cancel_requested = False  # Stop was pressed during this run (cancel_run)
+        self._sync_waiters: list[Callable[[bool], None]] = []   # callers waiting for the engine sync that runs
         self.log_tail = ''
         self.engine_syncing = False   # tools/engine.py sync runs: the window shows a status line
         self.engine_failure: bf.Failure | None = None   # how the last sync stopped (engine.py's failure_kind), shown as a failure row with Try again
@@ -170,13 +186,14 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.log_path.write_text('', encoding='utf-8')
         except OSError:
             self.log_path = None
+        if self.library.load_problem:     # a damaged library.json was moved aside, not overwritten: say where it is
+            self.log(self.library.load_problem + '\n')
         self._device_init()
         # The build's choices last from one start to the next (the Mac launcher keeps the output folder, the target and
         # the texture switch; this one also keeps prod.keys and the last game, so a new start does not ask for them
-        # again). Not under the offscreen test platform, whose runs must not read or write the player's settings.
-        self._persist_choices = os.environ.get('QT_QPA_PLATFORM') != 'offscreen'
-        if self._persist_choices:
-            self.restore_choices()
+        # again). Always: a test keeps the player's settings out of reach through NSPB_STATE_DIR (app_settings).
+        self._persist_choices = True
+        self.restore_choices()
         self._queue_init()
 
     # ---- the choices kept between starts
@@ -218,8 +235,11 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.dlc_paths = [str(d) for d in last.get('dlc') or [] if os.path.isfile(str(d))]
 
     def remember_choices(self) -> None:
-        """Write what restore_choices reads. Called by the window after every change of a choice."""
+        """Write what restore_choices reads. Called by the window after every change of a choice. Not while the queue
+        has loaded a queued game's choices: those are not the player's (the queue gives the page its own back)."""
         if not getattr(self, '_persist_choices', False):
+            return
+        if getattr(self, 'queue_drives_inputs', lambda: False)():
             return
         s = self.settings
         s.setValue('buildKeysPath', self.keys_path or '')
@@ -245,6 +265,55 @@ class Model(QObject, DeviceMixin, QueueMixin):
     def exports_one_game(self) -> bool:
         """The build makes one game's own IPA with its data inside, not a framework for the shared app."""
         return self.ipa_kind == 'oneGame' and (not pu.IS_WIN or self.output_mode == 'ipa')
+
+    # ---- the run
+
+    def begin_run(self, kind: str) -> bool:
+        """Start a run of `kind` ('build', 'install', 'export'); False when one is running already. The run lasts
+        until end_run: a build's archive step and the install that follows it belong to it, so neither the queue nor a
+        second build nor an install can start in the gap."""
+        if self.running:
+            return False
+        self.running = True
+        self.run_kind = kind
+        self.run_stopped = False
+        self._cancel_requested = False
+        emit_safely(self.runningChanged, True)
+        return True
+
+    def end_run(self, ok: bool, note: str, *, stopped: bool = False) -> None:
+        """The one end of every run: `running` goes false, then `finished` says how it ended. `stopped`: the player
+        stopped it, which the window shows as stopped, not as a failure."""
+        self._proc = None
+        self.transfer_info = None
+        self.running = False
+        self.run_stopped = stopped
+        emit_safely(self.runningChanged, False)
+        emit_safely(self.finished, ok, note)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested
+
+    def cancel_run(self) -> None:
+        """Stop, from any Stop button: the run checks the flag between its steps, and the tool running now (the
+        build script, the RomFS packer, the signing tool) is ended at once."""
+        self._cancel_requested = True
+        p = self._proc
+        if p is not None:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except OSError:
+                pass
+
+    def _end_stopped(self) -> None:
+        for st in self.stages:
+            if st.state == 'running':
+                st.state = 'stopped'
+        emit_safely(self.stagesChanged)
+        self.log(self.t('msg.stopped') + '\n')
+        self.end_run(False, self.t('msg.stopped'), stopped=True)
 
     # ---- strings
 
@@ -323,7 +392,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.settings.setValue('shellRoot', '')
         else:
             self.settings.setValue('shellRoot', str(dst))
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
         return True, self.t('shellCache.moved', str(dst))
 
     def reset_shell_cache_default(self) -> tuple[bool, str]:
@@ -338,19 +407,19 @@ class Model(QObject, DeviceMixin, QueueMixin):
 
     def toggle_lang(self) -> None:
         self.lang = self.lang.other
-        self.repoChanged.emit()
-        self.depsChanged.emit()
+        emit_safely(self.repoChanged)
+        emit_safely(self.depsChanged)
 
     def set_lang(self, lang: Lang) -> None:
         self.lang = lang
-        self.repoChanged.emit()
-        self.depsChanged.emit()
+        emit_safely(self.repoChanged)
+        emit_safely(self.depsChanged)
 
     @Slot()
     def _emit_library_changed(self) -> None:
         try:
             if QThread.currentThread() is self.thread():
-                self.libraryChanged.emit()
+                emit_safely(self.libraryChanged)
             else:
                 QMetaObject.invokeMethod(self, '_emit_library_changed', Qt.QueuedConnection)
         except RuntimeError:
@@ -373,7 +442,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.ipa_path = game.ipa_path if game.has_ipa else ''
         self.archive_path = game.archive_path if game.has_archive else ''
         self.library.select(game.title_id)
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
 
     # ---- repository
 
@@ -390,7 +459,9 @@ class Model(QObject, DeviceMixin, QueueMixin):
         """Run `tools/engine.py sync` on a thread when engine/ is stale (after a pull, at the start, before a build that
         needs it). A no-op for a checkout from before #214 or a current engine/. `then(ok)` runs after it."""
         if getattr(self, '_engine_syncing', False):
-            if then: then(True)
+            # a sync runs already: the caller hears its real result when it ends (a build pressed during the sync
+            # used to hear True at once, find the engine still stale and say the engine folder was invalid)
+            if then: self._sync_waiters.append(then)
             return
         if not engine.is_stale(self.repo_path):
             self.engine_failure = None
@@ -402,7 +473,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.engine_syncing = True
         self.engine_failure = None
         self.log('$ ' + ' '.join(cmd) + '\n')
-        self.repoChanged.emit()   # the window shows the status line
+        emit_safely(self.repoChanged)   # the window shows the status line
+
+        def done(ok: bool) -> None:
+            waiters, self._sync_waiters = self._sync_waiters, []
+            for w in ([then] if then else []) + waiters:
+                w(ok)
 
         def work() -> None:
             # The sync drives git throughout (hooks, fetch, patch, pack), and Windows may have
@@ -417,16 +493,16 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     self._engine_syncing = False
                     self.engine_syncing = False
                     self.engine_failure = bf.Failure(engine.ENGINE_SYNC)
-                    self.repoChanged.emit()
-                    if then: then(False)
+                    emit_safely(self.repoChanged)
+                    done(False)
                     return
                 extra = {'PATH': str(Path(git).parent) + os.pathsep + pu.child_env()['PATH']}
             ok, kind = engine.run_sync(cmd, self.repo_path, self.log, env=pu.child_env(extra), **pu.no_window_kwargs())
             self._engine_syncing = False
             self.engine_syncing = False
             self.engine_failure = None if ok else bf.Failure(kind or engine.ENGINE_SYNC)
-            self.repoChanged.emit()
-            if then: then(ok)
+            emit_safely(self.repoChanged)
+            done(ok)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -436,7 +512,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             return
         self.engine_failure = None
         self.sync_engine()
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
 
     def _find_repo(self) -> str:
         saved = os.environ.get('NSPB_REPO', '')
@@ -479,10 +555,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
 
     def check_deps(self) -> None:
         self.deps_checked = False
-        try:
-            self.depsChanged.emit()      # the window says "Checking…" with its wheel at once, not when the check ends
-        except RuntimeError:
-            pass
+        emit_safely(self.depsChanged)      # the window says "Checking…" with its wheel at once, not when the check ends
         self.sync_engine()   # at the start: a checkout whose engine/ is missing or older than its pin (#214)
         threading.Thread(target=self._check_deps_worker, daemon=True).start()
 
@@ -503,10 +576,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.log(traceback.format_exc() + '\n')
             self.deps = []
             self.deps_checked = True
-            try:
-                self.depsChanged.emit()
-            except RuntimeError:
-                pass
+            emit_safely(self.depsChanged)
 
     def _python_row(self, py: str, py_ok: bool, py_ver: str) -> Dep:
         """The interpreter row: fine, missing packages, missing interpreter, or too old.
@@ -614,10 +684,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.python_path, self.python_ok, self.python_ver = py, py_ok, py_ver
             self.dotnet_path, self.dotnet_ok = dn, dn_ok
         self.deps_checked = True
-        try:
-            self.depsChanged.emit()
-        except RuntimeError:
-            pass
+        emit_safely(self.depsChanged)
         if getattr(sys, 'frozen', False) and not self._app_update_checked:
             self._app_update_checked = True
             self.check_app_update(silent=True)
@@ -788,7 +855,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         try:
             from .win import fetch as wf
             self.log(self.t('repo.gitInstalling') + '\n')
-            self.repoChanged.emit()
+            emit_safely(self.repoChanged)
             wf.install_git(log=lambda s: self.log(str(s) + '\n'))
         except Exception as e:
             self.log(f'git install failed: {e}\n')
@@ -804,14 +871,14 @@ class Model(QObject, DeviceMixin, QueueMixin):
         git = self.git_binary()
         if not git:
             if not pu.IS_WIN:
-                self.repoChanged.emit()
+                emit_safely(self.repoChanged)
                 self.log(self.t('repo.gitMissing') + '\n')
                 return
             # Windows with no git at all: fetch PortableGit, then carry on with the clone. This is
             # the one case where "one click" has to install something first; it needs no
             # administrator rights and no installer.
             self.repo_busy = True
-            self.repoChanged.emit()
+            emit_safely(self.repoChanged)
             self.log(self.t('repo.gitInstalling') + '\n')
 
             def install_then_clone() -> None:
@@ -826,7 +893,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 except Exception as e:
                     self.log(self.t('repo.gitInstallFail', str(e)) + '\n')
                 self.repo_busy = False
-                self.repoChanged.emit()
+                emit_safely(self.repoChanged)
                 if ok:
                     self.clone_repo(dest)      # now git exists: the normal path
                 else:
@@ -838,12 +905,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if Path(target).exists():
             if self.is_repo(target):
                 self.repo_path = target
-                self.repoChanged.emit()
+                emit_safely(self.repoChanged)
             else:
                 self.log(self.t('repo.destBusy', target) + '\n')
             return
         self.repo_busy = True
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
         self.log(f'$ git clone --depth 1 {self.REPO_URL} {target}\n')
 
         def work() -> None:
@@ -867,7 +934,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 self.sync_engine()
             elif not ok:
                 shutil.rmtree(target, ignore_errors=True)   # a failed clone leaves a stub
-            self.repoChanged.emit()
+            emit_safely(self.repoChanged)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -892,7 +959,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             return
         self.repo_busy = True
         self.repo_status = self.t('repo.checking')
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
         self.log(self.t('repo.checking') + '\n')
 
         def stream(args: list[str], what: str) -> bool:
@@ -950,7 +1017,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     self.log(self.repo_status + '\n')
                     return
                 self.repo_status = self.t('repo.pulling')
-                self.repoChanged.emit()
+                emit_safely(self.repoChanged)
                 self.log(self.t('repo.pulling') + '\n')
                 if stream(['pull', '--ff-only', 'origin', 'main'], 'pull'):
                     self.repo_behind = 0
@@ -961,7 +1028,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 self.log(self.repo_status + '\n')
             finally:
                 self.repo_busy = False
-                self.repoChanged.emit()
+                emit_safely(self.repoChanged)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -974,10 +1041,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.app_update_busy = True
         if not silent:
             self.app_update_status = self.t('app.checking')
-            try:
-                self.repoChanged.emit()
-            except RuntimeError:
-                pass
+            emit_safely(self.repoChanged)
 
         def work() -> None:
             try:
@@ -991,10 +1055,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     else:
                         self.app_update_status = self.t('app.devBuild', rel.tag)
                     self.log(self.app_update_status + '\n')
-                    try:
-                        self.appUpdateFound.emit(rel.tag, rel.html_url)
-                    except RuntimeError:
-                        pass
+                    emit_safely(self.appUpdateFound, rel.tag, rel.html_url)
                 elif outcome.kind == 'no_asset':
                     if not silent:
                         self.app_update_status = self.t('app.noAsset', outcome.tag)
@@ -1006,10 +1067,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                         self.app_update_status = self.t('app.upToDate')
             finally:
                 self.app_update_busy = False
-                try:
-                    self.repoChanged.emit()
-                except RuntimeError:
-                    pass
+                emit_safely(self.repoChanged)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1020,36 +1078,38 @@ class Model(QObject, DeviceMixin, QueueMixin):
             return
         if self.running:
             self.app_update_status = self.t('app.waitForBuild')
-            try:
-                self.repoChanged.emit()
-            except RuntimeError:
-                pass
+            emit_safely(self.repoChanged)
             return
         if not (pu.IS_WIN and getattr(sys, 'frozen', False)):
             self.app_update_status = self.t('app.devBuild', rel.tag)
-            try:
-                self.repoChanged.emit()
-            except RuntimeError:
-                pass
+            emit_safely(self.repoChanged)
             return
 
         self.app_update_busy = True
         self.app_update_status = self.t('app.downloading', rel.tag)
         self.log(self.app_update_status + '\n')
-        try:
-            self.repoChanged.emit()
-        except RuntimeError:
-            pass
+        emit_safely(self.repoChanged)
 
         def work() -> None:
             try:
                 from .win import fetch as wf
+                # The release's own SHA-256 (GitHub's asset digest) is what the download is checked against: the app
+                # replaces its own program with this zip, so a release without one is not installed (the Mac app
+                # refuses an update it cannot verify too). download() needs the hash; it was called without one,
+                # which raised TypeError on every update and showed as a network failure.
+                sha = app_update.digest_hex(rel.digest)
+                if not sha:
+                    self.app_update_status = self.t('app.noDigest', rel.tag)
+                    self.log(self.app_update_status + '\n')
+                    return
                 root = app_update.fresh_staging_root()
                 zip_path = root / 'update.zip'
                 try:
                     wf.download(
                         rel.url,
                         zip_path,
+                        sha,
+                        log=lambda s: self.log(s + '\n'),
                         progress=lambda d, tot: self.log(
                             f'  {d // 1048576} MB'
                             + (f' / {tot // 1048576} MB ({d * 100 // tot}%)' if tot else '')
@@ -1062,7 +1122,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     return
 
                 try:
-                    staged = app_update.stage_zip(zip_path, rel, root, require_digest=False)
+                    staged = app_update.stage_zip(zip_path, rel, root, require_digest=True)
                 except app_update.StageError as err:
                     if err.key == 'app.digestMismatch':
                         self.app_update_status = self.t('app.digestMismatch', rel.tag)
@@ -1078,19 +1138,13 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 self.app_update_status = self.t('app.relaunching', rel.tag)
                 self.log(self.app_update_status + '\n')
                 if app_update.relaunch_windows_update(staged):
-                    try:
-                        self.appRelaunching.emit()
-                    except RuntimeError:
-                        pass
+                    emit_safely(self.appRelaunching)
                 else:
                     self.app_update_status = self.t('app.relaunchFail', rel.tag)
                     self.log(self.app_update_status + '\n')
             finally:
                 self.app_update_busy = False
-                try:
-                    self.repoChanged.emit()
-                except RuntimeError:
-                    pass
+                emit_safely(self.repoChanged)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1120,7 +1174,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self._install_win(dep, dep.install[0].split(':', 1)[1])
             return
         dep.installing = True
-        self.depsChanged.emit()
+        emit_safely(self.depsChanged)
 
         def work() -> None:
             ok = True
@@ -1144,7 +1198,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             if not ok:
                 self.log(self.t('dep.install.fail', '-') + '\n')
             self._clear_installing(dep)
-            self.depsChanged.emit()
+            emit_safely(self.depsChanged)
             self.check_deps()
 
         threading.Thread(target=work, daemon=True).start()
@@ -1194,7 +1248,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         started, finished, or thrown.
         """
         dep.installing = True
-        self.depsChanged.emit()
+        emit_safely(self.depsChanged)
 
         def progress_logger(label: str):
             return self._progress_logger(label)
@@ -1275,7 +1329,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 self.log(traceback.format_exc() + '\n')
                 self._record_install_failure(dep, detail)
             self._clear_installing(dep)
-            self.depsChanged.emit()
+            emit_safely(self.depsChanged)
             self.check_deps()
 
         threading.Thread(target=work, daemon=True).start()
@@ -1550,12 +1604,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if ok and not engine.needs_sync_before_build(self.repo_path):
             self.start_build()
         else:
-            self.finished.emit(False, self.t('msg.repoInvalidEmpty'))
+            emit_safely(self.finished, False, self.t('msg.repoInvalidEmpty'))
 
     @Slot(str)
     def _emit_log(self, s: str) -> None:
         """Main-thread half of log(): see log() for why the hop exists."""
-        self.logAppended.emit(s)
+        emit_safely(self.logAppended, s)
 
     def log(self, s: str) -> None:
         """Append to the window's log and to the log file.
@@ -1572,7 +1626,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         """
         try:
             if QThread.currentThread() is self.thread():
-                self.logAppended.emit(s)
+                emit_safely(self.logAppended, s)
             else:
                 QMetaObject.invokeMethod(self, '_emit_log', Qt.QueuedConnection,
                                          Q_ARG(str, s))
@@ -1609,7 +1663,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.base_path = str(found['base']) if found['base'] else ''
         self.update_path = str(found['update']) if found['update'] else ''
         self.dlc_paths = [str(f) for f in found['dlc']]
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
 
     # ---- a game as a folder of its files or a NUP (Switch 2 games), see inputs.scan_game_folder
 
@@ -1633,7 +1687,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 newest = found.newest_update
                 self.update_path = newest[1] if newest else ''
                 self.dlc_paths = [p for _, p in found.dlc]
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
 
     def leave_game_folder(self) -> None:
         """Back to packages: the folder's rows are emptied, so a picked package never mixes with them."""
@@ -1698,7 +1752,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if self.running:
             return
         if not self.repo_ok:
-            self.finished.emit(False, self.t('msg.repoInvalidEmpty'))
+            emit_safely(self.finished, False, self.t('msg.repoInvalidEmpty'))
             return
         if engine.needs_sync_before_build(self.repo_path):
             # engine/ is the only engine and is stale or missing: make it, then build (a failed sync names its fix in the log)
@@ -1709,7 +1763,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if folder is not None:
             why = self.game_folder_engine_problem(folder)
             if why:
-                self.finished.emit(False, why)
+                emit_safely(self.finished, False, why)
                 return
         base_dir = folder.folder if folder is not None else str(Path(self.base_path).parent)
         # a game folder or a NUP goes to the script as it is: nothing is staged and no file is a package
@@ -1725,8 +1779,14 @@ class Model(QObject, DeviceMixin, QueueMixin):
             # files from different folders: a stable folder of links per game, so the script sees one
             # folder and its fingerprints match on the next build (#132)
             staging = input_staging.folder(work_dir)
-            if input_staging.sync(all_files, staging, hard_links=not pu.IS_WIN) == 0:
-                self.finished.emit(False, self.t('msg.stagingFailed'))
+            try:
+                # hard links on every system: NTFS has them too, and a copy is only the fallback (another volume)
+                staged = input_staging.sync(all_files, staging, hard_links=True)
+            except input_staging.StagingError as e:
+                emit_safely(self.finished, False, self.t('msg.stagingFileFailed', Path(e.path).name, e.reason))
+                return
+            if staged == 0:
+                emit_safely(self.finished, False, self.t('msg.stagingFailed'))
                 return
             input_dir = staging
 
@@ -1735,7 +1795,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if compressed and not pu._runs(py, ['-c', 'import nsz']):
             self.log(self.t('msg.installingNsz') + '\n')
             if not pu._runs(py, ['-m', 'pip', 'install', 'nsz']):
-                self.finished.emit(False, self.t('msg.nszFailed', py))
+                emit_safely(self.finished, False, self.t('msg.nszFailed', py))
                 return
 
         # On Windows the upstream script is started through the driver, which loads it as a
@@ -1801,14 +1861,18 @@ class Model(QObject, DeviceMixin, QueueMixin):
             )
             self._emit_library_changed()
 
-        self.running = True
-        self.runningChanged.emit(True)
+        # Where this build's game data goes, fixed now: the page's choices may change while it runs. Beside the game's
+        # files when no output folder is chosen: for a game folder base_path is empty, and Path('').parent is the
+        # app's own working folder, where the data of a game-folder build used to land.
+        archive_dest = str(archive_folder(self.out_dir or base_dir, tid_hex))
+        if not self.begin_run('build'):
+            return
         self.stages = []
         self.log_tail = ''
         self._last_error = ''
         self.failure = None
         self.override.cancel()
-        self.stagesChanged.emit()
+        emit_safely(self.stagesChanged)
         if flag:
             self.log(self.t('fail.override.note', flag) + '\n')
         self.log(self.t('msg.running', py + ' ' + ' '.join(args)) + '\n')
@@ -1853,29 +1917,30 @@ class Model(QObject, DeviceMixin, QueueMixin):
             finally:
                 self._proc = None
             self._flush_lines()
-            self.running = False
-            self.runningChanged.emit(False)
-            if mac_app:
+            if self._cancel_requested:
+                self._end_stopped()
+            elif mac_app:
                 exists = bool(self.mac_app_path) and Path(self.mac_app_path).exists()
-                self.finished.emit(exists, self.t('target.macDone' if exists else 'target.missingApp'))
+                self.end_run(exists, self.t('target.macDone' if exists else 'target.missingApp'))
             elif ok:
                 for st in self.stages:
                     if st.state == 'running':
                         st.state = 'done'
-                self.stagesChanged.emit()
+                emit_safely(self.stagesChanged)
                 if self.exports_one_game:
                     self._record_library_ios_completion()
-                    self.finished.emit(True, self.t('shell.oneGameDone', self.ipa_path))
+                    self.end_run(True, self.t('shell.oneGameDone', self.ipa_path))
                 elif shell_fw:
                     work_dir_ = self.effective_work_dir
-                    self.pack_archive(then=lambda ok_: self.after_framework_build(work_dir_, self.archive_path)
-                                      if ok_ else self.finished.emit(False, self.t('msg.archiveFailed')))
+                    self.pack_archive(dest=archive_dest,
+                                      then=lambda ok_: self.after_framework_build(work_dir_, self.archive_path)
+                                      if ok_ else self.end_run(False, self.t('msg.archiveFailed')))
                 else:
-                    self.pack_archive()
+                    self.pack_archive(dest=archive_dest)
             else:
                 if self.stages:
                     self.stages[-1].state = 'failed'
-                    self.stagesChanged.emit()
+                    emit_safely(self.stagesChanged)
                 # The last real line says more than the exit code: "Build failed (exit code 1)"
                 # on its own sent a reporter looking for a log that was not on screen (#52)
                 last = getattr(self, '_last_error', '')
@@ -1884,7 +1949,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 if known.kind != bf.UNKNOWN:   # a known early stop: the window explains it and offers the next step
                     self.failure = known
                     note = self.failure_what(known)
-                self.finished.emit(False, note)
+                self.end_run(False, note)
 
         self._thread = threading.Thread(target=work, daemon=True)
         self._thread.start()
@@ -1938,9 +2003,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
                                  install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
-        self.cancel_install()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        """The Builds page's Cancel and the activity bar's Stop: the same stop as the transfer window's."""
+        self.cancel_run()
 
     # ---- the script's own progress lines
 
@@ -1970,20 +2034,21 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 if self.stages and self.stages[-1].state == 'running':
                     self.stages[-1].state = 'done'
                 self.stages.append(Stage(name=name, state='running'))
-                self.stagesChanged.emit()
+                emit_safely(self.stagesChanged)
             elif name and '✓' in name:
                 if self.stages and self.stages[-1].state == 'running':
                     self.stages[-1].state = 'done'
-                    self.stagesChanged.emit()
+                    emit_safely(self.stagesChanged)
 
     def _flush_lines(self) -> None:
         self._line_buf = ''
 
     # ---- the archive step (what makes a 16 GB game installable)
 
-    def pack_archive(self, then: Callable[[bool], None] | None = None) -> None:
-        """Pack the game data next to the output (`romfs/romfs.img`). `then(ok)` replaces the
-        finished signal when more follows (the install of the shared app on Windows)."""
+    def pack_archive(self, then: Callable[[bool], None] | None = None, dest: str | None = None) -> None:
+        """Pack the game data next to the output (`games/<title ID>/romfs.img`), as the last step of the build's run.
+        `then(ok)` replaces the run's end when more follows (the install of the shared app on Windows). `dest` is the
+        folder the build fixed when it started (else it is worked out now)."""
         work = getattr(self, 'effective_work_dir', '')
         extract = Path(work, 'extract')
         versions = []
@@ -1999,7 +2064,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             if then:
                 then(True)
                 return
-            self.finished.emit(True, self.t('msg.archiveSkipped', str(extract)))
+            self.end_run(True, self.t('msg.archiveSkipped', str(extract)))
             return
         ver_dir = versions[-1][1]
         romfs_img = ver_dir / 'RomFS.img'
@@ -2008,9 +2073,10 @@ class Model(QObject, DeviceMixin, QueueMixin):
         # romfs.img — one file, which copies to a phone at full speed where 300,000 did not. One folder per game, as
         # the Mac launcher packs it (BuildStore+Archive.swift): a shared <output>/romfs held the last game built
         # there only, so an earlier game's data could no longer be sent to a device.
-        dest = str(archive_folder(self.out_dir or str(Path(self.base_path).parent), self.build_key))
+        home = self.game_folder.folder if self.game_folder is not None else str(Path(self.base_path).parent)
+        dest = dest or str(archive_folder(self.out_dir or home, self.build_key))
         self.stages.append(Stage(name=self.t('prog.archiveShort'), state='running'))
-        self.stagesChanged.emit()
+        emit_safely(self.stagesChanged)
 
         def work_() -> None:
             ok = True
@@ -2035,10 +2101,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, encoding='utf-8', errors='replace', env=env,
                                          **pu.no_window_kwargs())
+                    self._proc = p          # Stop ends the packer too
                     assert p.stdout is not None
                     for line in p.stdout:
                         self.log(line)
                     p.wait()
+                    self._proc = None
                     ok = p.returncode == 0
                 aoc_src = Path(work, 'aoc')
                 if ok and aoc_src.is_dir() and any(aoc_src.iterdir()):
@@ -2048,16 +2116,19 @@ class Model(QObject, DeviceMixin, QueueMixin):
             except OSError as e:
                 self.log(f'{e}\n')
                 ok = False
+            if self._cancel_requested:
+                self._end_stopped()
+                return
             if self.stages:
                 self.stages[-1].state = 'done' if ok else 'failed'
             self.archive_path = dest if ok else ''
             if ok:
                 self._record_library_ios_completion()
-            self.stagesChanged.emit()
+            emit_safely(self.stagesChanged)
             if then:
                 then(ok)
                 return
-            self.finished.emit(ok, '' if ok else self.t('msg.archiveFailed'))
+            self.end_run(ok, '' if ok else self.t('msg.archiveFailed'))
 
         threading.Thread(target=work_, daemon=True).start()
 

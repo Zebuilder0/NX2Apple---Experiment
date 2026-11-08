@@ -175,6 +175,21 @@ class FinishFramework(unittest.TestCase):
             self.assertEqual(plistlib.load(f)['CFBundleIdentifier'], 'org.nxnative.test.game')
         self.assertFalse(any(p.name.startswith('.') for p in out.iterdir()))   # no half copy left
 
+    def test_a_stop_on_the_way_leaves_no_hidden_copy(self):
+        app = self.tmp / 'stage' / f'DmGame{self.GAME}.framework'
+        (app / 'dm').mkdir(parents=True)
+        (app / f'DmGame{self.GAME}').write_bytes(b'\xcf\xfa\xed\xfe' + bytes(1 << 20))
+        romfs = self.tmp / 'v0' / 'RomFS'
+        romfs.mkdir(parents=True)
+        out = self.tmp / 'shell-framework'
+        with mock.patch.dict(os.environ, {'DM_COPY_ROMFS': 'NO'}), self.assertRaises(SystemExit):
+            build_app.finish_framework(
+                repo=ENGINE, env=dict(os.environ), app=app, fw_only=out, fw_name=f'DmGame{self.GAME}',
+                game=self.GAME, name='Test Game', version='1.0.0', pkg='', mods=['main'], patched=self.tmp,
+                romfs=romfs, marker='x', msl_ios=self.tmp / 'no-shaders', msldir='b-1', chain='1',
+                bundle_id='org.nxnative.test', sdk_ver='26.0', sdk_build='23A', deployment='26.0')
+        self.assertEqual([p.name for p in out.iterdir()], [], 'a stopped framework build left its copy behind')
+
 
 if __name__ == '__main__':
     unittest.main()

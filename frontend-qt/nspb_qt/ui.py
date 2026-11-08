@@ -36,6 +36,8 @@ from . import platform_util as pu
 from . import style
 from .app_update import APP_VERSION
 from .build_notes import TEXT, TITLE, stale_reason
+# DEVICE_DEP_IDS: the rows of signing and installing on a device, which Settings shows in their own card (one list)
+from .device_model import DEVICE_DEP_IDS
 from .i18n import Lang
 from .model import Dep, DepState, Model
 from .sheets import CheatsDialog, DeleteGameDialog, FreeSpaceDialog, OnboardingDialog
@@ -60,9 +62,6 @@ from .widgets import (
     overall_fraction,
 )
 
-#: The dependency rows of signing and installing on a device (device_model.py _device_rows): Settings shows them in
-#: their own card, apart from the build tools.
-DEVICE_DEP_IDS = ('amds', 'signer', 'apple_id', 'shell_template')
 #: How many stages a build reports (the bar's denominator until more arrive).
 BUILD_STAGES = 7
 
@@ -176,7 +175,6 @@ class MainWindow(QMainWindow):
         self._device_deps_open = True
         self._onboarding_checked = False
         self._onboarding_dialog: OnboardingDialog | None = None
-        self._build_run = True          # the run in progress is a build (False: an install from the transfer dialog)
         self._transfer: TransferDialog | None = None
 
         root = QWidget()
@@ -238,7 +236,7 @@ class MainWindow(QMainWindow):
         self.m.newDeviceFound.connect(self._on_new_device)
         self.m.queueChanged.connect(self._refresh_queue)
         if pu.IS_WIN:
-            self.m.depsChanged.connect(self.m.refresh_devices)
+            self.m.depsChanged.connect(self._deps_changed_devices)
         self.transfer_toast = TransferToast(root)
 
         if self.m.log_path:
@@ -721,7 +719,6 @@ class MainWindow(QMainWindow):
         dlg.minimized.connect(lambda: self.transfer_toast.follow(dlg))
         dlg.done.connect(lambda _ok, _note: (self._refresh_library(), self._refresh_install_card()))
         self._transfer = dlg
-        self._build_run = False
         self.transfer_toast.hide()
         dlg.show()
 
@@ -1661,7 +1658,6 @@ class MainWindow(QMainWindow):
         if self.m.queue_running:
             self.m.stop_queue()
         else:
-            self._build_run = True
             self._failed = False
             self.m.start_queue()
         self._refresh_queue()
@@ -2180,7 +2176,7 @@ class MainWindow(QMainWindow):
         if cb:
             cb.setText(report)
         self.diag_btn.setText(self.m.t('diag.copied'))
-        QTimer.singleShot(2000, lambda: self.diag_btn.setText(self.m.t('diag.copy')))
+        QTimer.singleShot(2000, self, lambda: self.diag_btn.setText(self.m.t('diag.copy')))
 
     def _toggle_deps_expanded(self) -> None:
         self._deps_expanded = not self._deps_expanded
@@ -2304,7 +2300,7 @@ class MainWindow(QMainWindow):
             return
         self._onboarding_checked = True
         if self.should_show_onboarding(self.m):
-            QTimer.singleShot(0, self._open_onboarding)
+            QTimer.singleShot(0, self, self._open_onboarding)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2377,10 +2373,11 @@ class MainWindow(QMainWindow):
         self.act_dot.setVisible(not busy)
         if self.m.running:
             self.act_dot.set_color(style.AMBER)
-            if self._build_run:
-                self.act_title.setText(self.m.t('activity.ios' if self.m.target == 'ios' else 'activity.mac'))
-            else:
+            # what runs is the model's to say: a build that ends with its install is an install by then
+            if self.m.run_kind == 'install':
                 self.act_title.setText(self.m.t('win.transfer.running'))
+            else:
+                self.act_title.setText(self.m.t('activity.ios' if self.m.target == 'ios' else 'activity.mac'))
             curr_stage = next((s for s in self.m.stages if s.state == 'running'), None)
             frac = self._run_fraction()
             self.act_detail.setText(f"{curr_stage.name}: {curr_stage.detail}" if curr_stage and curr_stage.detail
@@ -2594,6 +2591,12 @@ class MainWindow(QMainWindow):
         self._refresh_running()
         self._refresh_install_card()
         self._maybe_show_onboarding()
+
+    def _deps_changed_devices(self) -> None:
+        """A dependency check that finished may have changed what a device scan can do (Apple's USB service
+        installed, the signing tool found): scan then. The check also says when it starts, which needs no scan."""
+        if self.m.deps_checked:
+            self.m.refresh_devices()
 
     def _refresh_device_deps(self) -> None:
         """iPhone and iPad: the rows signing and installing need, with their own summary."""
@@ -2850,7 +2853,7 @@ class MainWindow(QMainWindow):
 
     def _run_fraction(self) -> float:
         """How far the run in progress is: a build reports about seven stages, an install three."""
-        return overall_fraction(self.m.stages, BUILD_STAGES if self._build_run else 3)
+        return overall_fraction(self.m.stages, 3 if self.m.run_kind == 'install' else BUILD_STAGES)
 
     def _refresh_big_progress(self) -> None:
         t = self.m.t
@@ -2860,7 +2863,7 @@ class MainWindow(QMainWindow):
         running = next((x for x in stages if x.state == 'running'), None)
         failed = next((x for x in stages if x.state == 'failed'), None)
         if self.m.running:
-            title = t('activity.ios') if self._build_run else t('win.transfer.running')
+            title = t('win.transfer.running') if self.m.run_kind == 'install' else t('activity.ios')
             cur = running or stages[-1]
             detail = cur.name + (' · ' + cur.detail if cur.detail else '')
             from .transfer import copy_lines
@@ -2868,6 +2871,8 @@ class MainWindow(QMainWindow):
             if game:                     # the game data copy: which game, how much, and when it should end
                 detail = f'{game} · {size}\n{eta}'
             self.big_progress.set_progress(title, self._run_fraction(), detail, busy=True)
+        elif getattr(self.m, 'run_stopped', False):
+            self.big_progress.set_progress(t('msg.stopped'), self._run_fraction(), self.footer.text())
         elif failed is not None or self._failed:
             self.big_progress.set_progress(t('win.progress.failed'), self._run_fraction(),
                                            failed.name if failed else '', True)
@@ -2931,8 +2936,11 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, ok: bool, note: str) -> None:
         t = self.m.t
-        self._failed = not ok
-        if ok:
+        stopped = getattr(self.m, 'run_stopped', False)
+        self._failed = not ok and not stopped
+        if stopped:
+            self.footer.setText(note or t('msg.stopped'))     # the player stopped it: no failure card, no log
+        elif ok:
             out = self.m.mac_app_path or self.m.ipa_path
             self.footer.setText(note or (t('status.output', out) if out else t('msg.done')))
         else:
@@ -3139,14 +3147,13 @@ class MainWindow(QMainWindow):
             return
         self._failed = False
         self._stale_shaders_shown = False
-        self._build_run = True
         self.reveal_ipa_btn.hide()
         self.reveal_arc_btn.hide()
         self.reveal_app_btn.hide()
         self.footer.setText('')
         self.m.start_build()
         # the run's bar, in view (it sits under the button)
-        QTimer.singleShot(150, lambda: self.scroll.ensureWidgetVisible(self.stages_card, 0, 40))
+        QTimer.singleShot(150, self, lambda: self.scroll.ensureWidgetVisible(self.stages_card, 0, 40))
 
     # ================================================================ Full-Window Drag & Drop
 

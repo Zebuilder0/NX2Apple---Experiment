@@ -1015,41 +1015,47 @@ def finish_framework(*, repo: Path, env, app: Path, fw_only: Path, fw_name: str,
     out = fw_only / f'{fw_name}.framework'
     tmp = fw_only / f'.{fw_name}.framework.tmp'
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(app, tmp)
-    # An NVN game's libraries may be the one file b-<chain>.img: it goes in as msl/<MSLDIR>.img,
-    # where the host reads it, as stage_resources.sh copies it into an app
-    lib = msl_ios / msldir
-    image = Path(str(lib) + '.img')
-    slib = _shader_lib_module(repo)
-    stamp = getattr(slib, 'STAMP', 'inputs.tsv') if slib is not None else 'inputs.tsv'
-    if image.is_file() and not (lib / stamp).is_file():   # shader_lib.view(): the image when the folder is gone
-        lib = image
-    (tmp / 'msl').mkdir()
-    if lib.is_file():
-        shutil.copy2(lib, tmp / 'msl' / f'{msldir}.img')
-    elif lib.is_dir():
-        shutil.copytree(lib, tmp / 'msl' / msldir)
-    else:
-        die(f'shader libraries {msl_ios / msldir}: not found')
-    # no pipeline archive (pso/): Apple's Windows Metal tools have no metal-tt, so the device
-    # builds the bases on its first start (driver.py forces DM_PSO_GPUS=none)
-    icon = Path(env.get('DM_ICON') or '')
-    if not icon.is_file():
-        icon = romfs.parent / 'icon.jpg'
-    if icon.is_file():
-        try:
-            from PIL import Image
-            Image.open(icon).convert('RGB').resize((512, 512), Image.LANCZOS).save(tmp / 'icon.png', 'PNG')
-        except Exception as e:      # Pillow missing or an unreadable icon: the library shows no art
-            t(f'no library icon: {e}')
-    import json
-    m = json.loads((tmp / 'game.manifest.json').read_text(encoding='utf-8'))
-    if m.get('framework_executable') != fw_name:
-        die(f'{tmp}/game.manifest.json does not name {fw_name}')
-    shutil.rmtree(out, ignore_errors=True)
-    if out.exists():
-        die(f'cannot replace {out} (a file in it is open?)')
-    os.replace(tmp, out)
+    # Assembled in a hidden folder and moved into place whole. A stop on the way (no shader libraries, a manifest
+    # that names another framework) removes it: die() exits, and the folder held a copy of the whole framework.
+    try:
+        shutil.copytree(app, tmp)
+        # An NVN game's libraries may be the one file b-<chain>.img: it goes in as msl/<MSLDIR>.img,
+        # where the host reads it, as stage_resources.sh copies it into an app
+        lib = msl_ios / msldir
+        image = Path(str(lib) + '.img')
+        slib = _shader_lib_module(repo)
+        stamp = getattr(slib, 'STAMP', 'inputs.tsv') if slib is not None else 'inputs.tsv'
+        if image.is_file() and not (lib / stamp).is_file():   # shader_lib.view(): the image when the folder is gone
+            lib = image
+        (tmp / 'msl').mkdir()
+        if lib.is_file():
+            shutil.copy2(lib, tmp / 'msl' / f'{msldir}.img')
+        elif lib.is_dir():
+            shutil.copytree(lib, tmp / 'msl' / msldir)
+        else:
+            die(f'shader libraries {msl_ios / msldir}: not found')
+        # no pipeline archive (pso/): Apple's Windows Metal tools have no metal-tt, so the device
+        # builds the bases on its first start (driver.py forces DM_PSO_GPUS=none)
+        icon = Path(env.get('DM_ICON') or '')
+        if not icon.is_file():
+            icon = romfs.parent / 'icon.jpg'
+        if icon.is_file():
+            try:
+                from PIL import Image
+                Image.open(icon).convert('RGB').resize((512, 512), Image.LANCZOS).save(tmp / 'icon.png', 'PNG')
+            except Exception as e:      # Pillow missing or an unreadable icon: the library shows no art
+                t(f'no library icon: {e}')
+        import json
+        m = json.loads((tmp / 'game.manifest.json').read_text(encoding='utf-8'))
+        if m.get('framework_executable') != fw_name:
+            die(f'{tmp}/game.manifest.json does not name {fw_name}')
+        shutil.rmtree(out, ignore_errors=True)
+        if out.exists():
+            die(f'cannot replace {out} (a file in it is open?)')
+        os.replace(tmp, out)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
     t(f'done: {out} ({size / 2**20:.0f} MB; the shared app embeds it)')
     return 0

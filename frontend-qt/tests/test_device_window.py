@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'frontend-qt'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -185,7 +187,7 @@ class DeviceWindow(unittest.TestCase):
         signing = [Stage(m.t('win.install.stage.prepare'), 'done'), Stage(m.t('win.install.stage.sign'), 'running', '', 50.0)]
         self.assertAlmostEqual(install_fraction(signing, None, m.t), 0.125)
         # in the window, while it copies
-        m.transfer_games = lambda udid, titles: None
+        m.transfer_games = lambda udid, titles: True      # it started
         d = TransferDialog(m, w, udid='UDID1')
         self.addCleanup(d.deleteLater)
         d._start()
@@ -221,7 +223,7 @@ class DeviceWindow(unittest.TestCase):
         wi.Devices(Path(m.shell_cache_path)).put('UDID1', wi.DeviceState(bundle='org.nxnative.shell.T', signed=1.0,
                                                                          titles=['0100000000000A00']))
         started = []
-        m.transfer_games = lambda udid, titles: started.append((udid, titles))
+        m.transfer_games = lambda udid, titles: started.append((udid, titles)) or True   # it started
         d = TransferDialog(m, w, udid='UDID1', preselect=['0100000000000C00'])
         self.addCleanup(d.deleteLater)
         self.assertEqual(d.titles(), ['0100000000000A00', '0100000000000C00'])

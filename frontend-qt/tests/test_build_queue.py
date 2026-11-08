@@ -8,10 +8,13 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'frontend-qt'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -168,6 +171,56 @@ class Queue(unittest.TestCase):
             m.device_titles = lambda u: ['0100000000000F00']
             m._queue_end()
         self.assertEqual(installs, [('UDID1', ['0100000000000A00', '0100000000000B00', '0100000000000F00'])])
+
+    def test_a_queue_started_during_another_run_begins_when_it_ends(self):
+        m = self.model()
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True):
+            self.game(m, '0100000000000A00')
+            m.add_to_queue()
+        built = []
+        m.start_build = lambda: built.append(m.base_path)
+        m.running = True                                           # an install from the transfer window runs
+        m.start_queue()
+        self.assertEqual(built, [])
+        m.running = False
+        m._queue_on_finished(True, 'installed')                    # that run's end, not a queued game's
+        deadline = time.time() + 5
+        while not built and time.time() < deadline:
+            self.app.processEvents()
+            time.sleep(0.02)
+        self.assertEqual(len(built), 1, 'the queue never started')
+        self.assertEqual(m.queue[0].state, 'running')
+
+    def test_a_final_install_that_cannot_start_does_not_swallow_the_next_end(self):
+        m = self.model()
+        m.queue_running = True
+        m._queue_built_titles = ['0100000000000A00']
+        m.install_on_device = lambda udid, titles=None, **k: False   # another run is going on
+        with mock.patch.object(type(m), 'device_install_ready', new_callable=mock.PropertyMock, return_value=True):
+            m.install_udid = 'UDID1'
+            m.device_by_udid = lambda u: object()
+            m.device_titles = lambda u: []
+            m._queue_end()
+        self.assertFalse(m._queue_final_install)
+
+    def test_the_page_gets_its_own_choices_back_after_the_queue(self):
+        m = self.model()
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True):
+            self.game(m, '0100000000000A00')
+            m.add_to_queue()
+            m.queue[0].output_mode, m.queue[0].bc_on_cpu = 'ipa', True   # the queued game exports an IPA
+            mine = self.game(m, '0100000000000B00')                   # the game the player has on the page now
+        m.output_mode, m.bc_on_cpu = 'device', False
+        m.remember_choices()
+        m.start_build = lambda: None
+        m.start_queue()
+        self.assertEqual((m.output_mode, m.bc_on_cpu), ('ipa', True))   # the queued game's, while it builds
+        m.remember_choices()                                       # the window does this on every refresh
+        self.assertEqual(m.settings.value('outputMode'), 'device')  # not saved as the player's
+        m._queue_on_finished(True, '')
+        m._queue_next()                                            # nothing waits: the queue ends
+        self.assertFalse(m.queue_running)
+        self.assertEqual((m.output_mode, m.bc_on_cpu, m.base_path), ('device', False, str(mine)))
 
     def test_the_queue_survives_a_restart(self):
         m = self.model()

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import platform_util as pu
 from . import shell
+from .signals import emit_safely
 
 #: Apple's page for iTunes for Windows: the installer from apple.com carries Apple Mobile Device
 #: Support, the USB service every tool that talks to an iPhone from Windows needs.
@@ -31,10 +32,15 @@ AUTO_POLL_MS = 20_000
 BANNER_WAIT = 15
 
 
+#: The dependency rows of signing and installing on a device (_device_rows): Settings shows them in their own card, the
+#: setup guide on its own step, and device_install_ready needs all of them.
+DEVICE_DEP_IDS = ('amds', 'signer', 'apple_id', 'shell_template')
+
+
 class DeviceMixin:
-    """Needs from the model: settings, t(), log(), running, stages, the signals runningChanged,
-    stagesChanged, finished, devicesChanged and autoInstallRequested, shell_cache_path,
-    check_deps() and _proc."""
+    """Needs from the model: settings, t(), log(), running, stages, begin_run(), end_run(), cancel_run(),
+    cancel_requested, the signals runningChanged, stagesChanged, finished, devicesChanged and autoInstallRequested,
+    shell_cache_path, check_deps() and _proc."""
 
     def _device_init(self) -> None:
         self.devices: list = []                 # win.device.Device, connected now
@@ -43,9 +49,11 @@ class DeviceMixin:
         self.apple_account = None               # win.signer.Account after a dependency check
         self.signing_in = False                 # the sign-in window is open (the Apple ID row waits for it)
         self.transfer_info: dict | None = None  # where an install's game data copy is (install.py CopyPlan)
-        self._install_cancel = False
         self._auto_seen: set[str] = set()
         self._auto_busy = False
+        self._scan_lock = threading.Lock()      # one device scan at a time (refresh_devices)
+        self._scan_running = False
+        self._scan_again = False
         # a method of this QObject, not a lambda: the worker thread emits, and the install must start on
         # the model's own (main) thread
         self.autoInstallRequested.connect(self._on_auto_install)
@@ -106,7 +114,7 @@ class DeviceMixin:
 
     @property
     def device_install_ready(self) -> bool:
-        need = {'amds', 'signer', 'apple_id', 'shell_template'}
+        need = set(DEVICE_DEP_IDS)
         return pu.IS_WIN and all(d.ok for d in self.deps if d.id in need) and \
             need <= {d.id for d in self.deps}
 
@@ -123,7 +131,7 @@ class DeviceMixin:
             return
         self.log(self.t('win.appleId.opened') + '\n')
         self.signing_in = True
-        self.depsChanged.emit()
+        emit_safely(self.depsChanged)
 
         def wait() -> None:
             try:
@@ -142,17 +150,36 @@ class DeviceMixin:
     # ---------------------------------------------------------------- devices
 
     def refresh_devices(self) -> None:
+        """Look for connected devices on a thread. One scan at a time: a request while one runs is remembered and
+        served by one more scan when it ends (the dependency check, the poll and Refresh may all ask at once, and
+        each scan opens a lockdown session with every device)."""
+        with self._scan_lock:
+            if self._scan_running:
+                self._scan_again = True
+                return
+            self._scan_running = True
+
         def work() -> None:
             from .win import device as dv
-            try:
-                found = [dv.describe(d) for d in dv.list_devices()]
-                self.devices_note = '' if found else self.t('win.devices.none')
-            except dv.DeviceError as e:
-                found, self.devices_note = [], str(e)
-            self.devices = found
-            if found and self.install_udid not in {d.udid for d in found}:
-                self.install_udid = found[0].udid
-            self.devicesChanged.emit()
+            while True:
+                found: list = []
+                try:
+                    found = [dv.describe(d) for d in dv.list_devices()]
+                    self.devices_note = '' if found else self.t('win.devices.none')
+                except dv.DeviceError as e:
+                    found, self.devices_note = [], str(e)
+                except Exception as e:      # a bug must not leave the list stuck: the window always hears the end
+                    found, self.devices_note = [], str(e)
+                finally:
+                    self.devices = found
+                    if found and self.install_udid not in {d.udid for d in found}:
+                        self.install_udid = found[0].udid
+                    emit_safely(self.devicesChanged)
+                with self._scan_lock:
+                    if not self._scan_again:
+                        self._scan_running = False
+                        return
+                    self._scan_again = False
         threading.Thread(target=work, daemon=True).start()
 
     def set_install_device(self, udid: str) -> None:
@@ -184,9 +211,10 @@ class DeviceMixin:
             return []
         return list(st.titles) if st.titles else [g.titleID.upper() for g in self.built_games()]
 
-    def transfer_games(self, udid: str, titles: list[str]) -> None:
-        """Put exactly `titles` in the app on `udid` (install or update it), then copy their data the device lacks."""
-        self.install_on_device(udid, titles=[t.upper() for t in titles])
+    def transfer_games(self, udid: str, titles: list[str]) -> bool:
+        """Put exactly `titles` in the app on `udid` (install or update it), then copy their data the device lacks.
+        False when another run is going on and nothing started."""
+        return self.install_on_device(udid, titles=[t.upper() for t in titles])
 
     # ---------------------------------------------------------------- after a build
 
@@ -195,12 +223,12 @@ class DeviceMixin:
         when a device is ready (as the Mac launcher does after a build for iPhone / iPad)."""
         built = shell.built_framework(Path(work_dir))
         if not built:
-            self.finished.emit(False, self.t('win.install.noFramework', work_dir))
+            self.end_run(False, self.t('win.install.noFramework', work_dir))
             return
         try:
             game = shell.add_built_game(Path(self.shell_cache_path), built)
         except OSError as e:
-            self.finished.emit(False, self.t('win.install.prepareFailed', str(e)))
+            self.end_run(False, self.t('win.install.prepareFailed', str(e)))
             return
         self.log(self.t('win.install.added', game.name) + '\n')
         if archive and Path(archive).is_dir():
@@ -208,48 +236,55 @@ class DeviceMixin:
         if getattr(self, 'output_mode', 'device') == 'ipa':
             # Export as IPA: the shared app with every built game, unsigned, beside the build
             dest = Path(work_dir).parent / 'NX2Apple.ipa'
-            ok, msg = self.export_shell_ipa(str(dest))
+            try:
+                ok, msg = self.export_shell_ipa(str(dest))
+            except Exception as e:      # the run must end visibly
+                ok, msg = False, self.t('shell.exportFailed', str(e))
             if ok:
                 self.ipa_path = str(dest)
             self.log(msg + '\n')
-            self.finished.emit(ok, msg)
+            self.end_run(ok, msg)
             return
         if getattr(self, 'queue_defers_install', lambda: False)():
             # a queued game: the queue's end installs every game it built at once (queue_model.py)
             self.queue_built(game.titleID)
-            self.finished.emit(True, self.t('queue.built', game.name))
+            self.end_run(True, self.t('queue.built', game.name))
             return
         udid = self.install_udid
-        if self.device_install_ready and udid and self.device_by_udid(udid) is not None:
+        if self.cancel_requested:
+            self.end_run(False, self.t('msg.stopped'), stopped=True)
+        elif self.device_install_ready and udid and self.device_by_udid(udid) is not None:
             # the games already on the device and this one (a device never installed from this PC gets every game)
             on_device = self.device_titles(udid)
             titles = sorted(set(on_device) | {game.titleID.upper()}) if on_device else None
-            self.install_on_device(udid, keep_stages=True, titles=titles)   # with every game's data the device lacks
+            # with every game's data the device lacks, as the rest of this build's run (running stays true)
+            self.install_on_device(udid, keep_stages=True, titles=titles, continuing=True)
         else:
-            self.finished.emit(True, self.t('win.install.builtNoDevice', game.name))
+            self.end_run(True, self.t('win.install.builtNoDevice', game.name))
 
     # ---------------------------------------------------------------- the install
 
     def install_on_device(self, udid: str = '', data: list | None = None, auto: bool = False,
-                          keep_stages: bool = False, titles: list[str] | None = None) -> None:
+                          keep_stages: bool = False, titles: list[str] | None = None,
+                          continuing: bool = False) -> bool:
         """Sign and install the shared app on `udid` (the chosen device by default), then copy
         `data` [(title ID, game data folder)], by default the data of every game the device has not
-        received yet. The games already on the device keep theirs."""
-        if self.running:
-            return
+        received yet. The games already on the device keep theirs. Returns False when it did not start (another run
+        is going on), True when it started (its end is `finished`). `continuing`: the install is the last step of a
+        build's run, which is running already and keeps its Stop."""
+        if not continuing and not self.begin_run('install'):
+            return False
+        self.run_kind = 'install'
         udid = udid or self.install_udid
         if not udid:
-            self.finished.emit(False, self.t('win.install.noDevice'))
-            return
+            self.end_run(False, self.t('win.install.noDevice'))
+            return True
         from .model import Stage
         from .win import install as wi
-        self.running = True
-        self.runningChanged.emit(True)
-        self._install_cancel = False
         self.failure = None
         if not keep_stages:      # after a build its stages stay above the install's
             self.stages = []
-        self.stagesChanged.emit()
+        emit_safely(self.stagesChanged)
         if auto:
             self.log(self.t('win.install.autoStart') + '\n')
 
@@ -260,7 +295,7 @@ class DeviceMixin:
                 st = Stage(name=name)
                 self.stages.append(st)
             st.state, st.detail, st.percent = state, detail, percent
-            self.stagesChanged.emit()
+            emit_safely(self.stagesChanged)
 
         def started(p) -> None:
             self._proc = p
@@ -274,25 +309,27 @@ class DeviceMixin:
             rate.add(info['done'], now)
             left = rate.seconds_left(info['done'], info['total'])
             self.transfer_info = dict(info, rate=rate.rate(), left=left, at=now)
-            self.stagesChanged.emit()
+            emit_safely(self.stagesChanged)
 
         def work() -> None:
             try:
                 out = wi.install(Path(self.shell_cache_path), udid, data=data, titles=titles,
-                                 log=self.log, stage=stage, cancelled=lambda: self._install_cancel,
+                                 log=self.log, stage=stage, cancelled=lambda: self.cancel_requested,
                                  started=started, banner=self._banner_for, t=self.t, transfer=on_transfer)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
-                out = wi.Outcome(False, ('win.install.prepareFailed', str(e)))
-            self._proc = None
-            self.transfer_info = None
-            self.running = False
-            self.runningChanged.emit(False)
+                # not "could not prepare": this can come from any step. The step that was running failed with it.
+                for st in self.stages:
+                    if st.state == 'running':
+                        st.state, st.detail = 'failed', str(e)[:160]
+                emit_safely(self.stagesChanged)
+                out = wi.Outcome(False, ('win.install.unexpected', str(e)))
             note = self.t(*out.message) if out.message else ''
             if not out.ok and out.failure:
                 note += ' ' + self.t(out.failure)
             self.log(note + '\n')       # the footer is one line: the log keeps the whole note
-            self.finished.emit(out.ok, note)
+            self.end_run(out.ok, note, stopped=out.stopped)
         threading.Thread(target=work, daemon=True).start()
+        return True
 
     def _banner_for(self, title_id: str) -> str | None:
         """The game's picture for the app's library: what this launcher's own library shows (the
@@ -327,10 +364,13 @@ class DeviceMixin:
             return True         # cannot tell: do not ask
 
     def cancel_install(self) -> None:
-        self._install_cancel = True
+        """The transfer window's Stop: the same as every Stop (Model.cancel_run), so the signing tool ends at once
+        instead of finishing its install first."""
+        self.cancel_run()
 
     def _on_auto_install(self, udid: str) -> None:
-        self.install_on_device(udid, auto=True)
+        if not self.install_on_device(udid, auto=True):
+            self._auto_seen.discard(udid)   # something else ran: a later tick asks again
 
     def _auto_tick(self) -> None:
         """"Update the launcher when a device connects": a device that has the app from this PC
@@ -359,27 +399,33 @@ class DeviceMixin:
                 if not (auto or offer):
                     return
                 wired = {d.udid for d in found if d.wired}
+                self._auto_seen &= wired            # a device unplugged is new again when it comes back
                 new = wired - self._auto_seen
-                self._auto_seen = wired
                 if not new:
                     return
                 root = Path(self.shell_cache_path)
                 tpl = shell.find_template()
                 known = wi.Devices(root)
                 for udid in sorted(new):
+                    # A device counts as seen once it has been looked at here. The tick acts on one device and stops:
+                    # the devices after it stay new, so the next tick sees them (before, every connected device was
+                    # marked seen first, and only the first one was ever updated or offered).
+                    self._auto_seen.add(udid)
                     state = known.get(udid)
                     if state is not None and state.bundle:
                         current = wi.library_hash(wi.device_games(root, state), tpl)
                         if auto and wi.needs_update(state, current):
-                            self.autoInstallRequested.emit(udid)
+                            emit_safely(self.autoInstallRequested, udid)
                             return          # one at a time: the next tick sees the rest
                         continue
                     if offer and udid not in self._offered and shell.Library.load(root).present() \
                             and dv.is_paired(udid) and not self._has_shell(found, udid):
                         self._offered.add(udid)
                         self.refresh_devices()          # its name, for the question
-                        self.newDeviceFound.emit(udid)
+                        emit_safely(self.newDeviceFound, udid)
                         return
+            except Exception as e:      # a damaged devices.json or a bug: say it, and the next tick tries again
+                self.log(f'[devices] {e}\n')
             finally:
                 self._auto_busy = False
         threading.Thread(target=work, daemon=True).start()
@@ -388,10 +434,8 @@ class DeviceMixin:
 
     def export_shell_ipa_async(self, dest: str) -> None:
         """Export IPA off the window's thread: a shared app with several games is gigabytes to zip."""
-        if self.running:
+        if not self.begin_run('export'):
             return
-        self.running = True
-        self.runningChanged.emit(True)
 
         def work() -> None:
             try:
@@ -399,9 +443,7 @@ class DeviceMixin:
             except Exception as e:      # the run must end visibly
                 ok, msg = False, self.t('shell.exportFailed', str(e))
             self.log(msg + '\n')
-            self.running = False
-            self.runningChanged.emit(False)
-            self.finished.emit(ok, msg)
+            self.end_run(ok, msg)
         threading.Thread(target=work, daemon=True).start()
 
     def export_shell_ipa(self, dest: str) -> tuple[bool, str]:
@@ -425,6 +467,15 @@ def write_ipa(app: Path, dest: Path) -> None:
     may refuse an executable without its x bit, and Windows has none to copy), the rest 0644."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + '.tmp')
+    try:
+        _write_ipa(app, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)     # a failed export leaves no gigabytes of half an IPA behind
+        raise
+
+
+def _write_ipa(app: Path, tmp: Path) -> None:
     base = f'Payload/{app.name}'
     with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as z:
         for p in sorted(app.rglob('*')):
@@ -445,4 +496,3 @@ def write_ipa(app: Path, dest: Path) -> None:
             with open(p, 'rb') as src, z.open(zi, 'w', force_zip64=True) as out:
                 while chunk := src.read(8 << 20):
                     out.write(chunk)
-    os.replace(tmp, dest)

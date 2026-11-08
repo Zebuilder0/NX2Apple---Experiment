@@ -77,6 +77,28 @@ class InputStagingTests(unittest.TestCase):
             self.assertEqual(input_staging.sync([upper, mixed], d, hard_links=hard), 2)   # again: nothing stale
             self.assertEqual(len(list(Path(d).iterdir())), 2)
 
+    def test_a_file_that_cannot_be_staged_stops_instead_of_being_left_out(self):
+        import errno
+        import shutil
+        from unittest import mock
+        base = make(self.root / 'a' / 'base.nsp', 100)
+        upd = make(self.root / 'b' / 'update.nsp', 100)
+        d = input_staging.folder(self.work)
+        real_copy = shutil.copy2
+
+        def full_disk(src, dst, *a, **k):
+            if src == upd:
+                Path(dst).write_bytes(b'half')            # a copy cut off by a full disk
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real_copy(src, dst, *a, **k)
+        with mock.patch.object(input_staging.os, 'link', side_effect=OSError('another volume')), \
+                mock.patch.object(input_staging.shutil, 'copy2', side_effect=full_disk):
+            with self.assertRaises(input_staging.StagingError) as cm:
+                input_staging.sync([base, upd], d)
+        self.assertEqual(cm.exception.path, upd)
+        self.assertIn('No space', cm.exception.reason)
+        self.assertFalse((Path(d) / 'update.nsp').exists(), 'half a copy was left as the update')
+
 
 if __name__ == '__main__':
     unittest.main()

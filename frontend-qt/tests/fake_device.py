@@ -59,6 +59,9 @@ class FakeDevice:
         self.files: dict[str, bytes] = {}          # AFC paths of the vended container
         self.dirs: set[str] = {'/', '/Documents'}
         self.vended: list[str] = []
+        self.damaged_mux = False                  # usbmuxd answers with bytes that are not a plist
+        self.drop_after_writes: int | None = None  # the cable is pulled after this many AFC writes
+        self.writes = 0
         self.lock = threading.Lock()
         dev = self
 
@@ -87,6 +90,10 @@ class FakeDevice:
         while True:
             size, _v, msg, tag = struct.unpack('<IIII', _exact(s, 16))
             req = plistlib.loads(_exact(s, size - 16))
+            if self.damaged_mux:
+                body = b'not a plist at all'
+                s.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, tag) + body)
+                continue
             mt = req.get('MessageType')
             if mt == 'ListDevices':
                 reply = {'DeviceList': [{'DeviceID': 7, 'MessageType': 'Attached', 'Properties': {
@@ -255,6 +262,10 @@ class FakeDevice:
                         rop, body = 0x0E, struct.pack('<Q', h)
                 elif op == 0x10:    # WRITE
                     assert this == 48
+                    if self.drop_after_writes is not None and self.writes >= self.drop_after_writes:
+                        s.close()           # the cable is pulled mid-copy
+                        return
+                    self.writes += 1
                     h = struct.unpack_from('<Q', data)[0]
                     self.files[handles[h]] += payload
                 elif op == 0x14:    # FILE_CLOSE

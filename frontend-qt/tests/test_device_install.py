@@ -111,6 +111,61 @@ class UsbClient(DeviceTestCase):
         with self.assertRaises(dv.NotPaired):
             dv.copy_game_data(d, SHELL_ID, '0100ABCD00000000', data)
 
+    def test_a_stopped_copy_is_cancelled_and_leaves_no_part_file(self):
+        self.dev.apps = {SHELL_ID: {'CFBundleIdentifier': SHELL_ID, 'CFBundleExecutable': 'DmShell'}}
+        data = self.tmp / 'romfs'
+        data.mkdir()
+        (data / 'romfs.img').write_bytes(os.urandom(9 << 20))
+        d = dv.list_devices()[0]
+        stop = []
+        with self.assertRaises(dv.Cancelled):
+            dv.copy_game_data(d, SHELL_ID, '0100ABCD00000000', data, progress=lambda a, b: stop.append(1),
+                              cancelled=lambda: bool(stop))
+        self.assertFalse(any(p.endswith('.part') for p in self.dev.files), self.dev.files.keys())
+        self.assertNotIn('/Documents/games/0100ABCD00000000/romfs.img', self.dev.files)
+
+    def test_a_pulled_cable_mid_copy_is_a_device_error(self):
+        self.dev.apps = {SHELL_ID: {'CFBundleIdentifier': SHELL_ID, 'CFBundleExecutable': 'DmShell'}}
+        self.dev.drop_after_writes = 1
+        data = self.tmp / 'romfs'
+        data.mkdir()
+        (data / 'romfs.img').write_bytes(os.urandom(9 << 20))
+        d = dv.list_devices()[0]
+        with self.assertRaises(dv.DeviceError) as cm:
+            dv.copy_game_data(d, SHELL_ID, '0100ABCD00000000', data)
+        self.assertNotIsInstance(cm.exception, dv.Cancelled)
+        self.assertIn('keep the device connected', str(cm.exception))
+
+    def test_a_damaged_reply_is_a_device_error_and_the_name_stays_empty(self):
+        d = dv.list_devices()[0]
+        self.dev.damaged_mux = True
+        with self.assertRaises(dv.DeviceError):
+            dv.list_devices()
+        self.assertEqual(dv.describe(dv.Device(d.udid, d.device_id)).name, '')   # no traceback, no name
+
+    def test_a_refused_connection_closes_every_socket(self):
+        opened = []
+        real_init, real_close = dv.Mux.__init__, dv.Mux.close
+
+        def init(m, *a, **k):
+            real_init(m, *a, **k)
+            opened.append(m)
+
+        def close(m):
+            m.closed = True
+            real_close(m)
+
+        def refuse(m, device_id, port):
+            raise dv.DeviceError('refused')
+        d = dv.list_devices()[0]
+        from unittest import mock
+        with mock.patch.object(dv.Mux, '__init__', init), mock.patch.object(dv.Mux, 'close', close), \
+                mock.patch.object(dv.Mux, 'connect', refuse):
+            with self.assertRaises(dv.DeviceError):
+                dv.Lockdown(d)
+        self.assertTrue(opened)
+        self.assertTrue(all(getattr(m, 'closed', False) for m in opened), 'a Mux was left open')
+
     def test_no_service(self):
         os.environ['NSPB_USBMUXD'] = '127.0.0.1:1'
         self.assertFalse(dv.service_running(timeout=1))
@@ -510,6 +565,26 @@ class InstallEndToEnd(DeviceTestCase):
         self.dev.paired = True
         if shell.find_template() is None:     # no app bundled beside this interpreter
             self.assertEqual(wi.install(self.root, self.dev.udid, signer_exe=self.exe).message, ('win.install.noTemplate',))
+
+
+class DevicesFile(unittest.TestCase):
+    def test_two_installs_keep_each_others_device(self):
+        root = Path(tempfile.mkdtemp())
+        first, second = wi.Devices(root), wi.Devices(root)        # both read the file before either saved
+        first.put('A', wi.DeviceState(bundle='org.nxnative.shell.T', signed=1.0))
+        second.put('B', wi.DeviceState(bundle='org.nxnative.shell.T', signed=2.0))
+        again = wi.Devices(root)
+        self.assertEqual(sorted(again.items), ['A', 'B'])
+
+    def test_a_damaged_entry_is_skipped_not_a_traceback(self):
+        root = Path(tempfile.mkdtemp())
+        (root / 'devices.json').write_text(json.dumps({
+            'A': {'bundle': 'org.nxnative.shell.T', 'signed': 'yesterday'},
+            'B': {'bundle': 'org.nxnative.shell.T', 'signed': 5, 'receipts': ['not', 'a', 'dict']},
+            'C': {'bundle': 'org.nxnative.shell.T', 'signed': 7, 'titles': ['0100000000000a00']}}), encoding='utf-8')
+        d = wi.Devices(root)
+        self.assertEqual(sorted(d.items), ['C'])
+        self.assertEqual(d.get('C').titles, ['0100000000000A00'])
 
 
 if __name__ == '__main__':

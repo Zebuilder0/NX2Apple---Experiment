@@ -48,8 +48,18 @@ def _same(src: str, dst: Path) -> bool:
         return False
 
 
+class StagingError(OSError):
+    """A picked file could not be put in the staging folder: the build would run without it."""
+
+    def __init__(self, path: str, reason: object):
+        super().__init__(f'{path}: {reason}')
+        self.path, self.reason = path, str(reason)
+
+
 def sync(files: list[str], into: str, *, hard_links: bool = True) -> int:
-    """Make `into` hold exactly `files` (by file name), with their dates. Returns how many were linked."""
+    """Make `into` hold exactly `files` (by file name), with their dates. Returns how many were linked. A file that
+    can be neither linked nor copied raises StagingError: a build without the picked update or DLC is not the build
+    the player asked for (it used to go on without it, with no word)."""
     root = Path(into)
     root.mkdir(parents=True, exist_ok=True)
     wanted = {staged_name(Path(f).name): f for f in files if f}
@@ -67,13 +77,14 @@ def sync(files: list[str], into: str, *, hard_links: bool = True) -> int:
             continue
         try:
             if hard_links:
-                os.link(src, dst)
+                os.link(src, dst)        # NTFS and APFS link a file in place: no second copy of gigabytes
             else:
                 raise OSError
         except OSError:
             try:
-                shutil.copy2(src, dst)   # copy2 keeps the modification date
-            except OSError:
-                continue
+                shutil.copy2(src, dst)   # another volume, or FAT/exFAT: a copy, which keeps the modification date
+            except OSError as e:
+                Path(dst).unlink(missing_ok=True)   # half a copy is not the file
+                raise StagingError(src, e.strerror or e) from e
         linked += 1
     return linked

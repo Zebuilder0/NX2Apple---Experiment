@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import struct
-import tempfile
 import threading
 import time
 import urllib.request
@@ -18,15 +17,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import inputs
 from . import platform_util as pu
 
 
 def default_state_dir() -> Path:
+    """Where the launcher keeps its library, artwork and settings: NSPB_STATE_DIR when set (a portable copy, the
+    tests' sandbox: frontend-qt/tests/qt_sandbox.py), else the player's application data folder."""
     env_dir = os.environ.get('NSPB_STATE_DIR')
     if env_dir:
         return Path(env_dir)
-    if os.environ.get('QT_QPA_PLATFORM') == 'offscreen':
-        return Path(tempfile.gettempdir()) / f'nspb-offscreen-{os.getpid()}'
     if pu.IS_WIN:
         root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
         return root / 'NS Port Builder'
@@ -533,6 +533,8 @@ class GameLibrary:
         self.games: list[LibraryGame] = []
         self.selected_id: str | None = None
         self.games_folder: str = ''
+        self._save_lock = threading.Lock()     # saves come from the window and from the build's worker threads
+        self.load_problem = ''                 # why library.json could not be read ('' when it could, or was absent)
         self.load()
 
     @property
@@ -547,32 +549,48 @@ class GameLibrary:
         self.selected_id = title_id.upper() if title_id else None
 
     def load(self) -> None:
+        """Read library.json. A file that cannot be read is moved aside (library.json.bad-<time>) and named in
+        `load_problem`, never silently replaced: the next save would otherwise write an empty library over it."""
         if not self.file_path.is_file():
             return
         try:
             raw = json.loads(self.file_path.read_text(encoding='utf-8'))
             if isinstance(raw, list):
-                self.games = [LibraryGame.from_dict(x) for x in raw if isinstance(x, dict)]
+                games = [LibraryGame.from_dict(x) for x in raw if isinstance(x, dict)]
             elif isinstance(raw, dict):
-                self.games = [LibraryGame.from_dict(x) for x in raw.get('games', []) if isinstance(x, dict)]
+                games = [LibraryGame.from_dict(x) for x in raw.get('games', []) if isinstance(x, dict)]
                 self.games_folder = str(raw.get('gamesFolder') or '')
                 self.selected_id = raw.get('selectedID')
-            if self.games and not self.selected_id:
-                self.selected_id = self.games[0].title_id
-        except Exception:
-            pass
+            else:
+                raise ValueError(f'a {type(raw).__name__}, not the library')
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+            bad = self.file_path.with_name(f'{self.file_path.name}.bad-{time.strftime("%Y%m%d-%H%M%S")}')
+            try:
+                os.replace(self.file_path, bad)
+                self.load_problem = f'{self.file_path} could not be read ({e}): it is kept as {bad.name}'
+            except OSError:
+                self.load_problem = f'{self.file_path} could not be read ({e})'
+            self.games, self.games_folder, self.selected_id = [], '', None
+            return
+        self.games = games
+        if self.games and not self.selected_id:
+            self.selected_id = self.games[0].title_id
 
     def save(self) -> None:
-        try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            payload = {
-                'gamesFolder': self.games_folder,
-                'selectedID': self.selected_id,
-                'games': [g.to_dict() for g in self.games],
-            }
-            self.file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
-        except OSError:
-            pass
+        """Write library.json whole or not at all: a temporary file replaced in one step, one save at a time."""
+        with self._save_lock:
+            try:
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    'gamesFolder': self.games_folder,
+                    'selectedID': self.selected_id,
+                    'games': [g.to_dict() for g in list(self.games)],
+                }
+                tmp = self.file_path.with_name(self.file_path.name + '.tmp')
+                tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+                os.replace(tmp, self.file_path)
+            except OSError:
+                pass
 
     def set_games_folder(self, folder: str, repo_path: str = '', default_keys: str = '') -> None:
         self.games_folder = folder
@@ -649,12 +667,14 @@ class GameLibrary:
             inputs['keys'] = [keys_path]
 
         out = output_dir or os.path.dirname(base_path)
-        ipa_candidate = os.path.join(out, f'{name}.ipa')
+        # a build writes <output>/<title ID>.ipa (Model.start_build); an IPA named after the game is an older one
+        ipa_candidate = next((c for c in (os.path.join(out, f'{tid}.ipa'), os.path.join(out, f'{name}.ipa'))
+                              if os.path.isfile(c)), '')
         archive_candidate = os.path.join(out, 'games', tid)
         game = LibraryGame(
             title_id=tid,
             name=name,
-            ipa_path=ipa_candidate if os.path.isfile(ipa_candidate) else '',
+            ipa_path=ipa_candidate,
             archive_path=archive_candidate if os.path.isdir(archive_candidate) else '',
             output_dir=output_dir,
             inputs=inputs,
@@ -692,7 +712,9 @@ class GameLibrary:
             if tid_raw:
                 tid = base_family_id(tid_raw)
         if not tid:
-            tid = '0100000000000000'
+            # No title ID anywhere: not recorded. A made-up one (0100000000000000 before) made every such game share,
+            # and overwrite, one library entry.
+            return None
 
         name = GameFolder.profile_name(tid, repo_path)
         if not name:
@@ -816,7 +838,10 @@ class GameLibrary:
             if found_keys and 'keys' not in slots:
                 slots['keys'] = [found_keys]
             if 'update' in slots and len(slots['update']) > 1:
-                slots['update'] = [sorted(slots['update'])[-1]]
+                # the newest by its version number ([v196608] after [v65536]), as the Mac launcher picks it
+                # (Library.swift, TitleID.updateVersion): a sort of the names put v65536 last, since '6' > '1'
+                slots['update'] = [max(slots['update'],
+                                       key=lambda p: (inputs.update_version(os.path.basename(p)), p))]
             gname = names.get(tid) or GameFolder.profile_name(tid, repo_path) or tid
             base_dir = os.path.dirname(slots['base'][0])
             other_files = slots.get('update', []) + slots.get('dlc', [])
@@ -954,8 +979,11 @@ class ArtworkStore:
         self._gal_cache = cache
         return out
 
+    #: Whether banners are fetched from the network (the tests' sandbox turns it off).
+    fetch_online = True
+
     def request_banner_async(self, title_id: str) -> None:
-        if os.environ.get('QT_QPA_PLATFORM') == 'offscreen':
+        if not self.fetch_online:
             return
         tid = title_id.upper()
         if self.has_custom(tid) or (self.banners_dir / f'{tid}.jpg').is_file() or (self.banners_dir / f'{tid}.png').is_file():

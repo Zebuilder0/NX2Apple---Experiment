@@ -182,6 +182,14 @@ def sha256_file(path: Path) -> str | None:
         return None
 
 
+def digest_hex(expected: str | None) -> str:
+    """The 64 hex digits of a GitHub asset digest ('sha256:<hex>'), '' when there is none or it is not one."""
+    if not expected or not expected.lower().startswith('sha256:'):
+        return ''
+    want = expected[len('sha256:'):].strip().lower()
+    return want if len(want) == 64 and all(c in '0123456789abcdef' for c in want) else ''
+
+
 def check_digest(path: Path, expected: str | None) -> str:
     """Compare `path` against `expected` ('sha256:<hex>'). Returns 'match' | 'mismatch' | 'missing'."""
     if not expected or not expected.lower().startswith('sha256:'):

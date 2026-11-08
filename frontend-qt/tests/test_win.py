@@ -30,6 +30,8 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 HERE = Path(__file__).resolve().parent
 QT = HERE.parent
 sys.path.insert(0, str(QT))
@@ -2765,8 +2767,8 @@ class WindowsBuildFixesTest(unittest.TestCase):
 
         class FakeTimer:
             @staticmethod
-            def singleShot(_ms, cb):
-                cb()
+            def singleShot(_ms, context, cb=None):     # (ms, callback) or (ms, context object, callback)
+                (cb or context)()
 
         ns: dict = {'Path': Path, 'os': os, 'QTimer': FakeTimer}
         for name in ('should_show_onboarding', '_maybe_show_onboarding'):

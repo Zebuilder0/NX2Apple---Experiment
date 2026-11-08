@@ -24,6 +24,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .signals import emit_safely
+
 GB = 1024 ** 3
 #: Before this PC has built anything: the build folder (the extracted files, the rewritten code, the shaders) and the
 #: game data packed beside it take about this many times the game's files, plus a fixed part.
@@ -178,6 +180,7 @@ class QueueMixin:
         self._queue_free_before: int | None = None
         self._queue_built_titles: list[str] = []
         self._queue_final_install = False
+        self._queue_saved: dict | None = None   # the page's choices before the queue loaded its games (restored after)
         if getattr(self, '_persist_choices', False):
             try:
                 raw = json.loads(str(self.settings.value('buildQueue', '[]', type=str) or '[]'))
@@ -198,7 +201,7 @@ class QueueMixin:
     def _queue_save(self) -> None:
         if getattr(self, '_persist_choices', False):
             self.settings.setValue('buildQueue', json.dumps([asdict(i) for i in self.queue]))
-        self.queueChanged.emit()
+        emit_safely(self.queueChanged)
 
     def estimator(self) -> Estimator:
         try:
@@ -267,7 +270,7 @@ class QueueMixin:
         self.game_dir = ''
         self.log(self.t('queue.added', item.name) + '\n')
         self._queue_save()
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
         return item
 
     def remove_from_queue(self, item_id: str) -> None:
@@ -311,6 +314,8 @@ class QueueMixin:
     # ---------------------------------------------------------------- running
 
     def start_queue(self) -> None:
+        """Build the waiting games. Started while another run goes on, the first game starts when that run ends
+        (_queue_on_finished)."""
         if self.queue_running:
             return
         if not any(i.state == 'waiting' for i in self.queue):
@@ -318,14 +323,48 @@ class QueueMixin:
         self.queue_running = True
         self._queue_built_titles = []
         self._queue_final_install = False
-        self.queueChanged.emit()
+        if self._queue_saved is None:
+            self._queue_saved = self._choices_snapshot()
+        emit_safely(self.queueChanged)
         if not self.running:
             self._queue_next()
 
     def stop_queue(self) -> None:
-        """The game building now finishes; the next one does not start."""
+        """The game building now finishes; the next one does not start. The page gets its own choices back once
+        nothing of the queue runs any more."""
         self.queue_running = False
-        self.queueChanged.emit()
+        if not self._queue_current:
+            self._queue_release()
+        emit_safely(self.queueChanged)
+
+    # ---------------------------------------------------------------- the page's own choices
+
+    def _choices_snapshot(self) -> dict:
+        f = self.game_folder
+        return {'keys': self.keys_path, 'out_dir': self.out_dir, 'output_mode': self.output_mode,
+                'ipa_kind': self.ipa_kind, 'bc_on_cpu': self.bc_on_cpu,
+                'folder': (f.nup or f.folder) if f is not None else '', 'game_dir': self.game_dir,
+                'base': self.base_path, 'update': self.update_path, 'dlc': list(self.dlc_paths)}
+
+    def _queue_release(self) -> None:
+        """The queue is over: the page shows (and remember_choices keeps) the choices the player had before it, not
+        the last queued game's."""
+        snap, self._queue_saved = self._queue_saved, None
+        if snap is None:
+            return
+        self.keys_path, self.out_dir = snap['keys'], snap['out_dir']
+        self.output_mode, self.ipa_kind, self.bc_on_cpu = snap['output_mode'], snap['ipa_kind'], snap['bc_on_cpu']
+        if snap['folder'] and os.path.exists(snap['folder']):
+            self.take_game_folder(snap['folder'])
+        else:
+            self.leave_game_folder()
+            self.game_dir, self.base_path, self.update_path = snap['game_dir'], snap['base'], snap['update']
+            self.dlc_paths = list(snap['dlc'])
+        emit_safely(self.repoChanged)
+
+    def queue_drives_inputs(self) -> bool:
+        """The page's inputs are a queued game's, loaded by the queue: they are not the player's to remember."""
+        return self._queue_saved is not None
 
     def _queue_load(self, item: QueueItem) -> None:
         self.keys_path = item.keys or self.keys_path
@@ -341,7 +380,7 @@ class QueueMixin:
             self.base_path = item.base
             self.update_path = item.update
             self.dlc_paths = list(item.dlc)
-        self.repoChanged.emit()
+        emit_safely(self.repoChanged)
 
     def _queue_next(self) -> None:
         if not self.queue_running or self.running:
@@ -368,16 +407,19 @@ class QueueMixin:
         """Every game is built: one install of the shared-app games on the chosen device, if it is there."""
         self.queue_running = False
         self._queue_current = ''
+        self._queue_release()
         titles = self._queue_built_titles
         self._queue_built_titles = []
         udid = getattr(self, 'install_udid', '')
         if titles and self.device_install_ready and udid and self.device_by_udid(udid) is not None:
             on_device = self.device_titles(udid)
+            # Only an install that started ends with `finished`: a flag set for one that did not would swallow the
+            # next unrelated `finished` (the next queue's first game).
             self._queue_final_install = True
-            self.queueChanged.emit()
-            self.install_on_device(udid, titles=sorted(set(on_device) | set(titles)) if on_device else None)
-            return
-        self.queueChanged.emit()
+            started = self.install_on_device(udid, titles=sorted(set(on_device) | set(titles)) if on_device else None)
+            if started is False:
+                self._queue_final_install = False
+        emit_safely(self.queueChanged)
 
     def queue_defers_install(self) -> bool:
         """A queued shared-app game is not installed on its own (after_framework_build): the queue's end does it."""
@@ -389,10 +431,14 @@ class QueueMixin:
     def _queue_on_finished(self, ok: bool, note: str) -> None:
         if self._queue_final_install:
             self._queue_final_install = False
-            self.queueChanged.emit()
+            emit_safely(self.queueChanged)
             return
         item = next((i for i in self.queue if i.id == self._queue_current), None)
         if item is None:
+            # Not a queued game's end: another run ended. A queue started during it begins now.
+            if self.queue_running and not self.running and not any(i.state == 'running' for i in self.queue):
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(1500, self._queue_next)
             return
         self._queue_current = ''
         item.state = 'done' if ok else 'failed'
@@ -406,3 +452,5 @@ class QueueMixin:
         if self.queue_running:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(1500, self._queue_next)       # after the window has taken in this build's end
+        else:
+            self._queue_release()                           # stopped: the game that was building is done now

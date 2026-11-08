@@ -102,6 +102,7 @@ class TransferDialog(QDialog):
         self.preselect = [p.upper() for p in preselect] if preselect is not None else None
         self.active = False
         self.finished_ok: bool | None = None
+        self.stopped = False             # the run ended because the player stopped it (shown neither green nor red)
         self.note = ''
         self._checks: dict[str, QCheckBox] = {}
         self._udid = udid or model.install_udid
@@ -212,13 +213,19 @@ class TransferDialog(QDialog):
         foot.addWidget(self.go_btn)
         lay.addLayout(foot)
 
+        # Bound methods only: PySide disconnects them when this dialog is destroyed (the window deletes the old one
+        # when it opens a new one). A lambda has no receiver, stays connected to the model for the whole session and
+        # then runs on deleted widgets ("Internal C++ object already deleted").
         model.devicesChanged.connect(self._fill_devices)
         model.depsChanged.connect(self._refresh)
-        model.runningChanged.connect(lambda _r: self._refresh())
+        model.runningChanged.connect(self._on_running)
         model.stagesChanged.connect(self._on_stages)
         model.logAppended.connect(self._on_log)
         model.finished.connect(self._on_finished)
         self._fill_devices()
+
+    def _on_running(self, _running: bool) -> None:
+        self._refresh()
 
     # ---------------------------------------------------------------- choosing
 
@@ -273,7 +280,7 @@ class TransferDialog(QDialog):
             rl.setSpacing(10)
             cb = QCheckBox(g.name or tid)
             cb.setChecked(tid in ticked)
-            cb.toggled.connect(lambda _on: self._refresh())
+            cb.toggled.connect(self._on_game_toggled)
             rl.addWidget(cb, 1)
             tag = QLabel(t('win.transfer.onDevice') if tid in on_device else tid)
             tag.setObjectName('muted' if tid in on_device else 'mono')
@@ -286,6 +293,9 @@ class TransferDialog(QDialog):
             empty.setWordWrap(True)
             self.games_col.addWidget(empty)
         self.games_col.addStretch(1)
+        self._refresh()
+
+    def _on_game_toggled(self, _on: bool) -> None:
         self._refresh()
 
     def titles(self) -> list[str]:
@@ -343,7 +353,17 @@ class TransferDialog(QDialog):
         self.progress.set_progress(self.m.t('win.transfer.toast', self._device_name()), 0.0,
                                    self.m.t('win.install.stage.prepare'), busy=True)
         self.m.set_install_device(self._udid)
-        self.m.transfer_games(self._udid, titles)
+        if not self.m.transfer_games(self._udid, titles):
+            # another run started in the meantime (an automatic update): back to choosing, with the reason
+            self.active = False
+            self.dev_group.setEnabled(True)
+            self.games_group.show()
+            self.hint.show()
+            self.run_box.hide()
+            self.stop_btn.hide()
+            self.go_btn.show()
+            self.close_btn.setText(self.m.t('win.transfer.notNow') if self.new_device else self.m.t('win.transfer.cancel'))
+            self._refresh()
 
     def stage_text(self) -> tuple[str, float, bool]:
         """What runs now, how far the whole run is, and whether it failed (for the bar and the corner card)."""
@@ -352,7 +372,7 @@ class TransferDialog(QDialog):
         failed = next((s for s in stages if s.state == 'failed'), None)
         frac = 1.0 if self.finished_ok else install_fraction(stages, getattr(self.m, 'transfer_info', None), self.m.t)
         if self.finished_ok is not None:
-            return (self.note or self.m.t('msg.done')), frac, not self.finished_ok
+            return (self.note or self.m.t('msg.done')), frac, not self.finished_ok and not self.stopped
         cur = running or failed or (stages[-1] if stages else None)
         if cur is None:
             return self.m.t('win.install.stage.prepare'), frac, False
@@ -388,20 +408,28 @@ class TransferDialog(QDialog):
             return
         self.active = False
         self.finished_ok = ok
+        self.stopped = bool(getattr(self.m, 'run_stopped', False))
         self.note = note
         self.stop_btn.hide()
         self.close_btn.hide()
         self.go_btn.show()
         self.go_btn.setEnabled(True)
         self.go_btn.setText(self.m.t('win.transfer.close'))
-        self.progress.set_progress(self.m.t('win.transfer.doneTitle' if ok else 'win.transfer.failedTitle'),
-                                   1.0 if ok else install_fraction(self.m.stages, None, self.m.t), note, not ok)
+        self.progress.set_progress(self.title_text(),
+                                   1.0 if ok else install_fraction(self.m.stages, None, self.m.t), note,
+                                   not ok and not self.stopped)
         self.copy_box.hide()
-        if not ok:
+        if not ok and not self.stopped:
             self.log.show()
             self.log_btn.setText('⌄  ' + self.m.t('build.log'))
         self.progressed.emit()
         self.done.emit(ok, note)
+
+    def title_text(self) -> str:
+        """The finished run's heading: installed, stopped, or failed."""
+        if self.finished_ok:
+            return self.m.t('win.transfer.doneTitle')
+        return self.m.t('msg.stopped') if self.stopped else self.m.t('win.transfer.failedTitle')
 
     def _toggle_log(self) -> None:
         self.log.setVisible(not self.log.isVisible())
@@ -483,7 +511,7 @@ class TransferToast(QFrame):
         if d.finished_ok is None:
             self.title.setText(t('win.transfer.toast', name))
         else:
-            self.title.setText(t('win.transfer.doneTitle' if d.finished_ok else 'win.transfer.failedTitle'))
+            self.title.setText(d.title_text())
         game, _size, eta = copy_lines(d.m, getattr(d.m, 'transfer_info', None)) if d.finished_ok is None else ('', '', '')
         self.stage.setText(f'{game}\n{eta}' if game else text)
         self.pct.setText(f'{int(frac * 100)}%')

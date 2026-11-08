@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -234,18 +235,33 @@ def sign_and_install(app: Path, device_id: int | str, *, log: Callable[[str], No
         return Result(False, str(e), 'win.sign.fail.missing')
     if started:
         started(p)
+    # The limit is a watchdog that runs beside the reading: the loop below only ends when the tool closes its output,
+    # which a hung tool (a stalled connection, a question it cannot ask) never does, so a wait after the loop never
+    # got the chance to time out.
+    timed_out = threading.Event()
+
+    def overdue() -> None:
+        timed_out.set()
+        try:
+            p.kill()
+        except OSError:
+            pass
+    watchdog = threading.Timer(SIGN_TIMEOUT, overdue)
+    watchdog.daemon = True
+    watchdog.start()
     tail: list[str] = []
     assert p.stdout is not None
-    for line in p.stdout:
-        clean = redact(line.rstrip('\n'))
-        tail = (tail + [clean])[-60:]
-        log(clean + '\n')
-        if progress and (m := _PROGRESS.search(line)):
-            progress(int(m.group(1)))
     try:
-        p.wait(timeout=SIGN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        p.kill()
+        for line in p.stdout:
+            clean = redact(line.rstrip('\n'))
+            tail = (tail + [clean])[-60:]
+            log(clean + '\n')
+            if progress and (m := _PROGRESS.search(line)):
+                progress(int(m.group(1)))
+        p.wait()
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
         return Result(False, 'the signing tool did not finish in time', 'win.sign.fail.network')
     out = '\n'.join(tail)
     ok = p.returncode == 0 and 'Installation complete' in out
