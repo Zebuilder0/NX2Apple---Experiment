@@ -413,9 +413,15 @@ class ParityWindowTests(unittest.TestCase):
             from nspb_qt import platform_util as pu
             from unittest.mock import patch
             self.assertTrue(hasattr(pu, 'reveal') and callable(pu.reveal))
-            with patch('subprocess.Popen') as mock_popen:
+            # The Mac branch, whatever runs the test: it only starts `open`, which is mocked. The host's own branch
+            # would really open Explorer on Windows, and on Linux the offscreen platform refuses to open anything.
+            with patch.object(pu, 'IS_WIN', False), patch.object(pu, 'IS_MAC', True), \
+                    patch.object(pu.subprocess, 'Popen') as mock_popen:
                 self.assertTrue(pu.reveal(str(fake_ipa)))
-                self.assertTrue(pu.reveal(str(fake_romfs)))
+                self.assertEqual(mock_popen.call_args.args[0], ['/usr/bin/open', '-R', str(fake_ipa.resolve())])
+                self.assertTrue(pu.reveal(str(fake_romfs)))   # a data folder: its romfs.img is selected
+                self.assertEqual(mock_popen.call_args.args[0],
+                                 ['/usr/bin/open', '-R', str((fake_romfs / 'romfs.img').resolve())])
                 self.assertFalse(pu.reveal(''))
 
             # 6c. Thin 6px activity progress bar hides percentage text so digits are not clipped

@@ -38,6 +38,26 @@ class AppUpdateTests(unittest.TestCase):
         self.assertNotIn('--name "NS Port Builder"', wf)
         self.assertIn("Compress-Archive -Path 'NX2Apple' -DestinationPath '../NX2Apple-windows-x64.zip'", wf)
 
+    def test_the_windows_build_installs_only_pinned_hashed_packages(self) -> None:
+        wf = (ROOT / '.github' / 'workflows' / 'build-qt.yml').read_text(encoding='utf-8')
+        self.assertIn('--require-hashes --only-binary=:all: -r frontend-qt/requirements-build-windows.txt', wf)
+        self.assertNotIn('pip install PySide6-Essentials pyinstaller', wf)
+        self.assertNotIn('pip install --upgrade pip', wf)
+        reqs = (ROOT / 'frontend-qt' / 'requirements-build-windows.txt').read_text(encoding='utf-8')
+        lines = [ln for ln in reqs.splitlines() if ln.strip() and not ln.startswith('#')]
+        self.assertTrue(any(ln.startswith('pyside6-essentials==') for ln in lines))
+        for ln in lines:
+            self.assertRegex(ln, r'^[a-z0-9-]+==[\w.]+ --hash=sha256:[0-9a-f]{64}$')
+
+    def test_the_windows_build_never_makes_a_final_release(self) -> None:
+        """build-mac-app.yml writes the reviewed notes only into a release it creates: one made by the Windows build
+        first would ship with a one-line body."""
+        wf = (ROOT / '.github' / 'workflows' / 'build-qt.yml').read_text(encoding='utf-8')
+        creates = [ln for ln in wf.splitlines() if 'gh release create' in ln]
+        self.assertTrue(creates)
+        self.assertTrue(all('--prerelease' in ln for ln in creates), creates)
+        self.assertIn('persist-credentials: false   # the job holds contents: write', wf)
+
     def test_is_newer_compares_numeric_segments_and_release_candidates(self) -> None:
         self.assertTrue(app_update.is_newer('v1.2.2', '1.2.0'))
         self.assertTrue(app_update.is_newer('v1.2.10', '1.2.2'))

@@ -66,6 +66,34 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertFalse(real.runCaptured(["/usr/bin/false"], env: [:]) { _ in })
     }
 
+    func testStreamGivesTheLastLinesOfAToolThatFailsAsItExits() {
+        // the error comes last and the tool exits right after it: it is what EngineLayout.failureKind reads
+        for _ in 0..<20 {
+            let lines = Collected()
+            let script = "i=0; while [ $i -lt 2000 ]; do echo progress $i; i=$((i+1)); done; echo 'engine.py: cannot fetch abc' >&2; exit 2"
+            XCTAssertFalse(real.runCaptured(["/bin/sh", "-c", script], env: ["PATH": "/usr/bin:/bin"]) { lines.add($0) })
+            XCTAssertEqual(lines.values.count, 2001)
+            XCTAssertTrue(lines.values.contains("engine.py: cannot fetch abc"))
+        }
+    }
+
+    func testStreamKeepsALineAndACharacterThatArriveInTwoReads() {
+        let lines = Collected()
+        // printf writes "gr", sleeps, then "üße\n" with the ü's two bytes split across the two writes
+        let script = "printf 'gr\\303'; sleep 0.2; printf '\\274\\303\\237e\\n'; printf 'Receiving 50%%\\rReceiving 100%%, done.\\n'"
+        XCTAssertTrue(real.runCaptured(["/bin/sh", "-c", script], env: ["PATH": "/usr/bin:/bin"]) { lines.add($0) })
+        XCTAssertEqual(lines.values, ["grüße", "Receiving 50%", "Receiving 100%, done."])
+    }
+
+    func testLineSplitterJoinsReadsAndDropsEmptyLines() {
+        var s = LineSplitter()
+        XCTAssertEqual(s.feed(Data("one\ntw".utf8)), ["one"])
+        XCTAssertEqual(s.feed(Data([0x6F, 0x0A, 0x0A, 0xC3])), ["two"])   // "o\n\n" and the first byte of "é"
+        XCTAssertEqual(s.feed(Data([0xA9])), [])
+        XCTAssertEqual(s.finish(), "é")
+        XCTAssertNil(s.finish())
+    }
+
     func testStreamReportsAToolThatDoesNotStartAsALine() {
         let lines = Collected()
         XCTAssertFalse(real.runCaptured(["/nonexistent/tool"], env: [:]) { lines.add($0) })

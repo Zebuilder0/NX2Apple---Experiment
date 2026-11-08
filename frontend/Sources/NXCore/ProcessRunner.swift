@@ -166,15 +166,28 @@ package struct SystemProcessRunner: ProcessRunner {
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err; p.standardInput = FileHandle.nullDevice
         do { try p.run() } catch { line("could not start \(launch.executable): \(error.localizedDescription)"); return false }
+        // Both pipes are read to their end on background queues before the exit is awaited, as capture() reads them. The
+        // handlers this used to attach were removed right after the exit, which could leave the last output unread: the
+        // error line of a failing sync, clone or pip, which EngineLayout.failureKind reads to tell "offline" from
+        // "broken". Each read was also decoded on its own, so a line cut between two reads came out as two lines, and a
+        // read that ended inside a multi-byte character did not decode and was dropped whole.
+        let lock = NSLock()
+        let drained = DispatchGroup()
         for h in [out.fileHandleForReading, err.fileHandleForReading] {
-            PipeReader.attach(to: h) { d in
-                if let s = String(data: d, encoding: .utf8) {
-                    for piece in s.split(separator: "\n") { line(String(piece)) }
+            drained.enter()
+            DispatchQueue.global().async {
+                var lines = LineSplitter()
+                while true {
+                    let d = h.availableData
+                    if d.isEmpty { break }
+                    for l in lines.feed(d) { lock.lock(); line(l); lock.unlock() }
                 }
+                if let rest = lines.finish() { lock.lock(); line(rest); lock.unlock() }
+                drained.leave()
             }
         }
+        drained.wait()
         p.waitUntilExit()
-        out.fileHandleForReading.readabilityHandler = nil; err.fileHandleForReading.readabilityHandler = nil
         return p.terminationStatus == 0
     }
 
@@ -191,6 +204,39 @@ package struct SystemProcessRunner: ProcessRunner {
         try p.run()
         if launch.groupPython != nil { ProcessGroups.track(p) }
         return p
+    }
+}
+
+/// Cuts output into lines in bytes and decodes each whole line, so a line or a UTF-8 character that arrives in two reads
+/// stays one. A line ends at "\n", and at "\r", which progress output such as `git clone --progress` uses to redraw its
+/// line (each redraw is a line then, as a terminal shows it). Empty lines are dropped, as stream() always did.
+package struct LineSplitter {
+    private var pending = Data()
+
+    package init() {}
+
+    /// The lines that `data` completes.
+    package mutating func feed(_ data: Data) -> [String] {
+        pending.append(data)
+        var lines: [String] = []
+        var start = pending.startIndex
+        var i = start
+        while i < pending.endIndex {
+            let b = pending[i]
+            if b == 0x0A || b == 0x0D {
+                if i > start { lines.append(String(decoding: pending[start..<i], as: UTF8.self)) }
+                start = pending.index(after: i)
+            }
+            i = pending.index(after: i)
+        }
+        pending = Data(pending[start..<pending.endIndex])
+        return lines
+    }
+
+    /// The last line, when the output ended without a line end.
+    package mutating func finish() -> String? {
+        defer { pending = Data() }
+        return pending.isEmpty ? nil : String(decoding: pending, as: UTF8.self)
     }
 }
 

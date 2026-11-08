@@ -4,9 +4,11 @@
 # gone: the native SwiftUI app (build-mac-app.yml) is strictly better on the same machine, so a
 # second macOS download only offered a way to pick the worse one.
 #
-# Nothing here touches a release. The Windows build is still in testing — it is built on every
-# tag so the artifact is always available under Actions, and it becomes a release download only
-# once the reports from real hardware are clean.
+# The Windows build is still in testing. It is built on every tag, uploaded as a workflow artifact and attached to
+# the tag's release as NX2Apple-windows-x64.zip. It never makes a final release itself: build-mac-app.yml creates
+# that one with its reviewed notes (RELEASING.md), and this workflow waits for it, so the notes are never replaced
+# by a short body when the Windows build happens to finish first. A release candidate's pre-release may be made here
+# (build-mac-app.yml edits it and writes its notes either way).
 #
 #   - push a tag vX.Y.Z / workflow_dispatch → build, upload as a workflow artifact and attach to the release
 name: Build NX2Apple (Qt, Windows)
@@ -94,6 +96,8 @@ jobs:
     needs: [shell-template, plumesign]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # the job holds contents: write; nothing here pushes with git
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -101,12 +105,12 @@ jobs:
 
       - name: Install PySide6 and PyInstaller
         run: |
-          python -m pip install --upgrade pip
           # PySide6-Essentials only: no Addons, no Pdf, no WebEngine. The umbrella 'PySide6'
           # package installs all of them (WebEngine alone is 250 MB) and PyInstaller's Qt hooks
           # then copy every installed module regardless of --exclude-module — measured: a full
           # install produced a 591 MB bundle with the same exclusions in place.
-          python -m pip install PySide6-Essentials pyinstaller
+          # PySide6 goes into the shipped app: exact versions and hashes, wheels only (the file says how to update).
+          python -m pip install --require-hashes --only-binary=:all: -r frontend-qt/requirements-build-windows.txt
 
       # The build packages ride in the zip: the venv step then installs from disk (--no-index),
       # so a fresh machine needs no PyPI round-trip for lz4/capstone/fonttools/nsz. The runner's
@@ -352,13 +356,16 @@ jobs:
                 --notes "Release candidate $rc of NX2Apple $ver."
             fi
           else
-            # On a final tag, wait briefly for build-mac-app.yml to create the release with its full notes if both run in parallel
-            for _ in $(seq 1 30); do
+            # A final release is build-mac-app.yml's to create, with the reviewed notes: it writes them only when the
+            # release does not exist yet, so a release made here first would ship the short body instead. Wait for it
+            # (the Mac build of a final tag takes a while), and stop with a clear error if it never comes.
+            for _ in $(seq 1 180); do
               gh release view "$TAG" >/dev/null 2>&1 && break
-              sleep 10
+              sleep 30
             done
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --verify-tag --title "$TAG" --notes "NX2Apple $TAG"
+              echo "::error title=No release to attach to::build-mac-app.yml did not create the release $TAG within 90 minutes. The Windows zip is in this run's artifacts: attach it once the release exists (gh release upload $TAG NX2Apple-windows-x64.zip)."
+              exit 1
             fi
           fi
           gh release upload "$TAG" frontend-qt/NX2Apple-windows-x64.zip --clobber

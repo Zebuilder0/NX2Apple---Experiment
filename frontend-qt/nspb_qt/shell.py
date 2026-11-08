@@ -296,8 +296,9 @@ def remember_data(root: Path, title_id: str, folder: Path) -> None:
 def pending_data(root: Path, games: list[Game], receipts: dict) -> list[tuple[str, Path]]:
     """The (title ID, data folder) of the shared app's games whose data a device has not received
     (`receipts`: title ID → the stamp it got). A folder whose romfs.img changed since its game was
-    built is left out: the launcher packs every game's data into the same output folder, so it may
-    hold another game's now."""
+    built is left out: its data is no longer the data that game was built with (a rebuild packed
+    new data and remember_data stamps it again; a folder from before the per-game layout,
+    `<output>/romfs`, may hold another game's now)."""
     try:
         d = json.loads((Path(root) / 'data.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
