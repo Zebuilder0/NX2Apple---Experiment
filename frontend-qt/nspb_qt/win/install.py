@@ -224,7 +224,7 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
             template: Path | None = None, signer_exe: Path | None = None,
             banner: Callable[[str], str | None] | None = None,
             t: Callable[..., str] = lambda key, *a: key,
-            transfer: Callable[[dict], None] | None = None) -> Outcome:
+            transfer: Callable[[dict], None] | None = None, engine: str = '') -> Outcome:
     """Sign and install the shared app on `udid`, then copy each `(title ID, game data folder)`
     of `data`: by default every game's data the device has not received yet (`shell.pending_data`).
     `titles` are the games the app holds (a game left out is removed from the app on the device); by default the
@@ -267,6 +267,11 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         return Outcome(False, ('win.install.notPaired',), 'win.install.notPaired.next')
     dv.describe(dev)
     name = dev.name or 'iPhone'
+    if dv.gpu_class(dev.product) == 'older':
+        # this device's GPU has no BC textures: a game built for newer devices only stops at its start with a message
+        unready = [g.name for g in games if not shell.supports_older(Path(g.framework), engine)]
+        if unready:
+            log(t('win.install.olderWarn', name, ', '.join(unready)) + '\n')
     need = shell.template_min_ios(template)
     if dev.ios and need and shell.version_tuple(dev.ios) < shell.version_tuple(need):
         # the app's own minimum: the signing tool would install it and iOS would refuse to open it

@@ -47,10 +47,12 @@ from .widgets import (
     BigProgress,
     CardGroup,
     CardPageHeading,
+    Dot,
     DropOverlayWidget,
     GameCardWidget,
     GlyphIcon,
     HeroBannerWidget,
+    ImageLabel,
     HorizontalStripViewport,
     LauncherSegmented,
     LauncherSwitch,
@@ -66,15 +68,13 @@ from .widgets import (
 BUILD_STAGES = 7
 
 
-def _dot(color: str) -> QLabel:
-    d = QLabel()
-    d.setFixedSize(8, 8)
-    d.setStyleSheet(f'background: {color}; border-radius: 4px;')
-    return d
+def _dot(color: str) -> 'Dot':
+    """An 8 px status dot, painted smooth at any display scale (widgets.Dot)."""
+    return Dot(color, 8)
 
 
-def _set_dot(d: QLabel, color: str) -> None:
-    d.setStyleSheet(f'background: {color}; border-radius: 4px;')
+def _set_dot(d: 'Dot', color: str) -> None:
+    d.set_color(color)
 
 
 class TopBarFrame(QFrame):
@@ -274,15 +274,9 @@ class MainWindow(QMainWindow):
         # Brand (App Icon + NX2Apple — by nxnative)
         brand_row = QHBoxLayout()
         brand_row.setSpacing(10)
-        self.app_icon_lbl = QLabel()
-        self.app_icon_lbl.setFixedSize(26, 26)
+        # drawn from the full-size icon at paint time: a 26 px copy was stretched at 125 % and 150 % and looked grainy
         icon_file = Path(__file__).resolve().parent / 'assets' / 'app_icon.png'
-        if icon_file.is_file():
-            pm = QPixmap(str(icon_file))
-            if not pm.isNull():
-                self.app_icon_lbl.setPixmap(
-                    pm.scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                )
+        self.app_icon_lbl = ImageLabel(str(icon_file), 26, 26)
         brand_row.addWidget(self.app_icon_lbl)
         self.title_label = QLabel('NX2Apple')
         self.title_label.setStyleSheet('font-size: 23px; font-weight: 800; color: #ffffff;')
@@ -593,9 +587,11 @@ class MainWindow(QMainWindow):
                 p_label = self.m.t('library.viewBuild')
                 p_en = True
             elif self._transferable(sel):
-                # Windows: built for the shared app, so it goes onto a device from here (Show in folder is in Manage)
-                st_text = self.m.t('library.readyIOS')
-                st_color = style.GREEN
+                # Windows: built for the shared app, so it goes onto a device from here (Show in folder is in Manage).
+                # The status says which devices it plays on, so nobody installs it where it cannot start.
+                every = self.m.game_plays_on_older(sel.title_id)
+                st_text = self.m.t('win.ready.all' if every else 'win.ready.newer')
+                st_color = style.GREEN if every else style.AMBER
                 p_label = self.m.t('win.transfer.button')
                 p_en = not self.m.running
             elif sel.has_ipa or sel.has_archive:
@@ -1111,8 +1107,8 @@ class MainWindow(QMainWindow):
         grp.add_row(self.platform_card)
         self.platform_card.setVisible(not pu.IS_WIN)
 
-        # Older devices: decode BC textures on the CPU (opt.bc). A Windows shared-app game always carries it
-        # (Model.start_build), so the switch is only for a one-game IPA there.
+        # Older devices: decode BC textures on the CPU (opt.bc), under Play on and above Install as on the Mac. On by
+        # default on Windows: it changes nothing on a newer GPU, so one build plays on every device.
         self.bc_card = QFrame()
         self.bc_card.setObjectName('card')
         rbc_lay = QHBoxLayout(self.bc_card)
@@ -1133,11 +1129,6 @@ class MainWindow(QMainWindow):
         rbc_lay.addWidget(self.bc_switch)
         grp.add_row(self.bc_card)
 
-        self.older_note = QLabel(self.m.t('win.play.olderNote'))
-        self.older_note.setObjectName('sectionFoot')
-        self.older_note.setWordWrap(True)
-        self.older_note.setContentsMargins(4, 0, 4, 0)
-        grp.add_row(self.older_note)
         return grp
 
     def _set_output_mode(self, mode: str) -> None:
@@ -1152,6 +1143,7 @@ class MainWindow(QMainWindow):
     def _on_bc_toggled(self, checked: bool) -> None:
         self.m.bc_on_cpu = checked
         self.m.remember_choices()
+        self._refresh_target()
 
     def _build_device_card(self) -> CardGroup:
         """Windows, Install on device: where the build goes and who signs it (InstallCard.swift's Install on and
@@ -1482,12 +1474,16 @@ class MainWindow(QMainWindow):
         self.play_ipa_card.set_selected(not device)
         self.play_device_card.setEnabled(not self.m.running)
         self.play_ipa_card.setEnabled(not self.m.running)
-        # the texture switch matters where the build is not a Windows shared-app game, which always carries it
-        self.bc_card.setVisible(not pu.IS_WIN or self.m.exports_one_game)
+        self.bc_card.setVisible(True)
         self.bc_title_lbl.setText(t('opt.bc'))
-        self.bc_note_lbl.setText(t('opt.bc.note'))
-        self.older_note.setText(t('win.play.olderNote'))
-        self.older_note.setVisible(pu.IS_WIN and not self.m.exports_one_game)
+        if pu.IS_WIN:      # what on and off mean for the games built now
+            self.bc_note_lbl.setText(t('win.play.olderOn' if self.m.bc_on_cpu else 'win.play.olderOff'))
+        else:
+            self.bc_note_lbl.setText(t('opt.bc.note'))
+        self.bc_switch.blockSignals(True)
+        self.bc_switch.setChecked(self.m.bc_on_cpu)
+        self.bc_switch.blockSignals(False)
+        self.bc_switch.setEnabled(not self.m.running)
 
     def _export_shell_ipa(self) -> None:
         start = os.path.join(self.m.out_dir or str(Path.home()), 'NX2Apple.ipa')

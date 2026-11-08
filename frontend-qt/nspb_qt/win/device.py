@@ -117,6 +117,7 @@ class Device:
     connection: str = 'USB'     # 'USB' or 'Network'
     name: str = ''
     ios: str = ''               # its iOS version (ProductVersion), '' until describe() read it
+    product: str = ''           # its model identifier (ProductType, e.g. iPhone15,3), '' until describe() read it
 
     @property
     def wired(self) -> bool:
@@ -688,6 +689,10 @@ def describe(device: Device) -> Device:
                 device.ios = str(ld.get_value('ProductVersion') or '')
             except DeviceError:
                 device.ios = ''
+            try:
+                device.product = str(ld.get_value('ProductType') or '')
+            except DeviceError:
+                device.product = ''
     except DeviceError:
         pass
     return device
@@ -717,6 +722,28 @@ def reveal_developer_mode(device: Device) -> None:
             amfi.close()
     if r.get('Error') or not r.get('success', False):
         raise DeviceError(f'the device did not show the Developer Mode switch: {r.get("Error") or r}')
+
+
+#: iPads whose GPU reads BC textures (M1 and later, the A17 Pro iPad mini) among the model identifiers before
+#: iPad16: the M1 iPad Pros and Air, the M2 iPad Pros and Air, the M3 iPad Air. Every iPad16 and later has one too.
+_IPAD_BC = {'iPad13,4', 'iPad13,5', 'iPad13,6', 'iPad13,7', 'iPad13,8', 'iPad13,9', 'iPad13,10', 'iPad13,11',
+            'iPad13,16', 'iPad13,17', 'iPad14,3', 'iPad14,4', 'iPad14,5', 'iPad14,6', 'iPad14,8', 'iPad14,9',
+            'iPad14,10', 'iPad14,11', 'iPad15,3', 'iPad15,4', 'iPad15,5', 'iPad15,6'}
+
+
+def gpu_class(product: str) -> str:
+    """Whether a device's GPU reads the games' BC textures: 'new' (iPhone 15 Pro / A17 Pro and later, iPads with M1
+    or later), 'older' (the rest: a game must be built with Older devices on, nvn_mtl.m decodes them on the CPU),
+    'unknown' when the model identifier says nothing. The engine checks the GPU itself when the game starts; this only
+    says before the install which games will run."""
+    import re as _re
+    m = _re.fullmatch(r'(iPhone|iPad)(\d+),(\d+)', product or '')
+    if not m:
+        return 'unknown'
+    kind, major = m.group(1), int(m.group(2))
+    if kind == 'iPhone':
+        return 'new' if major >= 16 else 'older'      # iPhone16,1/16,2: the 15 Pro (A17 Pro); 15,4/15,5: the 15 (A16)
+    return 'new' if major >= 16 or product in _IPAD_BC else 'older'
 
 
 def find_shell(device: Device, preferred: str = '') -> str:

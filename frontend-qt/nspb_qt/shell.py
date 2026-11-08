@@ -219,6 +219,31 @@ def present_titles(games: list['Game'], titles) -> list['Game']:
     return [g for g in games if g.titleID.upper() in want]
 
 
+def supports_older(framework: Path, engine: str = '') -> bool:
+    """Whether a built game plays on a device whose GPU has no BC textures (before the A17 Pro and the M1): its build
+    carried DM_PROF_TEX_BC_CPU=1 (the Older devices switch, in the framework's dm/env.txt), or its profile turns
+    tex_bc_cpu on (dm/games/<title ID>/game.tsv, compiled in). On a GPU with BC textures it changes nothing, so such a
+    game plays everywhere."""
+    try:
+        for line in (Path(framework) / 'dm' / 'env.txt').read_text(encoding='utf-8', errors='replace').splitlines():
+            key, _, value = line.strip().partition('=')
+            if key.strip() == 'DM_PROF_TEX_BC_CPU' and value.strip().lower() in ('1', 'on', 'true', 'yes'):
+                return True
+    except OSError:
+        pass
+    tid = title_id_of(Path(framework))
+    if engine and tid:
+        try:
+            for line in (Path(engine) / 'dm' / 'games' / tid.upper() / 'game.tsv').read_text(
+                    encoding='utf-8', errors='replace').splitlines():
+                cols = line.split('\t')
+                if len(cols) >= 2 and cols[0].strip() == 'tex_bc_cpu' and cols[1].strip() == 'on':
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 #: The pictures the app's library reads beside a framework (ShellHost GameCatalogue.imageExtensions)
 BANNER_EXTS = ('png', 'jpg', 'jpeg', 'heic', 'webp')
 

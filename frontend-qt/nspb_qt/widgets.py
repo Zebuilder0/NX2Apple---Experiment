@@ -29,6 +29,57 @@ from PySide6.QtWidgets import (
 from . import style
 
 
+class ImageLabel(QWidget):
+    """A picture at a fixed size, drawn from its full-size source each paint: at 125 % or 150 % display scaling it
+    stays sharp, where a pixmap scaled to the logical size was stretched and looked grainy. No copy is kept."""
+
+    def __init__(self, path: str, width: int, height: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(width, height)
+        self._pixmap = QPixmap(path)
+
+    def is_null(self) -> bool:
+        return self._pixmap.isNull()
+
+    def paintEvent(self, _event) -> None:
+        if self._pixmap.isNull():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        scale = min(self.width() / max(1, pw), self.height() / max(1, ph))
+        w, h = pw * scale, ph * scale
+        p.drawPixmap(QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h), self._pixmap,
+                     QRectF(0, 0, pw, ph))
+
+
+class Dot(QWidget):
+    """A status dot drawn with antialiasing at the screen's scale (a stylesheet's rounded corners are not smoothed,
+    so its 8 px dots came out jagged at 125 % and 150 %)."""
+
+    def __init__(self, color: str = style.NEUTRAL_DOT, size: int = 8, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = color
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_color(self, color: str) -> None:
+        if self._color != color:
+            self._color = color
+            self.update()
+
+    def color(self) -> str:
+        return self._color
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self._color))
+        p.drawEllipse(QRectF(0, 0, self.width(), self.height()))
+
+
 class StatusDot(QWidget):
     """A 7px status indicator circle (LauncherTone)."""
 
@@ -808,15 +859,37 @@ class PlayOnCard(QFrame):
         return self._selected
 
     def _restyle(self) -> None:
-        if self._selected:
-            css = (f'QFrame#playOnCard {{ background: rgba(255, 240, 214, 0.05); '
-                   f'border: 1.5px solid rgba(255, 240, 214, 0.75); border-radius: 14px; }}')
-        else:
-            css = (f'QFrame#playOnCard {{ background: {style.CARD}; border: 1px solid {style.BORDER}; '
-                   f'border-radius: 14px; }} QFrame#playOnCard:hover {{ border-color: #3a3a3e; }}')
-        self.setStyleSheet(css)
+        self.setStyleSheet('QFrame#playOnCard { background: transparent; border: none; }')
         self.ring.set_selected(self._selected)
         self.icon.set_color(style.ACCENT if self._selected else style.MUTED)
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        # painted, so the rounded border is smoothed at any display scale (a stylesheet's 1.5 px border was not)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._selected:
+            fill, edge, width = QColor(255, 240, 214, 13), QColor(255, 240, 214, 191), 1.5
+        else:
+            fill = QColor(style.CARD)
+            edge = QColor('#3a3a3e' if getattr(self, '_hover', False) else style.BORDER)
+            width = 1.0
+        p.setPen(QPen(edge, width))
+        p.setBrush(fill)
+        half = width / 2
+        p.drawRoundedRect(QRectF(half, half, self.width() - width, self.height() - width), 14, 14)
+        p.end()
+        super().paintEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton and self.isEnabled() and self.rect().contains(event.position().toPoint()):

@@ -117,8 +117,13 @@ class DeviceWindow(unittest.TestCase):
         self.assertTrue(w.play_device_card.is_selected())
         self.assertTrue(w.device_group.isVisibleTo(w))
         self.assertFalse(w.install_group.isVisibleTo(w))      # no IPA steps when the build goes to a device
-        self.assertFalse(w.bc_card.isVisibleTo(w))            # a shared-app game always carries the texture switch
-        self.assertTrue(w.older_note.isVisibleTo(w))
+        self.assertTrue(w.bc_card.isVisibleTo(w))             # Older devices: under Play on, above Install
+        self.assertTrue(m.bc_on_cpu)                          # on by default on Windows: one build plays everywhere
+        self.assertIn('every game built now plays on all iPhones and iPads', w.bc_note_lbl.text())
+        w.bc_switch.toggled.emit(False)
+        self.assertFalse(m.bc_on_cpu)
+        self.assertIn('only on the iPhone 15 Pro', w.bc_note_lbl.text())
+        w.bc_switch.toggled.emit(True)
         w.play_ipa_card.clicked.emit()
         self.assertEqual(m.output_mode, 'ipa')
         self.assertTrue(w.play_ipa_card.is_selected())
@@ -127,8 +132,7 @@ class DeviceWindow(unittest.TestCase):
         self.assertFalse(m.exports_one_game)
         w._on_ipa_kind_changed('oneGame')
         self.assertTrue(m.exports_one_game)
-        self.assertTrue(w.bc_card.isVisibleTo(w))             # a one-game IPA takes the switch
-        self.assertFalse(w.older_note.isVisibleTo(w))
+        self.assertTrue(w.bc_card.isVisibleTo(w))             # a one-game IPA takes the switch too
         w._set_output_mode('device')
         self.assertFalse(m.exports_one_game)                  # the kind of IPA does not apply to a device
 
@@ -200,6 +204,33 @@ class DeviceWindow(unittest.TestCase):
         w.transfer_toast.follow(d)
         self.assertIn('Copying Game 0A00', w.transfer_toast.stage.text())
         m.transfer_info = None
+
+    def test_an_older_device_gets_only_the_games_that_play_on_it(self):
+        from nspb_qt.transfer import TransferDialog
+        from nspb_qt.win import device as dv
+        m, w = self._window(self._rows(signed_in=True))
+        self._built(m, '0100000000000A00', '0100000000000B00')
+        # A was built with Older devices on, B without
+        fw = Path(m.shell_cache_path) / 'frameworks' / 'DmGame0100000000000A00.framework' / 'dm'
+        fw.mkdir(parents=True, exist_ok=True)
+        (fw / 'env.txt').write_text('DM_PROF_TEX_BC_CPU=1\n')
+        self.assertTrue(m.game_plays_on_older('0100000000000A00'))
+        self.assertFalse(m.game_plays_on_older('0100000000000B00'))
+        m.devices = [dv.Device('OLD', 7, 'USB', 'Jane’s iPhone', '26.0', 'iPhone15,3'),
+                     dv.Device('NEW', 8, 'USB', 'Kat’s iPad', '26.0', 'iPad14,5')]
+        old = TransferDialog(m, w, udid='OLD')
+        self.addCleanup(old.deleteLater)
+        self.assertEqual(old.titles(), ['0100000000000A00'])          # B would stop at its start: not ticked
+        self.assertIn('older GPU', old.gpu_note.text())
+        old._checks['0100000000000B00'].setChecked(True)
+        self.assertIn('Built for newer devices only', old.hint.text())
+        new = TransferDialog(m, w, udid='NEW')
+        self.addCleanup(new.deleteLater)
+        self.assertEqual(new.titles(), ['0100000000000A00', '0100000000000B00'])
+        self.assertIn('plays every game', new.gpu_note.text())
+        # the library says which devices a game plays on
+        m.library.games = [type('G', (), {'title_id': '0100000000000B00'})()]
+        self.assertFalse(m.game_plays_on_older('0100000000000B00'))
 
     def _built(self, m, *tids):
         import json

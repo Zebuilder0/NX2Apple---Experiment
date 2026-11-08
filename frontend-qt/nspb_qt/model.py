@@ -152,7 +152,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.archive_path = ''
         self.mac_app_path = ''
         self.target = 'ios'   # 'ios' (an IPA) or 'mac-app' (a double-clickable Mac app; macOS only)
-        self.bc_on_cpu = False
+        # Older devices: on by default on Windows, where a build goes to iPhones and iPads of every age
+        self.bc_on_cpu = bool(pu.IS_WIN)
         self.ipa_kind = 'shared'   # 'shared' (shell.ipaShared) or 'oneGame' (shell.ipaOneGame)
         # Windows: where an iPhone build goes. 'device': the shared app, signed and installed over the cable;
         # 'ipa': an unsigned IPA for another signing tool (ipa_kind says which). Elsewhere always 'ipa'.
@@ -212,7 +213,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.out_dir = out
         elif self.library.games_folder and os.path.isdir(self.library.games_folder):
             self.out_dir = self.library.games_folder
-        self.bc_on_cpu = self._setting('bcOnCPU') == 'true'
+        if self._setting('bcOnCPU') in ('true', 'false'):
+            self.bc_on_cpu = self._setting('bcOnCPU') == 'true'
         if self._setting('ipaKind') in ('shared', 'oneGame'):
             self.ipa_kind = self._setting('ipaKind')
         if pu.IS_WIN and self._setting('outputMode') in ('device', 'ipa'):
@@ -1836,9 +1838,9 @@ class Model(QObject, DeviceMixin, QueueMixin):
         # Older iPhones and iPads (before the A17 Pro, iPads before the M1) have no BC texture formats: the profile's
         # tex_bc_cpu decodes them on the CPU. The engine reads it as DM_PROF_TEX_BC_CPU (hle_profile.c read_env); the
         # Mac launcher writes that name, and DM_TEX_BC_CPU, which this launcher wrote, was never read. It changes
-        # nothing on a GPU with BC support (nvn_mtl.m: g_bc_cpu = !supportsBCTextureCompression && tex_bc_cpu), so a
-        # Windows shared-app game always carries it: the one framework then plays on every iPhone and iPad.
-        if (self.bc_on_cpu or shell_fw) and not mac_app:
+        # nothing on a GPU with BC support (nvn_mtl.m: g_bc_cpu = !supportsBCTextureCompression && tex_bc_cpu), so the
+        # switch is on by default on Windows: one build then plays on every iPhone and iPad (shell.supports_older).
+        if self.bc_on_cpu and not mac_app:
             try:
                 Path(self.effective_work_dir).mkdir(parents=True, exist_ok=True)
                 env_file = Path(self.effective_work_dir, '_env.txt')

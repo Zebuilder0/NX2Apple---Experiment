@@ -329,6 +329,26 @@ class SharedApp(unittest.TestCase):
         second = plan.report(2, 350, 700)
         self.assertEqual((second['game'], second['number'], second['done'], second['total']), ('Game B', 2, 550, 900))
 
+    def test_which_devices_need_older_device_games(self):
+        cases = {'iPhone15,3': 'older', 'iPhone15,4': 'older', 'iPhone12,1': 'older', 'iPhone16,1': 'new',
+                 'iPhone17,5': 'new', 'iPad14,5': 'new', 'iPad13,16': 'new', 'iPad14,1': 'older', 'iPad13,18': 'older',
+                 'iPad15,7': 'older', 'iPad16,3': 'new', 'iPod9,1': 'unknown', '': 'unknown'}
+        for product, want in cases.items():
+            self.assertEqual(dv.gpu_class(product), want, product)
+
+    def test_a_game_plays_on_older_devices_by_its_env_or_its_profile(self):
+        fw = make_framework(self.tmp / 'f', '0100F2C0115B6000')
+        self.assertFalse(shell.supports_older(fw))
+        (fw / 'dm').mkdir()
+        (fw / 'dm' / 'env.txt').write_text('# a comment\nDM_PROF_TEX_BC_CPU=1\n')
+        self.assertTrue(shell.supports_older(fw))
+        (fw / 'dm' / 'env.txt').write_text('DM_TEX_BC_CPU=1\n')       # the name the engine never read
+        self.assertFalse(shell.supports_older(fw))
+        eng = self.tmp / 'engine'
+        (eng / 'dm' / 'games' / '0100F2C0115B6000').mkdir(parents=True)
+        (eng / 'dm' / 'games' / '0100F2C0115B6000' / 'game.tsv').write_text('name\tZelda\ntex_bc_cpu\ton\n')
+        self.assertTrue(shell.supports_older(fw, str(eng)))           # the profile turns it on
+
     def test_the_signing_step_reads_the_tools_lines(self):
         self.assertEqual(wi.signer_step('[2026-11-06T10:00:00Z INFO  plumesign] Registering device'), 'Registering device')
         self.assertEqual(wi.signer_step('$ plumesign sign --package <shared app>'), '')
@@ -534,6 +554,16 @@ class InstallEndToEnd(DeviceTestCase):
         self.assertEqual(json.loads(self.out.read_text())['frameworks'], ['DmGame0100000000000B00.framework'])
         state = wi.Devices(self.root).get(self.dev.udid)
         self.assertEqual([g.titleID for g in wi.device_games(self.root, state)], ['0100000000000B00'])
+
+    def test_an_older_device_is_warned_of_games_built_for_newer_ones(self):
+        shell.add_built_game(self.root, make_framework(self.tmp / 'w' / 'shell-framework', '0100000000000A00', 'Zelda'))
+        self.dev.product = 'iPhone15,3'                 # an iPhone 14 Pro Max: A16, no BC textures
+        self._signing()
+        log = []
+        out = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe, log=log.append,
+                         t=lambda key, *a: key + ':' + '|'.join(map(str, a)))
+        self.assertTrue(out.ok, out)
+        self.assertIn('win.install.olderWarn:Test iPhone|Zelda', ''.join(log))
 
     def test_a_device_on_an_older_ios_is_told_before_signing(self):
         shell.add_built_game(self.root, make_framework(self.tmp / 'w' / 'shell-framework', '0100000000000A00'))

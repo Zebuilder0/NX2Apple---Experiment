@@ -211,6 +211,17 @@ class DeviceMixin:
             return []
         return list(st.titles) if st.titles else [g.titleID.upper() for g in self.built_games()]
 
+    def game_plays_on_older(self, title_id: str) -> bool:
+        """Whether a game built for the shared app plays on a device without BC textures (shell.supports_older)."""
+        g = next((x for x in self.built_games() if x.titleID.upper() == title_id.upper()), None)
+        return bool(g) and shell.supports_older(Path(g.framework), self.engine_path)
+
+    def device_gpu(self, udid: str) -> str:
+        """'new', 'older' or 'unknown' for a connected device (win.device.gpu_class of its model identifier)."""
+        from .win import device as dv
+        d = self.device_by_udid(udid)
+        return dv.gpu_class(getattr(d, 'product', '')) if d else 'unknown'
+
     def transfer_games(self, udid: str, titles: list[str]) -> bool:
         """Put exactly `titles` in the app on `udid` (install or update it), then copy their data the device lacks.
         False when another run is going on and nothing started."""
@@ -315,7 +326,8 @@ class DeviceMixin:
             try:
                 out = wi.install(Path(self.shell_cache_path), udid, data=data, titles=titles,
                                  log=self.log, stage=stage, cancelled=lambda: self.cancel_requested,
-                                 started=started, banner=self._banner_for, t=self.t, transfer=on_transfer)
+                                 started=started, banner=self._banner_for, t=self.t, transfer=on_transfer,
+                                 engine=self.engine_path)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
                 # not "could not prepare": this can come from any step. The step that was running failed with it.
                 for st in self.stages:

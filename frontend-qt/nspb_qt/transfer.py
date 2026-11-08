@@ -137,6 +137,12 @@ class TransferDialog(QDialog):
         self.refresh_btn.clicked.connect(model.refresh_devices)
         rl.addWidget(self.refresh_btn)
         self.dev_group.add_row(r)
+        # what the device's GPU plays: an older one (before the A17 Pro and the M1) needs games built with Older devices
+        self.gpu_note = QLabel('')
+        self.gpu_note.setObjectName('muted')
+        self.gpu_note.setWordWrap(True)
+        self.gpu_note.setContentsMargins(18, 0, 18, 10)
+        self.dev_group.add_row(self.gpu_note)
         lay.addWidget(self.dev_group)
 
         # the games
@@ -268,10 +274,16 @@ class TransferDialog(QDialog):
         self._checks = {}
         games = self.m.built_games()
         on_device = set(self.m.device_titles(self._udid)) if self._udid else set()
+        older = self.m.device_gpu(self._udid) == 'older' if self._udid else False
+        plays = {g.titleID.upper(): self.m.game_plays_on_older(g.titleID) for g in games}
         if self.preselect is None:
             ticked = on_device or {g.titleID.upper() for g in games}
         else:
             ticked = on_device | set(self.preselect)
+        if older:      # a game built for newer devices only would stop at its start here: not ticked unless it is there
+            ticked = {tid for tid in ticked if plays.get(tid, True) or tid in on_device}
+        self._plays = plays
+        self._older = older
         for g in games:
             tid = g.titleID.upper()
             row = QWidget()
@@ -282,6 +294,9 @@ class TransferDialog(QDialog):
             cb.setChecked(tid in ticked)
             cb.toggled.connect(self._on_game_toggled)
             rl.addWidget(cb, 1)
+            ready = QLabel(t('win.transfer.tagAll') if plays.get(tid) else t('win.transfer.tagNewer'))
+            ready.setStyleSheet(f'color: {style.GREEN if plays.get(tid) else style.AMBER}; font-size: 12px;')
+            rl.addWidget(ready)
             tag = QLabel(t('win.transfer.onDevice') if tid in on_device else tid)
             tag.setObjectName('muted' if tid in on_device else 'mono')
             rl.addWidget(tag)
@@ -317,6 +332,12 @@ class TransferDialog(QDialog):
         self.go_btn.setText(t('win.transfer.update' if has_app else 'win.transfer.install'))
         on_device = set(self.m.device_titles(self._udid)) if self._udid else set()
         removed = sorted(on_device - set(self.titles()))
+        gpu = self.m.device_gpu(self._udid) if self._udid else 'unknown'
+        self.gpu_note.setVisible(gpu != 'unknown')
+        self.gpu_note.setText(t('win.transfer.gpuOlder', name) if gpu == 'older' else t('win.transfer.gpuNew', name))
+        self.gpu_note.setStyleSheet(f'color: {style.AMBER};' if gpu == 'older' else '')
+        names = {g.titleID.upper(): g.name for g in self.m.built_games()}
+        stuck = [names.get(tid, tid) for tid in self.titles() if gpu == 'older' and not getattr(self, '_plays', {}).get(tid, True)]
         if not self.m.device_install_ready:
             why = t('win.install.needsSetup')
         elif not self._udid:
@@ -328,6 +349,8 @@ class TransferDialog(QDialog):
         else:
             why = ''
         note = why or (t('win.transfer.removes', len(removed)) if removed else t('win.transfer.ready'))
+        if not why and stuck:            # ticked anyway: it is said, before it is installed
+            note = t('win.transfer.olderWarn', name, ', '.join(stuck)) + (' ' + note if removed else '')
         self.hint.setText(note)
         self.go_btn.setEnabled(not why)
 
