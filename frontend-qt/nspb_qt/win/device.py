@@ -43,6 +43,13 @@ LABEL = 'NX2Apple'
 HOUSE_ARREST = 'com.apple.mobile.house_arrest'
 INSTALLATION_PROXY = 'com.apple.mobile.installation_proxy'
 
+#: Developer Mode (iOS 16 and later): its state is a lockdown value, and the AMFI service shows its
+#: switch in Settings (action 0, what Xcode asks when a device is plugged in; libimobiledevice's
+#: idevicedevmodectl reveal, pymobiledevice3's amfi reveal-developer-mode)
+AMFI = 'com.apple.amfi.lockdown'
+AMFI_DOMAIN = 'com.apple.security.mac.amfi'
+AMFI_REVEAL = 0
+
 #: The shared app's executable: how the app is found on a device whatever bundle ID the signing
 #: tool gave it (it appends the team ID to `org.nxnative.shell`).
 SHELL_EXECUTABLE = 'DmShell'
@@ -588,6 +595,32 @@ def describe(device: Device) -> Device:
     except DeviceError:
         pass
     return device
+
+
+def developer_mode(device: Device) -> bool | None:
+    """Whether Developer Mode is on, None when the device does not say (iOS 15 and earlier have
+    none). A development-signed app, which a free Apple ID makes, opens only with it on."""
+    with Lockdown(device, timeout=8) as ld:
+        try:
+            v = ld.get_value('DeveloperModeStatus', AMFI_DOMAIN)
+        except DeviceError:
+            return None
+    return bool(v) if v is not None else None
+
+
+def reveal_developer_mode(device: Device) -> None:
+    """Make the Developer Mode switch appear in Settings, Privacy & Security. iOS hides it until a
+    development tool asks for it: Xcode does when a device is plugged into a Mac, which is why the
+    switch was there on a Mac and not from Windows. Turning it on stays the player's (iOS restarts
+    and asks for the passcode)."""
+    with Lockdown(device, timeout=8) as ld:
+        amfi = ld.service(AMFI)
+        try:
+            r = amfi.request({'action': AMFI_REVEAL})
+        finally:
+            amfi.close()
+    if r.get('Error') or not r.get('success', False):
+        raise DeviceError(f'the device did not show the Developer Mode switch: {r.get("Error") or r}')
 
 
 def find_shell(device: Device, preferred: str = '') -> str:

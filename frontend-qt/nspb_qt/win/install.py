@@ -205,8 +205,33 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         state.receipts[title_id.upper()] = stamp
         known.put(udid, state)
         stage('win.install.stage.data', 'done', name, 100)
-    if not prev.bundle:
-        # the first install on this device: iOS opens the app only once the player trusts the
-        # Apple ID's certificate and turns Developer Mode on
-        return Outcome(True, ('win.install.firstTime', name), '', bundle, copied)
-    return Outcome(True, ('dev.installed', name), '', bundle, copied)
+
+    # 5. Developer Mode, last: turning it on restarts the device
+    on = check_developer_mode(dev, log)
+    return Outcome(True, (done_message(first=not prev.bundle, developer_mode=on), name), '', bundle, copied)
+
+
+def check_developer_mode(dev: dv.Device, log: Callable[[str], None] = lambda s: None) -> bool | None:
+    """Whether Developer Mode is on (None: the device does not say). When it is off, its switch is
+    made to appear in Settings, as Xcode does on a Mac: iOS hides it until a development tool
+    asks, so a device that only ever met Windows had no switch to turn on."""
+    try:
+        on = dv.developer_mode(dev)
+    except (dv.DeviceError, OSError, ValueError) as e:
+        log(f'Developer Mode: {e}\n')
+        return None
+    if on is False:
+        try:
+            dv.reveal_developer_mode(dev)
+            log('Developer Mode is off on the device: its switch is now in Settings, Privacy & Security\n')
+        except (dv.DeviceError, OSError, ValueError) as e:
+            log(f'Developer Mode: {e}\n')
+    return on
+
+
+def done_message(first: bool, developer_mode: bool | None) -> str:
+    """The en.json key of a finished install's note. The first time, iOS opens the app only once the
+    player trusts the Apple ID's certificate; and with Developer Mode off, it never does."""
+    if first:
+        return 'win.install.firstTimeTrust' if developer_mode else 'win.install.firstTime'
+    return 'win.install.devModeOff' if developer_mode is False else 'dev.installed'

@@ -2,8 +2,8 @@
 
 One TCP server plays usbmuxd (point NSPB_USBMUXD at it). After a `Connect` the connection is a
 tunnel to the device: port 62078 is lockdownd (with TLS after StartSession when `tls` is set),
-the ports StartService hands out are house_arrest (AFC on an in-memory file system) and
-installation_proxy (Browse). Only what the client uses is implemented, framed as Apple frames it.
+the ports StartService hands out are house_arrest (AFC on an in-memory file system),
+installation_proxy (Browse) and AMFI (the Developer Mode switch). Only what the client uses is implemented, framed as Apple frames it.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from pathlib import Path
 LOCKDOWN = 62078
 HOUSE_ARREST_PORT = 49001
 INSTPROXY_PORT = 49002
+AMFI_PORT = 49003
 AFC_HEADER = struct.Struct('<8sQQQQ')
 
 
@@ -48,8 +49,11 @@ def _exact(sock, n: int) -> bytes:
 
 class FakeDevice:
     def __init__(self, *, udid='00008110-001A2B3C4D5E801E', name='Test iPhone', paired=True,
-                 tls: tuple[bytes, bytes] | None = None, free=50_000_000_000, locked=False):
+                 tls: tuple[bytes, bytes] | None = None, free=50_000_000_000, locked=False,
+                 developer_mode: bool | None = None):
         self.udid, self.name, self.paired, self.tls, self.free, self.locked = udid, name, paired, tls, free, locked
+        self.developer_mode = developer_mode      # None: the device does not say (iOS 15)
+        self.revealed = 0                         # AMFI reveal requests (the Developer Mode switch shown)
         self.apps: dict[str, dict] = {}
         self.files: dict[str, bytes] = {}          # AFC paths of the vended container
         self.dirs: set[str] = {'/', '/Documents'}
@@ -114,6 +118,8 @@ class FakeDevice:
             self._house_arrest(s)
         elif port == INSTPROXY_PORT:
             self._instproxy(s)
+        elif port == AMFI_PORT:
+            self._amfi(s)
 
     # ---- plist service framing
     @staticmethod
@@ -168,6 +174,9 @@ class FakeDevice:
                     self._send(s, {'Request': r, 'Value': self.name})
                 elif req.get('Key') == 'AmountDataAvailable':
                     self._send(s, {'Request': r, 'Value': self.free})
+                elif (req.get('Domain'), req.get('Key')) == ('com.apple.security.mac.amfi', 'DeveloperModeStatus') \
+                        and self.developer_mode is not None:
+                    self._send(s, {'Request': r, 'Value': self.developer_mode})
                 else:
                     self._send(s, {'Request': r, 'Error': 'MissingValue'})
             elif r == 'StartService':
@@ -175,12 +184,21 @@ class FakeDevice:
                     self._send(s, {'Request': r, 'Error': 'PasswordProtected'})
                     continue
                 port = {'com.apple.mobile.house_arrest': HOUSE_ARREST_PORT,
-                        'com.apple.mobile.installation_proxy': INSTPROXY_PORT}.get(req.get('Service'))
+                        'com.apple.mobile.installation_proxy': INSTPROXY_PORT,
+                        'com.apple.amfi.lockdown': AMFI_PORT}.get(req.get('Service'))
                 self._send(s, {'Request': r, 'Port': port, 'EnableServiceSSL': False} if port
                            else {'Request': r, 'Error': 'InvalidService'})
             elif r == 'StopSession':
                 self._send(s, {'Request': r})
                 return
+
+    def _amfi(self, s):
+        req = self._recv(s)
+        if req.get('action') == 0:          # reveal: the switch appears in Settings
+            self.revealed += 1
+            self._send(s, {'success': True})
+        else:
+            self._send(s, {'Error': 'unexpected action'})
 
     def _instproxy(self, s):
         req = self._recv(s)

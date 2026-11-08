@@ -122,6 +122,23 @@ class UsbClient(DeviceTestCase):
         self.assertEqual(dv.files_to_copy({'a': 1}, {'a': 1}, force=['a']), ['a'])
 
 
+class DeveloperMode(DeviceTestCase):
+    def test_status_and_reveal(self):
+        dev = dv.list_devices()[0]
+        self.assertIsNone(dv.developer_mode(dev))            # the device does not say: iOS 15
+        self.dev.developer_mode = False
+        self.assertIs(dv.developer_mode(dev), False)
+        dv.reveal_developer_mode(dev)
+        self.assertEqual(self.dev.revealed, 1)
+        log = []
+        self.assertIs(wi.check_developer_mode(dev, log.append), False)
+        self.assertEqual(self.dev.revealed, 2)
+        self.assertIn('Privacy & Security', ''.join(log))
+        self.dev.developer_mode = True
+        self.assertIs(wi.check_developer_mode(dev), True)
+        self.assertEqual(self.dev.revealed, 2)
+
+
 class UsbClientOverTls(UsbClient):
     """The same, with lockdownd asking for TLS after StartSession (every real device does)."""
 
@@ -346,6 +363,7 @@ class InstallEndToEnd(DeviceTestCase):
             r = orig(*a, **k)
             installed_by_signer()
             return r
+        self.dev.developer_mode = False       # a device that only ever met Windows: no switch in Settings
         signer.sign_and_install = sign_and_install
         try:
             log, stages = [], []
@@ -356,6 +374,7 @@ class InstallEndToEnd(DeviceTestCase):
             signer.sign_and_install = orig
         self.assertTrue(out.ok, out)
         self.assertEqual(out.message[0], 'win.install.firstTime')   # trust the Apple ID, Developer Mode
+        self.assertEqual(self.dev.revealed, 1)                       # its switch is shown, as Xcode does
         self.assertEqual(out.bundle_id, SHELL_ID)
         info = json.loads(self.out.read_text())
         self.assertEqual(info['frameworks'], ['DmGame0100ABCD00000000.framework'])
@@ -376,10 +395,22 @@ class InstallEndToEnd(DeviceTestCase):
         self.assertFalse(wi.needs_update(None, current))
         signer.sign_and_install = sign_and_install
         try:
+            off = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
+            self.dev.developer_mode = True
             again = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
         finally:
             signer.sign_and_install = orig
+        self.assertEqual((off.ok, off.message[0]), (True, 'win.install.devModeOff'))
         self.assertEqual((again.ok, again.message[0], again.copied_files), (True, 'dev.installed', 0))
+        self.assertEqual(self.dev.revealed, 2)                       # not asked once it is on
+
+    def test_the_note_names_what_the_player_still_does(self):
+        self.assertEqual(wi.done_message(True, None), 'win.install.firstTime')      # iOS 15 or unknown: say it all
+        self.assertEqual(wi.done_message(True, False), 'win.install.firstTime')
+        self.assertEqual(wi.done_message(True, True), 'win.install.firstTimeTrust')
+        self.assertEqual(wi.done_message(False, False), 'win.install.devModeOff')
+        self.assertEqual(wi.done_message(False, True), 'dev.installed')
+        self.assertEqual(wi.done_message(False, None), 'dev.installed')
 
     def test_install_stops_early_with_a_reason(self):
         self.assertEqual(wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe).message,

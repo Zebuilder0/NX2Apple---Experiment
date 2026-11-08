@@ -277,7 +277,10 @@ one app on the device that holds all your games, signed with your own Apple ID, 
 | Apple ID for signing | Impactor's own session in `%APPDATA%\PlumeImpactor` | **Sign in…** opens Impactor's console window: Apple ID, password (hidden), code. The launcher never sees the password. **Sign out** removes the session |
 | Shared app (ready-made) | `shell\DmShell.app`, the empty app built on GitHub's macOS runner (`tools/build_shell_template.sh`) | Nothing, the zip carries it |
 
-On the device, turn on Developer Mode once (Settings → Privacy & Security) when iOS asks after the first install.
+On the device, turn on Developer Mode once (Settings → Privacy & Security → Developer Mode). iOS hides that switch
+until a development tool asks for it, which Xcode does on a Mac when a device is plugged in. On Windows the install asks
+for it (`win/device.py` `reveal_developer_mode`, Apple's AMFI service) when the device reports Developer Mode off, and its
+note says where to turn it on. Turning it on stays on the device: iOS restarts and asks for the passcode.
 
 **Each build:** the game is built as `DmGame<title ID>.framework` (`--shell-framework`, `win/build_app.py`
 `DM_FRAMEWORK_ONLY`: the same compile, linked as a dylib with its own engine host), its data is packed as before, then
