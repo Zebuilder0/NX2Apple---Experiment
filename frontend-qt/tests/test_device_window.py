@@ -164,6 +164,41 @@ class DeviceWindow(unittest.TestCase):
         self.assertTrue(any(s.is_spinning() for s in w.device_deps_host.findChildren(Spinner)))
         m.signing_in = False
 
+    def test_the_transfer_shows_the_game_the_time_left_and_the_clock(self):
+        import time
+        from nspb_qt.model import Stage
+        from nspb_qt.transfer import TransferDialog, copy_lines, finish_clock, install_fraction
+        from nspb_qt.win import device as dv
+        m, w = self._window(self._rows(signed_in=True))
+        self._built(m, '0100000000000A00', '0100000000000B00')
+        m.devices = [dv.Device('UDID1', 7, 'USB', 'Jane’s iPhone')]
+        info = {'game': 'Game 0A00', 'number': 2, 'count': 3, 'done': 14_200_000_000, 'total': 31_600_000_000,
+                'rate': 38_000_000, 'left': 420.0, 'at': time.time()}
+        game, size, eta = copy_lines(m, info)
+        self.assertEqual(game, 'Copying Game 0A00 · game 2 of 3')
+        self.assertEqual(size, '14.2 of 31.6 GB · 38 MB/s')
+        self.assertTrue(eta.startswith('About 7 min left · done around '))
+        self.assertIn(finish_clock(420.0, info['at']), eta)
+        self.assertEqual(copy_lines(m, dict(info, left=None, rate=None))[2], 'Working out the time left…')
+        # the bar: a fifth for preparing and signing, the rest by bytes
+        self.assertAlmostEqual(install_fraction([], info, m.t), 0.2 + 0.8 * 14.2 / 31.6, places=3)
+        signing = [Stage(m.t('win.install.stage.prepare'), 'done'), Stage(m.t('win.install.stage.sign'), 'running', '', 50.0)]
+        self.assertAlmostEqual(install_fraction(signing, None, m.t), 0.125)
+        # in the window, while it copies
+        m.transfer_games = lambda udid, titles: None
+        d = TransferDialog(m, w, udid='UDID1')
+        self.addCleanup(d.deleteLater)
+        d._start()
+        m.stages = signing
+        m.transfer_info = info
+        d._on_stages()
+        self.assertTrue(d.copy_box.isVisibleTo(d))
+        self.assertEqual(d.copy_game.text(), 'Copying Game 0A00 · game 2 of 3')
+        self.assertTrue(d.progress.spinner.is_spinning())
+        w.transfer_toast.follow(d)
+        self.assertIn('Copying Game 0A00', w.transfer_toast.stage.text())
+        m.transfer_info = None
+
     def _built(self, m, *tids):
         import json
         from nspb_qt import shell

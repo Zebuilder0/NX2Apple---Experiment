@@ -26,10 +26,63 @@ from PySide6.QtWidgets import (
 )
 
 from . import style
-from .widgets import BigProgress, CardGroup, Spinner, overall_fraction
+from .widgets import BigProgress, CardGroup, Spinner
 
-#: The install's stages (prepare, sign and install, copy the data): what the bar is the fraction of.
-INSTALL_STAGES = 3
+#: How much of the bar each step takes. The game data (8 to 12 GB a game) is most of the time.
+PREPARE_SHARE, SIGN_SHARE = 0.05, 0.15
+
+
+def install_fraction(stages, info: dict | None, t) -> float:
+    """How far an install is, for the bar: prepare and sign take the first fifth, the game data the rest, by bytes."""
+    if info:
+        return PREPARE_SHARE + SIGN_SHARE + (1 - PREPARE_SHARE - SIGN_SHARE) * min(1.0, info['done'] / info['total'])
+    by_name = {s.name: s for s in stages}
+    frac = 0.0
+    for key, start, share in (('win.install.stage.prepare', 0.0, PREPARE_SHARE),
+                              ('win.install.stage.sign', PREPARE_SHARE, SIGN_SHARE)):
+        st = by_name.get(t(key))
+        if st is None:
+            continue
+        if st.state == 'done':
+            frac = start + share
+        elif st.state == 'running':
+            frac = start + share * max(0.0, min(100.0, float(st.percent or 0))) / 100
+    data = by_name.get(t('win.install.stage.data'))
+    if data is not None and data.state == 'done':
+        frac = 1.0
+    return frac
+
+
+def finish_clock(seconds: float, now: float | None = None) -> str:
+    """The clock time `seconds` from now in this PC's time zone and format (3:42 PM, 15:42), with the day when it
+    is not today."""
+    import time
+    from PySide6.QtCore import QDateTime, QLocale
+    end = QDateTime.fromSecsSinceEpoch(int((now if now is not None else time.time()) + seconds))
+    loc = QLocale.system()
+    clock = loc.toString(end.time(), QLocale.ShortFormat)
+    if end.date() != QDateTime.currentDateTime().date():
+        clock = loc.dayName(end.date().dayOfWeek(), QLocale.ShortFormat) + ' ' + clock
+    return clock
+
+
+def copy_lines(m, info: dict | None) -> tuple[str, str, str]:
+    """The game data copy as three lines: which game (its number of all), the bytes and speed, the time left and
+    when it should be done. Empty while no game data is copying."""
+    if not info:
+        return '', '', ''
+    from .queue_model import format_duration
+    t = m.t
+    game = t('win.transfer.copying', info['game'], info['number'], info['count'])
+    size = t('win.transfer.bytes', f"{info['done'] / 1e9:.1f}", f"{info['total'] / 1e9:.1f}")
+    if info.get('rate'):
+        size += ' · ' + t('win.transfer.speed', f"{info['rate'] / 1e6:.0f}")
+    left = info.get('left')
+    if left is None:
+        eta = t('win.transfer.etaPending')
+    else:
+        eta = t('win.transfer.eta', format_duration(left, t), finish_clock(left, info.get('at')))
+    return game, size, eta
 
 
 class TransferDialog(QDialog):
@@ -111,6 +164,23 @@ class TransferDialog(QDialog):
         rb.setSpacing(10)
         self.progress = BigProgress()
         rb.addWidget(self.progress, 0)
+        # the game data copy: the game it is on, the bytes and speed, the time left and the clock time it ends
+        self.copy_box = QWidget()
+        cb = QVBoxLayout(self.copy_box)
+        cb.setContentsMargins(0, 2, 0, 0)
+        cb.setSpacing(3)
+        self.copy_game = QLabel('')
+        self.copy_game.setObjectName('rowTitle')
+        self.copy_game.setWordWrap(True)
+        self.copy_bytes = QLabel('')
+        self.copy_bytes.setObjectName('muted')
+        self.copy_eta = QLabel('')
+        self.copy_eta.setStyleSheet(f'color: {style.ACCENT}; font-weight: 600;')
+        self.copy_eta.setWordWrap(True)
+        for w in (self.copy_game, self.copy_bytes, self.copy_eta):
+            cb.addWidget(w)
+        self.copy_box.hide()
+        rb.addWidget(self.copy_box, 0)
         self.log_btn = QPushButton('›  ' + t('build.log'))
         self.log_btn.setObjectName('ghost')
         self.log_btn.clicked.connect(self._toggle_log)
@@ -280,7 +350,7 @@ class TransferDialog(QDialog):
         stages = list(self.m.stages)
         running = next((s for s in stages if s.state == 'running'), None)
         failed = next((s for s in stages if s.state == 'failed'), None)
-        frac = 1.0 if self.finished_ok else overall_fraction(stages, INSTALL_STAGES)
+        frac = 1.0 if self.finished_ok else install_fraction(stages, getattr(self.m, 'transfer_info', None), self.m.t)
         if self.finished_ok is not None:
             return (self.note or self.m.t('msg.done')), frac, not self.finished_ok
         cur = running or failed or (stages[-1] if stages else None)
@@ -297,6 +367,11 @@ class TransferDialog(QDialog):
             return
         text, frac, failed = self.stage_text()
         self.progress.set_progress(self.m.t('win.transfer.toast', self._device_name()), frac, text, failed, busy=True)
+        game, size, eta = copy_lines(self.m, getattr(self.m, 'transfer_info', None))
+        self.copy_box.setVisible(bool(game))
+        self.copy_game.setText(game)
+        self.copy_bytes.setText(size)
+        self.copy_eta.setText(eta)
         self.progressed.emit()
 
     def _on_log(self, s: str) -> None:
@@ -320,7 +395,8 @@ class TransferDialog(QDialog):
         self.go_btn.setEnabled(True)
         self.go_btn.setText(self.m.t('win.transfer.close'))
         self.progress.set_progress(self.m.t('win.transfer.doneTitle' if ok else 'win.transfer.failedTitle'),
-                                   1.0 if ok else overall_fraction(self.m.stages, INSTALL_STAGES), note, not ok)
+                                   1.0 if ok else install_fraction(self.m.stages, None, self.m.t), note, not ok)
+        self.copy_box.hide()
         if not ok:
             self.log.show()
             self.log_btn.setText('⌄  ' + self.m.t('build.log'))
@@ -408,7 +484,8 @@ class TransferToast(QFrame):
             self.title.setText(t('win.transfer.toast', name))
         else:
             self.title.setText(t('win.transfer.doneTitle' if d.finished_ok else 'win.transfer.failedTitle'))
-        self.stage.setText(text)
+        game, _size, eta = copy_lines(d.m, getattr(d.m, 'transfer_info', None)) if d.finished_ok is None else ('', '', '')
+        self.stage.setText(f'{game}\n{eta}' if game else text)
         self.pct.setText(f'{int(frac * 100)}%')
         self.pct.setStyleSheet(f'font-weight: 700; color: {style.RED if failed else style.ACCENT}; background: transparent;')
         self.bar.setValue(int(frac * 1000))

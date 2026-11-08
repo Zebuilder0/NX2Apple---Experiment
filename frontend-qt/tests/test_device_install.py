@@ -248,6 +248,32 @@ class SharedApp(unittest.TestCase):
             del owner.artwork
             self.assertIsNone(dm.DeviceMixin._banner_for(owner, '0100ABCD00000000'))
 
+    def test_the_copy_rate_and_the_time_left(self):
+        r = wi.CopyRate(window=30, least=3)
+        r.add(0, 100.0)
+        r.add(10_000_000, 101.0)
+        self.assertIsNone(r.rate())                        # too soon to tell
+        r.add(40_000_000, 104.0)
+        self.assertEqual(r.rate(), 10_000_000)             # 40 MB in 4 s
+        self.assertEqual(r.seconds_left(40_000_000, 140_000_000), 10.0)
+        for i in range(1, 40):                             # only the last 30 s count
+            r.add(40_000_000 + i * 20_000_000, 104.0 + i)
+        self.assertAlmostEqual(r.rate(), 20_000_000, delta=1_000_000)
+        r.add(5, 200.0)                                    # a count that starts over
+        self.assertIsNone(r.rate())
+
+    def test_the_copy_plan_counts_every_game(self):
+        a, b = self.tmp / 'a', self.tmp / 'b'
+        a.mkdir(); b.mkdir()
+        (a / 'romfs.img').write_bytes(b'x' * 300)
+        (b / 'romfs.img').write_bytes(b'y' * 700)
+        plan = wi.CopyPlan([('A', 'Game A', a), ('B', 'Game B', b)])
+        self.assertEqual(plan.report(1, 0, None), {'game': 'Game A', 'number': 1, 'count': 2, 'done': 0, 'total': 1000})
+        self.assertEqual(plan.report(1, 100, 200)['total'], 900)     # the device lacked only 200 bytes of A
+        plan.finish(1, 200)
+        second = plan.report(2, 350, 700)
+        self.assertEqual((second['game'], second['number'], second['done'], second['total']), ('Game B', 2, 550, 900))
+
     def test_the_signing_step_reads_the_tools_lines(self):
         self.assertEqual(wi.signer_step('[2026-11-06T10:00:00Z INFO  plumesign] Registering device'), 'Registering device')
         self.assertEqual(wi.signer_step('$ plumesign sign --package <shared app>'), '')
@@ -373,9 +399,9 @@ class InstallEndToEnd(DeviceTestCase):
         self.dev.developer_mode = False       # a device that only ever met Windows: no switch in Settings
         signer.sign_and_install = sign_and_install
         try:
-            log, stages = [], []
+            log, stages, reports = [], [], []
             shell.remember_data(self.root, game.titleID, data)   # built while no device was connected
-            out = wi.install(self.root, self.dev.udid, log=log.append,
+            out = wi.install(self.root, self.dev.udid, log=log.append, transfer=reports.append,
                              stage=lambda *a: stages.append(a), template=self.tpl, signer_exe=self.exe)
         finally:
             signer.sign_and_install = orig
@@ -387,6 +413,10 @@ class InstallEndToEnd(DeviceTestCase):
         self.assertEqual(info['frameworks'], ['DmGame0100ABCD00000000.framework'])
         self.assertEqual(info['udid'], '7')         # usbmuxd's device number: what plumesign's --udid matches
         self.assertEqual(self.dev.files['/Documents/games/0100ABCD00000000/romfs.img'], b'R' * 5000)
+        # the copy says which game, its number of all, and the bytes of every game together
+        self.assertEqual((reports[0]['game'], reports[0]['number'], reports[0]['count'], reports[0]['done']),
+                         ('Zelda', 1, 1, 0))
+        self.assertEqual((reports[-1]['done'], reports[-1]['total']), (5000, 5000))
         joined = ''.join(log)
         self.assertNotIn(self.dev.udid, joined)              # the signer's lines are redacted
         self.assertIn(('win.install.stage.sign', 'done', 'Test iPhone', 100), stages)

@@ -42,6 +42,7 @@ class DeviceMixin:
         self.install_udid = str(self.settings.value('installDevice', '', type=str) or '')
         self.apple_account = None               # win.signer.Account after a dependency check
         self.signing_in = False                 # the sign-in window is open (the Apple ID row waits for it)
+        self.transfer_info: dict | None = None  # where an install's game data copy is (install.py CopyPlan)
         self._install_cancel = False
         self._auto_seen: set[str] = set()
         self._auto_busy = False
@@ -264,14 +265,26 @@ class DeviceMixin:
         def started(p) -> None:
             self._proc = p
 
+        rate = wi.CopyRate()
+        self.transfer_info = None
+
+        def on_transfer(info: dict) -> None:
+            # where the game data copy is, with its speed and the time left (the window shows it with a clock time)
+            now = time.time()
+            rate.add(info['done'], now)
+            left = rate.seconds_left(info['done'], info['total'])
+            self.transfer_info = dict(info, rate=rate.rate(), left=left, at=now)
+            self.stagesChanged.emit()
+
         def work() -> None:
             try:
                 out = wi.install(Path(self.shell_cache_path), udid, data=data, titles=titles,
                                  log=self.log, stage=stage, cancelled=lambda: self._install_cancel,
-                                 started=started, banner=self._banner_for, t=self.t)
+                                 started=started, banner=self._banner_for, t=self.t, transfer=on_transfer)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
                 out = wi.Outcome(False, ('win.install.prepareFailed', str(e)))
             self._proc = None
+            self.transfer_info = None
             self.running = False
             self.runningChanged.emit(False)
             note = self.t(*out.message) if out.message else ''

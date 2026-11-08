@@ -116,6 +116,55 @@ def needs_update(state: DeviceState | None, current: str, now: float | None = No
 
 data_stamp = shell.data_stamp
 
+class CopyPlan:
+    """The game data of one install, all games together: which game is copying (its name and number), and the
+    bytes done and to do. Each game counts its files' size until its copy starts and says what the device lacks."""
+
+    def __init__(self, games: list[tuple[str, str, Path]]):
+        self.names = [name for _tid, name, _folder in games]
+        self.sizes = [sum(dv.local_files(Path(folder)).values()) if Path(folder).is_dir() else 0
+                      for _tid, _name, folder in games]
+        self.finished = 0          # bytes of the games already copied
+
+    def report(self, number: int, done: int, total: int | None) -> dict:
+        if total is not None:
+            self.sizes[number - 1] = total
+        return {'game': self.names[number - 1], 'number': number, 'count': len(self.names),
+                'done': self.finished + done, 'total': max(sum(self.sizes), 1)}
+
+    def finish(self, number: int, copied: int) -> None:
+        self.sizes[number - 1] = copied       # 0 when the device had it all
+        self.finished += copied
+
+
+class CopyRate:
+    """The copy's speed over its last `window` seconds and the time left at that speed. Nothing until `least`
+    seconds have passed: the first seconds (opening the connection, a small file) say little about the rest."""
+
+    def __init__(self, window: float = 30.0, least: float = 3.0):
+        self.window, self.least = window, least
+        self.samples: list[tuple[float, int]] = []
+
+    def add(self, done: int, now: float) -> None:
+        if self.samples and done < self.samples[-1][1]:
+            self.samples = []                 # a new count: start over
+        self.samples.append((now, done))
+        while len(self.samples) > 2 and now - self.samples[1][0] >= self.window:
+            self.samples.pop(0)
+
+    def rate(self) -> float | None:
+        if len(self.samples) < 2:
+            return None
+        (t0, d0), (t1, d1) = self.samples[0], self.samples[-1]
+        if t1 - t0 < self.least or d1 <= d0:
+            return None
+        return (d1 - d0) / (t1 - t0)
+
+    def seconds_left(self, done: int, total: int) -> float | None:
+        r = self.rate()
+        return None if r is None else max(0.0, (total - done) / r)
+
+
 _LOG_PREFIX = re.compile(r'^\[[^\]]*\]\s*')
 
 
@@ -140,7 +189,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
             started: Callable[[object], None] | None = None,
             template: Path | None = None, signer_exe: Path | None = None,
             banner: Callable[[str], str | None] | None = None,
-            t: Callable[..., str] = lambda key, *a: key) -> Outcome:
+            t: Callable[..., str] = lambda key, *a: key,
+            transfer: Callable[[dict], None] | None = None) -> Outcome:
     """Sign and install the shared app on `udid`, then copy each `(title ID, game data folder)`
     of `data`: by default every game's data the device has not received yet (`shell.pending_data`).
     `titles` are the games the app holds (a game left out is removed from the app on the device); by default the
@@ -235,25 +285,34 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
                         titles=sorted(g.titleID.upper() for g in games))
     known.put(udid, state)
 
-    # 4. the game data the device lacks
+    # 4. the game data the device lacks. `transfer` hears where the whole copy is (the game, its number, the bytes
+    # of every game together), for the time left: the plan starts from the size of each game's files and takes each
+    # game's real amount (what the device lacks) as its copy starts.
     if data is None:
         data = shell.pending_data(root, games, state.receipts)
     copied = 0
-    for title_id, folder in data:
+    plan = CopyPlan([(tid, names.get(tid.upper(), names.get(tid, tid)), folder) for tid, folder in data])
+    for number, (title_id, folder) in enumerate(data, 1):
         if cancelled():
             break
         stamp = data_stamp(folder)
         force = ['romfs.img'] if stamp and state.receipts.get(title_id.upper()) != stamp else []
         stage('win.install.stage.data', 'running', name, 0)
+        if transfer:
+            transfer(plan.report(number, 0, None))
+
+        def on_copy(done: int, total: int, _n=number) -> None:
+            stage('win.install.stage.data', 'running', f'{done / 1e9:.1f} / {total / 1e9:.1f} GB',
+                  done * 100 / max(total, 1))
+            if transfer:
+                transfer(plan.report(_n, done, total))
         try:
-            n, _bytes = dv.copy_game_data(
-                dev, bundle, title_id, Path(folder), force=force, log=log, cancelled=cancelled,
-                progress=lambda done, total: stage('win.install.stage.data', 'running',
-                                                   f'{done / 1e9:.1f} / {total / 1e9:.1f} GB',
-                                                   done * 100 / max(total, 1)))
+            n, game_bytes = dv.copy_game_data(dev, bundle, title_id, Path(folder), force=force, log=log,
+                                              cancelled=cancelled, progress=on_copy)
         except dv.DeviceError as e:
             stage('win.install.stage.data', 'failed', str(e)[:160], 0)
             return Outcome(False, ('win.install.dataFailed', str(e)), 'win.install.dataFailed.next', bundle)
+        plan.finish(number, game_bytes)
         copied += n
         state.receipts[title_id.upper()] = stamp
         known.put(udid, state)

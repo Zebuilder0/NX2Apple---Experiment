@@ -2863,6 +2863,10 @@ class MainWindow(QMainWindow):
             title = t('activity.ios') if self._build_run else t('win.transfer.running')
             cur = running or stages[-1]
             detail = cur.name + (' · ' + cur.detail if cur.detail else '')
+            from .transfer import copy_lines
+            game, size, eta = copy_lines(self.m, getattr(self.m, 'transfer_info', None))
+            if game:                     # the game data copy: which game, how much, and when it should end
+                detail = f'{game} · {size}\n{eta}'
             self.big_progress.set_progress(title, self._run_fraction(), detail, busy=True)
         elif failed is not None or self._failed:
             self.big_progress.set_progress(t('win.progress.failed'), self._run_fraction(),
