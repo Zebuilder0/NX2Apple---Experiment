@@ -168,8 +168,12 @@ def logout(exe: Path | None = None) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------- sign and install
 
-def sign_command(exe: Path, app: Path, udid: str) -> list[str]:
-    return [str(exe), 'sign', '--package', str(app), '--apple-id', '--udid', udid,
+def sign_command(exe: Path, app: Path, device_id: int | str) -> list[str]:
+    """`--udid` takes usbmuxd's device number, not the UDID its name says: plumesign looks the
+    device up with `d.device_id.to_string() == device_id` (plume_utils get_device_for_id), and a
+    UDID stopped with "Device ID ... not found". The number is the one usbmuxd gives the connected
+    device now (it changes when the device is plugged in again), so it is read just before."""
+    return [str(exe), 'sign', '--package', str(app), '--apple-id', '--udid', str(device_id),
             '--register-and-install']
 
 
@@ -182,6 +186,7 @@ FAILURES = (
     ('NotTerminal', 'win.sign.fail.teams'),
     ('No devices connected', 'win.sign.fail.noDevice'),
     ('Device not found', 'win.sign.fail.noDevice'),
+    (re.compile(r'Device ID \S+ not found'), 'win.sign.fail.noDevice'),   # plumesign's get_device_for_id
     ('PasswordProtected', 'win.sign.fail.locked'),
     ('maximum number of', 'win.sign.fail.limit'),
     ('anisette', 'win.sign.fail.network'),
@@ -208,17 +213,18 @@ class Result:
     failure: str = ''     # an en.json key from FAILURES, '' when unknown
 
 
-def sign_and_install(app: Path, udid: str, *, log: Callable[[str], None] = lambda s: None,
+def sign_and_install(app: Path, device_id: int | str, *, log: Callable[[str], None] = lambda s: None,
                      progress: Callable[[int], None] | None = None,
                      started: Callable[[subprocess.Popen], None] | None = None,
                      exe: Path | None = None) -> Result:
-    """Sign `app` (a folder, in place) with the selected Apple ID and install it on `udid`.
+    """Sign `app` (a folder, in place) with the selected Apple ID and install it on the device
+    usbmuxd numbers `device_id` (see sign_command).
     stdin is closed, so a question the signer would ask (an Apple ID with several teams) fails
     at once instead of waiting forever. Every output line goes to `log`, redacted."""
     exe = exe or find()
     if not exe:
         return Result(False, 'the signing tool (plumesign) is missing', 'win.sign.fail.missing')
-    cmd = sign_command(exe, app, udid)
+    cmd = sign_command(exe, app, device_id)
     log('$ plumesign sign --package <shared app> --apple-id --udid <device> --register-and-install\n')
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

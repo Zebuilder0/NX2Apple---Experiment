@@ -159,7 +159,7 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
 
     # 2. sign and install
     stage('win.install.stage.sign', 'running', name, 0)
-    r = signer.sign_and_install(app, udid, log=log, exe=exe, started=started,
+    r = signer.sign_and_install(app, dev.device_id, log=log, exe=exe, started=started,
                                 progress=lambda p: stage('win.install.stage.sign', 'running', f'{p}%', p))
     if not r.ok:
         last = next((ln for ln in reversed(r.output.splitlines()) if ln.strip()), '')
