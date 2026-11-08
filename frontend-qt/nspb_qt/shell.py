@@ -192,6 +192,33 @@ def template_version(app: Path) -> str:
         return ''
 
 
+def template_min_ios(app: Path) -> str:
+    """The oldest iOS the empty app runs on (its MinimumOSVersion), '' when it does not say."""
+    try:
+        with open(Path(app) / 'Info.plist', 'rb') as f:
+            return str(plistlib.load(f).get('MinimumOSVersion') or '')
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return ''
+
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    out = []
+    for part in str(v).split('.'):
+        digits = ''.join(ch for ch in part if ch.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def present_titles(games: list['Game'], titles) -> list['Game']:
+    """The games of `games` whose title ID is in `titles` (all of them when `titles` is None), in library order."""
+    if titles is None:
+        return list(games)
+    want = {str(t).upper() for t in titles}
+    return [g for g in games if g.titleID.upper() in want]
+
+
 #: The pictures the app's library reads beside a framework (ShellHost GameCatalogue.imageExtensions)
 BANNER_EXTS = ('png', 'jpg', 'jpeg', 'heic', 'webp')
 

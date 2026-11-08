@@ -92,6 +92,7 @@ class Device:
     device_id: int
     connection: str = 'USB'     # 'USB' or 'Network'
     name: str = ''
+    ios: str = ''               # its iOS version (ProductVersion), '' until describe() read it
 
     @property
     def wired(self) -> bool:
@@ -588,10 +589,14 @@ def copy_game_data(device: Device, bundle_id: str, title_id: str, folder: Path, 
 
 
 def describe(device: Device) -> Device:
-    """`device` with its name read from the device (empty when it is not paired yet)."""
+    """`device` with its name and iOS version read from the device (empty when it is not paired yet)."""
     try:
         with Lockdown(device, timeout=8) as ld:
             device.name = ld.name()
+            try:
+                device.ios = str(ld.get_value('ProductVersion') or '')
+            except DeviceError:
+                device.ios = ''
     except DeviceError:
         pass
     return device

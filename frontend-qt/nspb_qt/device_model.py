@@ -47,6 +47,7 @@ class DeviceMixin:
         # the model's own (main) thread
         self.autoInstallRequested.connect(self._on_auto_install)
         self._known_udids: set[str] = set()
+        self._offered: set[str] = set()         # devices asked about this session (newDeviceFound)
         if pu.IS_WIN:
             from PySide6.QtCore import QTimer
             self._auto_timer = QTimer(self)
@@ -62,6 +63,14 @@ class DeviceMixin:
 
     def set_auto_update_launcher(self, on: bool) -> None:
         self.settings.setValue('autoUpdateLauncher', bool(on))
+
+    @property
+    def offer_new_devices(self) -> bool:
+        """Ask to install the launcher when an iPhone or iPad without it is plugged in."""
+        return bool(self.settings.value('offerNewDevices', True, type=bool))
+
+    def set_offer_new_devices(self, on: bool) -> None:
+        self.settings.setValue('offerNewDevices', bool(on))
 
     def _device_rows(self) -> list:
         """Apple's USB service, the signing tool and the Apple ID: what installing on a device
@@ -148,6 +157,31 @@ class DeviceMixin:
         name = d.name or self.t('win.devices.untrusted')
         return name + ('' if d.wired else ' · Wi-Fi')
 
+    def device_by_udid(self, udid: str):
+        return next((d for d in self.devices if d.udid == udid), None)
+
+    # ---------------------------------------------------------------- the games on a device
+
+    def built_games(self) -> list:
+        """Every game built for the shared app on this PC (shell.json, frameworks still there)."""
+        return shell.Library.load(Path(self.shell_cache_path)).present()
+
+    def device_state(self, udid: str):
+        from .win import install as wi
+        return wi.Devices(Path(self.shell_cache_path)).get(udid) if udid else None
+
+    def device_titles(self, udid: str) -> list[str]:
+        """The games in the app on a device after the last install from this PC ([]: none from this PC yet). A device
+        installed before the app kept this list holds every built game."""
+        st = self.device_state(udid)
+        if st is None or not st.bundle:
+            return []
+        return list(st.titles) if st.titles else [g.titleID.upper() for g in self.built_games()]
+
+    def transfer_games(self, udid: str, titles: list[str]) -> None:
+        """Put exactly `titles` in the app on `udid` (install or update it), then copy their data the device lacks."""
+        self.install_on_device(udid, titles=[t.upper() for t in titles])
+
     # ---------------------------------------------------------------- after a build
 
     def after_framework_build(self, work_dir: str, archive: str) -> None:
@@ -165,15 +199,28 @@ class DeviceMixin:
         self.log(self.t('win.install.added', game.name) + '\n')
         if archive and Path(archive).is_dir():
             shell.remember_data(Path(self.shell_cache_path), game.titleID, Path(archive))
-        if self.device_install_ready and self.install_udid:
-            self.install_on_device(self.install_udid, keep_stages=True)   # with every game's data the device lacks
+        if getattr(self, 'output_mode', 'device') == 'ipa':
+            # Export as IPA: the shared app with every built game, unsigned, beside the build
+            dest = Path(work_dir).parent / 'NX2Apple.ipa'
+            ok, msg = self.export_shell_ipa(str(dest))
+            if ok:
+                self.ipa_path = str(dest)
+            self.log(msg + '\n')
+            self.finished.emit(ok, msg)
+            return
+        udid = self.install_udid
+        if self.device_install_ready and udid and self.device_by_udid(udid) is not None:
+            # the games already on the device and this one (a device never installed from this PC gets every game)
+            on_device = self.device_titles(udid)
+            titles = sorted(set(on_device) | {game.titleID.upper()}) if on_device else None
+            self.install_on_device(udid, keep_stages=True, titles=titles)   # with every game's data the device lacks
         else:
             self.finished.emit(True, self.t('win.install.builtNoDevice', game.name))
 
     # ---------------------------------------------------------------- the install
 
     def install_on_device(self, udid: str = '', data: list | None = None, auto: bool = False,
-                          keep_stages: bool = False) -> None:
+                          keep_stages: bool = False, titles: list[str] | None = None) -> None:
         """Sign and install the shared app on `udid` (the chosen device by default), then copy
         `data` [(title ID, game data folder)], by default the data of every game the device has not
         received yet. The games already on the device keep theirs."""
@@ -209,7 +256,7 @@ class DeviceMixin:
 
         def work() -> None:
             try:
-                out = wi.install(Path(self.shell_cache_path), udid, data=data,
+                out = wi.install(Path(self.shell_cache_path), udid, data=data, titles=titles,
                                  log=self.log, stage=stage, cancelled=lambda: self._install_cancel,
                                  started=started, banner=self._banner_for)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
@@ -244,6 +291,18 @@ class DeviceMixin:
                 break                       # the download ended without a picture
         return None
 
+    @staticmethod
+    def _has_shell(found: list, udid: str) -> bool:
+        """Whether the device has the shared app already (installed from another computer): then it is not offered."""
+        from .win import device as dv
+        dev = next((d for d in found if d.udid == udid), None)
+        if dev is None:
+            return False
+        try:
+            return bool(dv.find_shell(dev))
+        except dv.DeviceError:
+            return True         # cannot tell: do not ask
+
     def cancel_install(self) -> None:
         self._install_cancel = True
 
@@ -253,11 +312,14 @@ class DeviceMixin:
     def _auto_tick(self) -> None:
         """"Update the launcher when a device connects": a device that has the app from this PC
         gets it signed and installed again when the signature is getting old or the games
-        changed. Only a cable connection, only when nothing else runs."""
+        changed. Only a cable connection, only when nothing else runs. A device without the app
+        (none from this PC, none from elsewhere) is offered it once a session (newDeviceFound)."""
         if self._auto_busy:
             return
         self._auto_busy = True
-        auto = not self.running and self.auto_update_launcher and self.device_install_ready
+        ready = not self.running and self.device_install_ready
+        auto = ready and self.auto_update_launcher
+        offer = ready and self.offer_new_devices
 
         def work() -> None:
             try:
@@ -271,7 +333,7 @@ class DeviceMixin:
                 if udids != self._known_udids:
                     self._known_udids = udids
                     self.refresh_devices()
-                if not auto:
+                if not (auto or offer):
                     return
                 wired = {d.udid for d in found if d.wired}
                 new = wired - self._auto_seen
@@ -279,13 +341,22 @@ class DeviceMixin:
                 if not new:
                     return
                 root = Path(self.shell_cache_path)
-                games = shell.Library.load(root).present()
-                current = wi.library_hash(games, shell.find_template())
+                tpl = shell.find_template()
                 known = wi.Devices(root)
                 for udid in sorted(new):
-                    if wi.needs_update(known.get(udid), current):
-                        self.autoInstallRequested.emit(udid)
-                        return              # one at a time: the next tick sees the rest
+                    state = known.get(udid)
+                    if state is not None and state.bundle:
+                        current = wi.library_hash(wi.device_games(root, state), tpl)
+                        if auto and wi.needs_update(state, current):
+                            self.autoInstallRequested.emit(udid)
+                            return          # one at a time: the next tick sees the rest
+                        continue
+                    if offer and udid not in self._offered and shell.Library.load(root).present() \
+                            and dv.is_paired(udid) and not self._has_shell(found, udid):
+                        self._offered.add(udid)
+                        self.refresh_devices()          # its name, for the question
+                        self.newDeviceFound.emit(udid)
+                        return
             finally:
                 self._auto_busy = False
         threading.Thread(target=work, daemon=True).start()

@@ -40,18 +40,30 @@ from .i18n import Lang
 from .model import Dep, DepState, Model
 from .sheets import CheatsDialog, DeleteGameDialog, FreeSpaceDialog, OnboardingDialog
 from .win.signer import redact as _redact
+from .transfer import TransferDialog, TransferToast
 from .widgets import (
+    BigProgress,
     CardGroup,
     CardPageHeading,
     DropOverlayWidget,
     GameCardWidget,
+    GlyphIcon,
     HeroBannerWidget,
     HorizontalStripViewport,
     LauncherSegmented,
     LauncherSwitch,
+    PlayOnCard,
     StatusDot,
+    centered_column,
     make_divider,
+    overall_fraction,
 )
+
+#: The dependency rows of signing and installing on a device (device_model.py _device_rows): Settings shows them in
+#: their own card, apart from the build tools.
+DEVICE_DEP_IDS = ('amds', 'signer', 'apple_id', 'shell_template')
+#: How many stages a build reports (the bar's denominator until more arrive).
+BUILD_STAGES = 7
 
 
 def _dot(color: str) -> QLabel:
@@ -160,8 +172,11 @@ class MainWindow(QMainWindow):
         self._drive_folder = ''
         self._options_expanded = True
         self._deps_expanded = True
+        self._device_deps_open = True
         self._onboarding_checked = False
         self._onboarding_dialog: OnboardingDialog | None = None
+        self._build_run = True          # the run in progress is a build (False: an install from the transfer dialog)
+        self._transfer: TransferDialog | None = None
 
         root = QWidget()
         root.setObjectName('root')
@@ -219,8 +234,10 @@ class MainWindow(QMainWindow):
         self.m.appRelaunching.connect(QApplication.quit)
         self.m.libraryChanged.connect(self._refresh_library)
         self.m.devicesChanged.connect(self._refresh_install_card)
+        self.m.newDeviceFound.connect(self._on_new_device)
         if pu.IS_WIN:
             self.m.depsChanged.connect(self.m.refresh_devices)
+        self.transfer_toast = TransferToast(root)
 
         if self.m.log_path:
             self._append_log(self.m.t('log.at', str(self.m.log_path)) + '\n\n')
@@ -441,7 +458,7 @@ class MainWindow(QMainWindow):
         self.lib_welcome_title.setStyleSheet('font-size: 40px; font-weight: 800; color: #ffffff;')
         ecol.addWidget(self.lib_welcome_title)
 
-        self.lib_welcome_note = QLabel(self.m.t('library.welcomeNote'))
+        self.lib_welcome_note = QLabel(self.m.t(self._welcome_note_key()))
         self.lib_welcome_note.setObjectName('pageNote')
         self.lib_welcome_note.setAlignment(Qt.AlignCenter)
         self.lib_welcome_note.setWordWrap(True)
@@ -530,6 +547,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lib_stack, 1)
         return page
 
+    @staticmethod
+    def _welcome_note_key() -> str:
+        """The empty library's note: the Mac's names finished Mac apps, which a Windows PC does not make."""
+        return 'win.library.welcomeNote' if pu.IS_WIN else 'library.welcomeNote'
+
     def _filtered_games(self) -> list[lib.LibraryGame]:
         games = list(self.m.library.games)
         if self._library_filter == 'built':
@@ -541,7 +563,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_library(self) -> None:
         self.lib_welcome_title.setText(self.m.t('library.welcome'))
-        self.lib_welcome_note.setText(self.m.t('library.welcomeNote'))
+        self.lib_welcome_note.setText(self.m.t(self._welcome_note_key()))
         self.lib_first_build_btn.setText('+ ' + self.m.t('library.firstBuild'))
         self.lib_choose_folder_btn.setText(self.m.t('library.chooseFolder'))
         self.coll_title_lbl.setText(self.m.t('library.collection'))
@@ -570,6 +592,12 @@ class MainWindow(QMainWindow):
                 st_color = style.AMBER
                 p_label = self.m.t('library.viewBuild')
                 p_en = True
+            elif self._transferable(sel):
+                # Windows: built for the shared app, so it goes onto a device from here (Show in folder is in Manage)
+                st_text = self.m.t('library.readyIOS')
+                st_color = style.GREEN
+                p_label = self.m.t('win.transfer.button')
+                p_en = not self.m.running
             elif sel.has_ipa or sel.has_archive:
                 st_text = self.m.t('library.readyIOS')
                 st_color = style.GREEN
@@ -660,6 +688,9 @@ class MainWindow(QMainWindow):
         if self.m.running and self.m.build_key.upper() == g.title_id.upper():
             self._switch_page('builds')
             return
+        if self._transferable(g):
+            self._open_transfer(preselect=[g.title_id])
+            return
         if g.has_ipa:
             pu.reveal(g.ipa_path)
         elif g.has_archive:
@@ -667,6 +698,36 @@ class MainWindow(QMainWindow):
         else:
             self.m.load_game_from_library(g)
             self._switch_page('builds')
+
+    def _transferable(self, g: lib.LibraryGame) -> bool:
+        """Windows: the game is built for the shared app on this PC, so it can go onto a device."""
+        if not pu.IS_WIN:
+            return False
+        return any(x.titleID.upper() == g.title_id.upper() for x in self.m.built_games())
+
+    def _open_transfer(self, *, udid: str = '', preselect: list[str] | None = None, new_device: bool = False) -> None:
+        """The transfer dialog (transfer.py): a running one comes back to the front, else a new one opens."""
+        if self._transfer is not None and self._transfer.active:
+            self._transfer.show()
+            self._transfer.raise_()
+            self._transfer.activateWindow()
+            return
+        if self._transfer is not None:
+            self._transfer.deleteLater()
+        self.m.refresh_devices()
+        dlg = TransferDialog(self.m, self, udid=udid, preselect=preselect, new_device=new_device)
+        dlg.minimized.connect(lambda: self.transfer_toast.follow(dlg))
+        dlg.done.connect(lambda _ok, _note: (self._refresh_library(), self._refresh_install_card()))
+        self._transfer = dlg
+        self._build_run = False
+        self.transfer_toast.hide()
+        dlg.show()
+
+    def _on_new_device(self, udid: str) -> None:
+        """A device without the launcher was plugged in: offer to put it there, with the games to take."""
+        if self.m.running or (self._transfer is not None and self._transfer.isVisible()):
+            return
+        self._open_transfer(udid=udid, new_device=True)
 
     def _show_manage_menu(self, anchor: QWidget) -> None:
         g = self.m.library.selected
@@ -679,6 +740,11 @@ class MainWindow(QMainWindow):
             f'QMenu::item {{ padding: 7px 18px; border-radius: 6px; }} '
             f'QMenu::item:selected {{ background: rgba(255,255,255,0.12); }}'
         )
+
+        if self._transferable(g):
+            act_send = menu.addAction(self.m.t('win.transfer.button'))
+            act_send.setEnabled(not self.m.running)
+            act_send.triggered.connect(lambda: self._open_transfer(preselect=[g.title_id]))
 
         act_build = menu.addAction(self.m.t('library.buildAgain') if g.has_any_build else self.m.t('build.startGame'))
         act_build.triggered.connect(lambda: (self.m.load_game_from_library(g), self._switch_page('builds')))
@@ -759,6 +825,7 @@ class MainWindow(QMainWindow):
         )
         if d:
             self.m.library.set_games_folder(d, repo_path=self.m.engine_path, default_keys=self.m.keys_path)
+            self.m.use_games_folder_for_builds(d)
             for g in self.m.library.games:
                 self.m.artwork.request_banner_async(g.title_id)
             self._refresh_all()
@@ -777,8 +844,8 @@ class MainWindow(QMainWindow):
     def _build_builds_page(self) -> QWidget:
         body = QWidget()
         self.body_col = QVBoxLayout(body)
-        self.body_col.setContentsMargins(40, 28, 40, 36)
-        self.body_col.setSpacing(20)
+        self.body_col.setContentsMargins(40, 36, 40, 44)
+        self.body_col.setSpacing(30)
 
         # Page heading
         self.build_heading = CardPageHeading(self.m.t('build.heading'), self.m.t('build.intro'))
@@ -796,24 +863,28 @@ class MainWindow(QMainWindow):
         self.target_group = self._build_target_card()
         self.body_col.addWidget(self.target_group)
 
-        # Card 3: Install or Export / Shared App vs One-Game IPA + Drive Copy (InstallCard)
+        # Card 3 (Windows, Install on device): the device and the Apple ID (InstallCard)
+        self.device_group = self._build_device_card()
+        self.body_col.addWidget(self.device_group)
+
+        # Card 4: Export as IPA / Shared App vs One-Game IPA + Drive Copy (InstallCard, ExportSteps)
         self.install_group = self._build_install_card()
         self.body_col.addWidget(self.install_group)
 
-        # Card 4: Action + BuildFailureCard + OutcomeCard
-        self.action_group = self._build_action_card()
-        self.body_col.addWidget(self.action_group)
-
-        # Card 5: Progress Card
-        self.stages_card = self._build_stages_card()
-        self.body_col.addWidget(self.stages_card)
-
-        # Card 6: Build Log Card (at the bottom of `self.scroll` so `test_build_failure.py` geometry checks pass)
+        # Card 5: Build Log Card, folded as on the Mac (LogCard), opened by a failure
         self.log_group = self._build_log_card()
         self.body_col.addWidget(self.log_group)
 
+        # Card 6: Action (status + Build game) + BuildFailureCard + OutcomeCard
+        self.action_group = self._build_action_card()
+        self.body_col.addWidget(self.action_group)
+
+        # Card 7: Progress Card: the whole run's bar, then the stages
+        self.stages_card = self._build_stages_card()
+        self.body_col.addWidget(self.stages_card)
+
         self.body_col.addStretch(1)
-        return body
+        return centered_column(body)
 
     def _build_setup_hint_card(self) -> CardGroup:
         grp = CardGroup(title=self.m.t('section.setup'))
@@ -852,17 +923,17 @@ class MainWindow(QMainWindow):
         rf_lay.addWidget(self.folder_cta_dot)
         fcol = QVBoxLayout()
         fcol.setSpacing(2)
-        self.folder_cta_title = QLabel(self.m.t('build.folderCTA') + ' · ' + self.m.t('data.note'))
+        self.folder_cta_title = QLabel(self.m.t('build.folderCTA'))
         self.folder_cta_title.setObjectName('rowTitle')
-        self.folder_cta_sub = QLabel(self.m.t('build.folderNote') + ' (' + self.m.t('data.folderHint') + ')')
+        self.folder_cta_sub = QLabel(self.m.t('build.folderNote'))
         self.folder_cta_sub.setObjectName('muted')
         self.folder_cta_sub.setWordWrap(True)
         fcol.addWidget(self.folder_cta_title)
         fcol.addWidget(self.folder_cta_sub)
         rf_lay.addLayout(fcol, 1)
-        self.pick_folder_btn = QPushButton(self.m.t('data.pickFolder'))
+        self.pick_folder_btn = QPushButton(self.m.t('data.choose'))
         self.pick_folder_btn.setObjectName('creamPill')
-        self.pick_folder_btn.setFixedWidth(184)
+        self.pick_folder_btn.setFixedWidth(150)
         self.pick_folder_btn.clicked.connect(self._pick_game_dir)
         rf_lay.addWidget(self.pick_folder_btn)
         grp.add_row(r_folder)
@@ -898,7 +969,7 @@ class MainWindow(QMainWindow):
         disc_head = QWidget()
         dh_lay = QHBoxLayout(disc_head)
         dh_lay.setContentsMargins(18, 10, 18, 10)
-        self.opt_toggle_btn = QPushButton('▾  ' + self.m.t('build.options'))
+        self.opt_toggle_btn = QPushButton(self.m.t('build.options') + '  ›')
         self.opt_toggle_btn.setObjectName('ghost')
         self.opt_toggle_btn.clicked.connect(self._toggle_optional_inputs)
         dh_lay.addWidget(self.opt_toggle_btn)
@@ -934,8 +1005,8 @@ class MainWindow(QMainWindow):
         self.out_clear_btn.clicked.connect(self._clear_out_dir)
         self.out_clear_btn.hide()
         or_lay.addWidget(self.out_clear_btn)
-        self.out_btn = QPushButton(self.m.t('build.outDir'))
-        self.out_btn.setFixedWidth(184)
+        self.out_btn = QPushButton(self.m.t('data.change'))
+        self.out_btn.setFixedWidth(150)
         self.out_btn.clicked.connect(self._pick_out_dir)
         or_lay.addWidget(self.out_btn)
         grp.add_row(out_row)
@@ -966,7 +1037,7 @@ class MainWindow(QMainWindow):
         r.addWidget(clear)
 
         choose = QPushButton(self.m.t('data.choose'))
-        choose.setFixedWidth(184)
+        choose.setFixedWidth(150)
         choose.clicked.connect(lambda _=False, k=key, m=multi: self._pick_input(k, m))
         r.addWidget(choose)
 
@@ -984,15 +1055,38 @@ class MainWindow(QMainWindow):
     def _toggle_optional_inputs(self) -> None:
         self._options_expanded = not self._options_expanded
         self.opt_container.setVisible(self._options_expanded)
-        arrow = '▾' if self._options_expanded else '▸'
-        self.opt_toggle_btn.setText(f"{arrow}  {self.m.t('build.options')}")
+        self.opt_toggle_btn.setText(self._disclosure_text('build.options', self._options_expanded))
+
+    def _disclosure_text(self, key: str, is_open: bool) -> str:
+        """A folding row's label with the Mac's chevron (CardDisclosure): › closed, ⌄ open."""
+        return self.m.t(key).replace('&', '&&') + ('  ⌄' if is_open else '  ›')
 
     def _build_target_card(self) -> CardGroup:
+        """Play on (TargetCard.swift). On Windows the two ways an iPhone build goes, as big cards: the shared app
+        installed on a device over the cable, or an IPA for another signing tool. Elsewhere the old platform row."""
         grp = CardGroup(title=self.m.t('section.target'))
+        grp.card.setObjectName('bare')          # the cards below are the content: no card around them
+        grp.body_layout.setContentsMargins(0, 0, 0, 0)
+        grp.body_layout.setSpacing(14)
 
-        # Platform row
-        r_plat = QWidget()
-        rp_lay = QHBoxLayout(r_plat)
+        # Windows: the two big choices
+        self.play_on_row = QWidget()
+        pr = QHBoxLayout(self.play_on_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(14)
+        self.play_device_card = PlayOnCard('phone', self.m.t('shell.modeInstall'), self.m.t('win.play.deviceNote'))
+        self.play_device_card.clicked.connect(lambda: self._set_output_mode('device'))
+        pr.addWidget(self.play_device_card)
+        self.play_ipa_card = PlayOnCard('package', self.m.t('shell.modeExport'), self.m.t('win.play.ipaNote'))
+        self.play_ipa_card.clicked.connect(lambda: self._set_output_mode('ipa'))
+        pr.addWidget(self.play_ipa_card)
+        grp.add_row(self.play_on_row)
+        self.play_on_row.setVisible(pu.IS_WIN)
+
+        # Elsewhere: the platform row (iPhone, or a Mac app on macOS)
+        self.platform_card = QFrame()
+        self.platform_card.setObjectName('card')
+        rp_lay = QHBoxLayout(self.platform_card)
         rp_lay.setContentsMargins(18, 12, 18, 12)
         rp_lay.setSpacing(12)
         rp_lay.addWidget(_dot(style.GREEN))
@@ -1006,23 +1100,23 @@ class MainWindow(QMainWindow):
         pcol.addWidget(self.target_title_lbl)
         pcol.addWidget(self.target_hint)
         rp_lay.addLayout(pcol, 1)
-
         self.target_btn = QPushButton()
         self.target_btn.clicked.connect(self._toggle_target)
         if pu.IS_WIN:
             self.target_btn.hide()
         rp_lay.addWidget(self.target_btn)
-        grp.add_row(r_plat)
-        grp.add_divider()
+        grp.add_row(self.platform_card)
+        self.platform_card.setVisible(not pu.IS_WIN)
 
-        # Older devices BC texture CPU decode row (opt.bc)
-        r_bc = QWidget()
-        rbc_lay = QHBoxLayout(r_bc)
-        rbc_lay.setContentsMargins(18, 12, 18, 12)
+        # Older devices: decode BC textures on the CPU (opt.bc). A Windows shared-app game always carries it
+        # (Model.start_build), so the switch is only for a one-game IPA there.
+        self.bc_card = QFrame()
+        self.bc_card.setObjectName('card')
+        rbc_lay = QHBoxLayout(self.bc_card)
+        rbc_lay.setContentsMargins(18, 14, 18, 14)
         rbc_lay.setSpacing(12)
-        rbc_lay.addWidget(_dot(style.NEUTRAL_DOT))
         bccol = QVBoxLayout()
-        bccol.setSpacing(2)
+        bccol.setSpacing(3)
         self.bc_title_lbl = QLabel(self.m.t('opt.bc'))
         self.bc_title_lbl.setObjectName('rowTitle')
         self.bc_note_lbl = QLabel(self.m.t('opt.bc.note'))
@@ -1034,12 +1128,98 @@ class MainWindow(QMainWindow):
         self.bc_switch = LauncherSwitch(self.m.bc_on_cpu)
         self.bc_switch.toggled.connect(self._on_bc_toggled)
         rbc_lay.addWidget(self.bc_switch)
-        grp.add_row(r_bc)
+        grp.add_row(self.bc_card)
 
+        self.older_note = QLabel(self.m.t('win.play.olderNote'))
+        self.older_note.setObjectName('sectionFoot')
+        self.older_note.setWordWrap(True)
+        self.older_note.setContentsMargins(4, 0, 4, 0)
+        grp.add_row(self.older_note)
         return grp
+
+    def _set_output_mode(self, mode: str) -> None:
+        if self.m.running or mode == self.m.output_mode:
+            return
+        self.m.output_mode = mode
+        self.m.remember_choices()
+        self._refresh_target()
+        self._refresh_install_card()
+        self._refresh_running()
 
     def _on_bc_toggled(self, checked: bool) -> None:
         self.m.bc_on_cpu = checked
+        self.m.remember_choices()
+
+    def _build_device_card(self) -> CardGroup:
+        """Windows, Install on device: where the build goes and who signs it (InstallCard.swift's Install on and
+        Signing team rows). The build installs the shared app there when it ends."""
+        grp = CardGroup(title=self.m.t('dev.section'), footer=self.m.t('win.install.cardNote'))
+        self.win_dev_container = grp
+
+        r_dev = QWidget()
+        rd_lay = QHBoxLayout(r_dev)
+        rd_lay.setContentsMargins(18, 12, 18, 12)
+        rd_lay.setSpacing(10)
+        self.win_dev_dot = _dot(style.NEUTRAL_DOT)
+        rd_lay.addWidget(self.win_dev_dot)
+        wd_col = QVBoxLayout()
+        wd_col.setSpacing(3)
+        self.win_dev_title = QLabel(self.m.t('dev.target'))
+        self.win_dev_title.setObjectName('rowTitle')
+        self.win_dev_note = QLabel(self.m.t('win.install.note'))
+        self.win_dev_note.setObjectName('muted')
+        self.win_dev_note.setWordWrap(True)
+        wd_col.addWidget(self.win_dev_title)
+        wd_col.addWidget(self.win_dev_note)
+        rd_lay.addLayout(wd_col, 1)
+        self.win_dev_refresh_btn = QPushButton()
+        self.win_dev_refresh_btn.setFixedSize(46, 38)
+        self.win_dev_refresh_btn.setToolTip(self.m.t('dev.refresh'))
+        rl = QHBoxLayout(self.win_dev_refresh_btn)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(GlyphIcon('refresh', 20, style.TEXT), 0, Qt.AlignCenter)
+        self.win_dev_refresh_btn.clicked.connect(self.m.refresh_devices)
+        rd_lay.addWidget(self.win_dev_refresh_btn)
+        self.win_dev_combo = QComboBox()
+        self.win_dev_combo.setObjectName('launcherDropdown')
+        self.win_dev_combo.setFixedWidth(220)
+        self.win_dev_combo.currentIndexChanged.connect(self._on_win_device_changed)
+        rd_lay.addWidget(self.win_dev_combo)
+        grp.add_row(r_dev)
+        grp.add_divider()
+
+        r_id = QWidget()
+        ri_lay = QHBoxLayout(r_id)
+        ri_lay.setContentsMargins(18, 12, 18, 12)
+        ri_lay.setSpacing(10)
+        self.win_id_dot = _dot(style.NEUTRAL_DOT)
+        ri_lay.addWidget(self.win_id_dot)
+        id_col = QVBoxLayout()
+        id_col.setSpacing(3)
+        self.win_id_title = QLabel(self.m.t('win.dep.appleId'))
+        self.win_id_title.setObjectName('rowTitle')
+        self.win_id_note = QLabel('')
+        self.win_id_note.setObjectName('muted')
+        self.win_id_note.setWordWrap(True)
+        id_col.addWidget(self.win_id_title)
+        id_col.addWidget(self.win_id_note)
+        ri_lay.addLayout(id_col, 1)
+        self.win_id_btn = QPushButton('')
+        self.win_id_btn.setFixedWidth(220)
+        self.win_id_btn.clicked.connect(self._on_apple_id_button)
+        ri_lay.addWidget(self.win_id_btn)
+        grp.add_row(r_id)
+        grp.setVisible(pu.IS_WIN)
+        return grp
+
+    def _on_apple_id_button(self) -> None:
+        signed_in = any(d.id == 'apple_id' and d.ok for d in self.m.deps)
+        if signed_in:
+            self.m.sign_out_apple_id()
+        elif any(d.id == 'signer' and d.ok for d in self.m.deps):
+            self.m.sign_in_apple_id()
+        else:
+            self._switch_page('settings')
 
     def _build_install_card(self) -> CardGroup:
         grp = CardGroup(title=self.m.t('dev.section'))
@@ -1072,43 +1252,6 @@ class MainWindow(QMainWindow):
         rk_lay.addWidget(self.ipa_kind_seg)
         grp.add_row(r_kind)
         grp.add_divider()
-
-        # Windows, shared app: install on a connected device (device_model.py)
-        self.win_dev_container = QWidget()
-        wd_outer = QVBoxLayout(self.win_dev_container)
-        wd_outer.setContentsMargins(0, 0, 0, 0)
-        wd_outer.setSpacing(0)
-        r_dev = QWidget()
-        rd_lay = QHBoxLayout(r_dev)
-        rd_lay.setContentsMargins(18, 11, 18, 11)
-        rd_lay.setSpacing(10)
-        self.win_dev_dot = _dot(style.NEUTRAL_DOT)
-        rd_lay.addWidget(self.win_dev_dot)
-        wd_col = QVBoxLayout()
-        wd_col.setSpacing(3)
-        self.win_dev_title = QLabel(self.m.t('shell.modeInstall'))
-        self.win_dev_title.setObjectName('rowTitle')
-        self.win_dev_note = QLabel(self.m.t('win.install.note'))
-        self.win_dev_note.setObjectName('muted')
-        self.win_dev_note.setWordWrap(True)
-        wd_col.addWidget(self.win_dev_title)
-        wd_col.addWidget(self.win_dev_note)
-        rd_lay.addLayout(wd_col, 1)
-        self.win_dev_combo = QComboBox()
-        self.win_dev_combo.setObjectName('launcherDropdown')
-        self.win_dev_combo.setMinimumWidth(184)
-        self.win_dev_combo.currentIndexChanged.connect(self._on_win_device_changed)
-        rd_lay.addWidget(self.win_dev_combo)
-        self.win_dev_refresh_btn = QPushButton(self.m.t('dev.refresh'))
-        self.win_dev_refresh_btn.clicked.connect(self.m.refresh_devices)
-        rd_lay.addWidget(self.win_dev_refresh_btn)
-        self.win_install_btn = QPushButton(self.m.t('win.install.button'))
-        self.win_install_btn.setObjectName('creamPill')
-        self.win_install_btn.clicked.connect(lambda: self.m.install_on_device())
-        rd_lay.addWidget(self.win_install_btn)
-        wd_outer.addWidget(r_dev)
-        wd_outer.addWidget(make_divider())
-        grp.add_row(self.win_dev_container)
 
         # Step 1: Export IPA
         r_s1 = QWidget()
@@ -1212,9 +1355,10 @@ class MainWindow(QMainWindow):
         if self.m.archive_path and os.path.isdir(self.m.archive_path):
             return self.m.archive_path
         if self.m.out_dir:
-            cand = os.path.join(self.m.out_dir, 'romfs')
-            if os.path.isdir(cand):
-                return cand
+            from .model import archive_folder
+            for cand in (str(archive_folder(self.m.out_dir, self.m.build_key)), os.path.join(self.m.out_dir, 'romfs')):
+                if os.path.isdir(cand):
+                    return cand
         sel = self.m.library.selected
         if sel and sel.has_archive:
             return sel.archive_path
@@ -1222,10 +1366,14 @@ class MainWindow(QMainWindow):
 
     def _on_ipa_kind_changed(self, kind: str) -> None:
         self.m.ipa_kind = kind
+        self.m.remember_choices()
         self._refresh_install_card()
+        self._refresh_target()
 
     def _refresh_install_card(self) -> None:
-        self.install_group.set_title(self.m.t('dev.section'))
+        device_mode = pu.IS_WIN and self.m.output_mode == 'device'
+        self.install_group.setVisible(not device_mode)
+        self.install_group.set_title(self.m.t('shell.modeExport' if pu.IS_WIN else 'dev.section'))
         self.ipa_kind_title.setText(self.m.t('shell.ipaKind'))
         self.ipa_kind_seg.set_items(
             [
@@ -1251,6 +1399,8 @@ class MainWindow(QMainWindow):
         self.drive_choose_btn.setText(self.m.t('shell.driveChoose'))
         self.drive_copy_btn.setText(self.m.t('shell.driveCopy'))
         self.step3_container.setVisible(not one)
+        self.win_export_btn.setVisible(pu.IS_WIN and not one)
+        self.win_export_btn.setText(self.m.t('shell.step1Button'))
         self._refresh_win_device_row(one)
         arch_p = self._effective_archive_path()
         has_arch = bool(arch_p and os.path.isdir(arch_p))
@@ -1258,17 +1408,17 @@ class MainWindow(QMainWindow):
         self.step3_open_romfs_btn.setVisible(has_arch)
         self.drive_copy_btn.setEnabled(has_arch)
 
-    def _refresh_win_device_row(self, one: bool) -> None:
-        """Windows, shared app: the device to install on, and Install or Update launcher."""
+    def _refresh_win_device_row(self, one: bool = False) -> None:
+        """Windows, Install on device: the device the build goes to, its state, and the Apple ID that signs."""
         t = self.m.t
-        show = pu.IS_WIN and not one
-        self.win_dev_container.setVisible(show)
-        self.win_export_btn.setVisible(show)
+        show = pu.IS_WIN and self.m.output_mode == 'device'
+        self.device_group.setVisible(show)
         if not show:
             return
-        self.win_dev_title.setText(t('shell.modeInstall'))
-        self.win_dev_refresh_btn.setText(t('dev.refresh'))
-        self.win_export_btn.setText(t('shell.step1Button'))
+        self.device_group.set_title(t('dev.section'))
+        self.device_group.set_footer(t('win.install.cardNote'))
+        self.win_dev_title.setText(t('dev.target'))
+        self.win_dev_refresh_btn.setToolTip(t('dev.refresh'))
         self.win_dev_combo.blockSignals(True)
         self.win_dev_combo.clear()
         for d in self.m.devices:
@@ -1281,10 +1431,7 @@ class MainWindow(QMainWindow):
         self.win_dev_combo.blockSignals(False)
         ready = self.m.device_install_ready
         udid = self.m.install_udid if self.m.devices else ''
-        from .win import install as wi
-        state = wi.Devices(Path(self.m.shell_cache_path)).get(udid) if udid else None
-        self.win_install_btn.setText(t('win.install.update' if state and state.bundle else 'win.install.button'))
-        self.win_install_btn.setEnabled(ready and bool(udid) and not self.m.running)
+        state = self.m.device_state(udid) if udid else None
         if not ready:
             note, dot = t('win.install.needsSetup'), style.AMBER
         elif not self.m.devices:
@@ -1298,11 +1445,46 @@ class MainWindow(QMainWindow):
         self.win_dev_note.setText(note)
         _set_dot(self.win_dev_dot, dot)
 
+        acct = next((d for d in self.m.deps if d.id == 'apple_id'), None)
+        signer_ok = any(d.id == 'signer' and d.ok for d in self.m.deps)
+        self.win_id_title.setText(t('win.dep.appleId'))
+        if acct is not None and acct.ok:
+            self.win_id_note.setText(acct.detail)
+            self.win_id_btn.setText(t('win.dep.appleId.signOut'))
+            _set_dot(self.win_id_dot, style.GREEN)
+        else:
+            self.win_id_note.setText(t('win.dep.appleId.hint'))
+            self.win_id_btn.setText(t('win.dep.appleId.signIn') if signer_ok else t('nav.settings'))
+            _set_dot(self.win_id_dot, style.AMBER)
+        self.win_id_btn.setEnabled(not self.m.running)
+
     def _on_win_device_changed(self, idx: int) -> None:
         udid = self.win_dev_combo.itemData(idx)
         if udid:
             self.m.set_install_device(str(udid))
             self._refresh_install_card()
+
+    def _refresh_target(self) -> None:
+        t = self.m.t
+        ios = self.m.target == 'ios'
+        self.target_title_lbl.setText(t('build.ios') if ios else t('build.mac'))
+        self.target_btn.setText(t('target.ios' if ios else 'target.mac'))
+        self.target_btn.setToolTip(t('target.tip'))
+        self.target_hint.setText(t('target.hint.ios' if ios else 'target.hint.mac'))
+        self.target_group.set_title(t('section.target'))
+        self.play_device_card.set_text(t('shell.modeInstall'), t('win.play.deviceNote'))
+        self.play_ipa_card.set_text(t('shell.modeExport'), t('win.play.ipaNote'))
+        device = self.m.output_mode == 'device'
+        self.play_device_card.set_selected(device)
+        self.play_ipa_card.set_selected(not device)
+        self.play_device_card.setEnabled(not self.m.running)
+        self.play_ipa_card.setEnabled(not self.m.running)
+        # the texture switch matters where the build is not a Windows shared-app game, which always carries it
+        self.bc_card.setVisible(not pu.IS_WIN or self.m.exports_one_game)
+        self.bc_title_lbl.setText(t('opt.bc'))
+        self.bc_note_lbl.setText(t('opt.bc.note'))
+        self.older_note.setText(t('win.play.olderNote'))
+        self.older_note.setVisible(pu.IS_WIN and not self.m.exports_one_game)
 
     def _export_shell_ipa(self) -> None:
         start = os.path.join(self.m.out_dir or str(Path.home()), 'NX2Apple.ipa')
@@ -1336,23 +1518,30 @@ class MainWindow(QMainWindow):
             self.step3_sub.setText(self.m.t('shell.driveFailed', info))
 
     def _build_action_card(self) -> CardGroup:
+        """The page's last row, as on the Mac (ActionCard): what the build still needs or what it made, then the big
+        Build game button on the right."""
         grp = CardGroup()
+        grp.card.setObjectName('bare')
         r = QWidget()
         act = QHBoxLayout(r)
-        act.setContentsMargins(18, 14, 18, 14)
+        act.setContentsMargins(2, 4, 0, 4)
         act.setSpacing(12)
-
-        self.build_btn = QPushButton(self.m.t('build.start'))
-        self.build_btn.setObjectName('primary')
-        self.build_btn.setMinimumWidth(190)
-        self.build_btn.clicked.connect(self._build_clicked)
-        act.addWidget(self.build_btn)
 
         self.footer = QLabel('')
         self.footer.setObjectName('muted')
         self.footer.setWordWrap(True)
         self.footer.setTextInteractionFlags(Qt.TextSelectableByMouse)
         act.addWidget(self.footer, 1)
+
+        self.build_btn = QPushButton(self.m.t('build.startGame'))
+        self.build_btn.setObjectName('primary')
+        self.build_btn.setMinimumWidth(200)
+        # 26 + 2 × 12 padding + border ≈ 52 px tall. The height lives in the style sheet: a fixed height set in code
+        # lost to the stylesheet's min-height whenever the button was restyled (primary ↔ danger). A radius over half
+        # the height draws square corners, so 25.
+        self.build_btn.setStyleSheet('QPushButton { border-radius: 25px; font-size: 16px; padding: 12px 30px; '
+                                     'min-height: 26px; }')
+        self.build_btn.clicked.connect(self._build_clicked)
 
         self.reveal_ipa_btn = QPushButton(f"{self.m.t('shell.showInFinder')} (IPA)")
         self.reveal_ipa_btn.clicked.connect(lambda: pu.reveal(self.m.ipa_path))
@@ -1368,6 +1557,7 @@ class MainWindow(QMainWindow):
         self.reveal_app_btn.clicked.connect(lambda: pu.reveal(self.m.mac_app_path))
         self.reveal_app_btn.hide()
         act.addWidget(self.reveal_app_btn)
+        act.addWidget(self.build_btn)
 
         grp.add_row(r)
 
@@ -1409,7 +1599,15 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_stages_card(self) -> CardGroup:
-        grp = CardGroup(title=self.m.t('prog.title'))
+        """Progress (ProgressCard): one big bar for the whole run with its percentage, then each stage."""
+        grp = CardGroup(title=self.m.t('section.progress'))
+        top = QWidget()
+        tl = QVBoxLayout(top)
+        tl.setContentsMargins(18, 16, 18, 14)
+        self.big_progress = BigProgress()
+        tl.addWidget(self.big_progress)
+        grp.add_row(top)
+        grp.add_divider()
         wrap = QWidget()
         self.stages_col = QVBoxLayout(wrap)
         self.stages_col.setContentsMargins(18, 12, 18, 12)
@@ -1419,12 +1617,14 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_log_card(self) -> CardGroup:
-        grp = CardGroup(title=self.m.t('build.log'))
+        """Log (LogCard): folded like the Mac's, opened by a click or by a failure."""
+        grp = CardGroup(title=self.m.t('section.log'))
         head = QWidget()
         hl = QHBoxLayout(head)
-        hl.setContentsMargins(18, 10, 18, 6)
-        self.log_label = QLabel(self.m.t('build.log'))
-        self.log_label.setObjectName('rowTitle')
+        hl.setContentsMargins(10, 8, 18, 8)
+        self.log_label = QPushButton(self._disclosure_text('build.log', False))
+        self.log_label.setObjectName('ghost')
+        self.log_label.clicked.connect(lambda: self._set_log_open(not self._log_open))
         hl.addWidget(self.log_label)
         hl.addStretch(1)
         self.export_log_btn = QPushButton(self.m.t('log.export'))
@@ -1433,16 +1633,25 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.export_log_btn)
         grp.add_row(head)
 
-        log_wrap = QWidget()
-        lw = QVBoxLayout(log_wrap)
+        self.log_wrap = QWidget()
+        lw = QVBoxLayout(self.log_wrap)
         lw.setContentsMargins(14, 4, 14, 14)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText(self.m.t('log.placeholder'))
-        self.log.setMinimumHeight(200)
+        self.log.setMinimumHeight(220)
         lw.addWidget(self.log)
-        grp.add_row(log_wrap)
+        grp.add_row(self.log_wrap)
+        self._log_open = False
+        self.log_wrap.hide()
+        self.export_log_btn.hide()
         return grp
+
+    def _set_log_open(self, is_open: bool) -> None:
+        self._log_open = is_open
+        self.log_wrap.setVisible(is_open)
+        self.export_log_btn.setVisible(is_open)
+        self.log_label.setText(self._disclosure_text('build.log', is_open))
 
     def _export_log(self) -> None:
         f, _ = QFileDialog.getSaveFileName(self, self.m.t('log.export'), 'nx2apple-build.log', 'Log files (*.log *.txt)')
@@ -1458,8 +1667,8 @@ class MainWindow(QMainWindow):
     def _build_settings_page(self) -> QWidget:
         sbody = QWidget()
         scol = QVBoxLayout(sbody)
-        scol.setContentsMargins(40, 28, 40, 36)
-        scol.setSpacing(22)
+        scol.setContentsMargins(40, 36, 40, 44)
+        scol.setSpacing(30)
 
         self.settings_heading = CardPageHeading(self.m.t('settings.heading'), self.m.t('settings.note'))
         scol.addWidget(self.settings_heading)
@@ -1501,12 +1710,106 @@ class MainWindow(QMainWindow):
         self.tools_group = self._build_tools_card()
         scol.addWidget(self.tools_group)
 
+        # 2.5 (Windows) iPhone and iPad: what signing and installing need, the launcher on a device, and when to
+        # offer or update it
+        self.device_settings_group = self._build_device_settings_card()
+        scol.addWidget(self.device_settings_group)
+        self.device_settings_group.setVisible(pu.IS_WIN)
+
         # 3. App Card (section.app: 13-Language Dropdown + Notify + Setup Wizard + Version)
         self.app_group = self._build_app_card()
         scol.addWidget(self.app_group)
 
         scol.addStretch(1)
-        return sbody
+        return centered_column(sbody)
+
+    def _settings_row(self, title: str, note: str = '') -> tuple[QWidget, QHBoxLayout, QLabel, QLabel]:
+        """A Settings row: a title and a note on the left, the caller's control on the right."""
+        r = QWidget()
+        lay = QHBoxLayout(r)
+        lay.setContentsMargins(18, 12, 18, 12)
+        lay.setSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        tl = QLabel(title)
+        tl.setObjectName('rowTitle')
+        nl = QLabel(note)
+        nl.setObjectName('muted')
+        nl.setWordWrap(True)
+        col.addWidget(tl)
+        col.addWidget(nl)
+        lay.addLayout(col, 1)
+        return r, lay, tl, nl
+
+    def _build_device_settings_card(self) -> CardGroup:
+        t = self.m.t
+        grp = CardGroup(title=t('win.settings.devices'))
+
+        # what signing and installing need (the device rows of the dependency check)
+        r_deps = QWidget()
+        deps_col = QVBoxLayout(r_deps)
+        deps_col.setContentsMargins(18, 14, 18, 14)
+        deps_col.setSpacing(10)
+        dh = QHBoxLayout()
+        dh.setSpacing(10)
+        self.device_deps_dot = _dot(style.NEUTRAL_DOT)
+        dh.addWidget(self.device_deps_dot)
+        dcol = QVBoxLayout()
+        dcol.setSpacing(2)
+        self.device_deps_toggle = QPushButton(self._disclosure_text('win.settings.signing', self._device_deps_open))
+        self.device_deps_toggle.setObjectName('ghost')
+        self.device_deps_toggle.setStyleSheet('QPushButton { padding: 0px; text-align: left; font-weight: 600; }')
+        self.device_deps_toggle.clicked.connect(self._toggle_device_deps)
+        dcol.addWidget(self.device_deps_toggle, 0, Qt.AlignLeft)
+        self.device_deps_summary = QLabel(t('dep.checking'))
+        self.device_deps_summary.setObjectName('muted')
+        dcol.addWidget(self.device_deps_summary)
+        dh.addLayout(dcol, 1)
+        self.device_recheck_btn = QPushButton(t('dep.recheck'))
+        self.device_recheck_btn.clicked.connect(self.m.check_deps)
+        dh.addWidget(self.device_recheck_btn)
+        deps_col.addLayout(dh)
+        self.device_deps_host = QWidget()
+        self.device_deps_rows = QVBoxLayout(self.device_deps_host)
+        self.device_deps_rows.setContentsMargins(0, 4, 0, 0)
+        self.device_deps_rows.setSpacing(8)
+        self.device_deps_host.setVisible(self._device_deps_open)
+        deps_col.addWidget(self.device_deps_host)
+        grp.add_row(r_deps)
+        grp.add_divider()
+
+        # the launcher on a device, by hand
+        r, lay, self.settings_install_title, self.settings_install_note = self._settings_row(
+            t('win.settings.install'), t('win.settings.installNote'))
+        self.settings_install_btn = QPushButton(t('win.settings.installBtn'))
+        self.settings_install_btn.setFixedWidth(184)
+        self.settings_install_btn.clicked.connect(lambda: self._open_transfer())
+        lay.addWidget(self.settings_install_btn)
+        grp.add_row(r)
+        grp.add_divider()
+
+        # ask when a device without the launcher is plugged in
+        r, lay, self.offer_title_lbl, self.offer_note_lbl = self._settings_row(
+            t('win.settings.offer'), t('win.settings.offerNote'))
+        self.offer_switch = LauncherSwitch(self.m.offer_new_devices if pu.IS_WIN else False)
+        self.offer_switch.toggled.connect(self.m.set_offer_new_devices)
+        lay.addWidget(self.offer_switch)
+        grp.add_row(r)
+        grp.add_divider()
+
+        # update the launcher when a device connects (device_model.py)
+        r, lay, self.auto_title_lbl, self.auto_note_lbl = self._settings_row(
+            t('settings.autoUpdateLauncher'), t('win.settings.autoUpdateNote'))
+        self.auto_switch = LauncherSwitch(self.m.auto_update_launcher if pu.IS_WIN else False)
+        self.auto_switch.toggled.connect(self.m.set_auto_update_launcher)
+        lay.addWidget(self.auto_switch)
+        grp.add_row(r)
+        return grp
+
+    def _toggle_device_deps(self) -> None:
+        self._device_deps_open = not self._device_deps_open
+        self.device_deps_host.setVisible(self._device_deps_open)
+        self.device_deps_toggle.setText(self._disclosure_text('win.settings.signing', self._device_deps_open))
 
     def _build_tools_card(self) -> CardGroup:
         grp = CardGroup(title=self.m.t('section.tools'))
@@ -1759,28 +2062,6 @@ class MainWindow(QMainWindow):
         grp.add_row(r_notif)
         grp.add_divider()
 
-        # Row 2.5 (Windows): update the launcher when a device connects (device_model.py)
-        if pu.IS_WIN:
-            r_auto = QWidget()
-            ra_lay = QHBoxLayout(r_auto)
-            ra_lay.setContentsMargins(18, 12, 18, 12)
-            ra_lay.addWidget(_dot(style.NEUTRAL_DOT))
-            acol = QVBoxLayout()
-            acol.setSpacing(2)
-            self.auto_title_lbl = QLabel(self.m.t('settings.autoUpdateLauncher'))
-            self.auto_title_lbl.setObjectName('rowTitle')
-            self.auto_note_lbl = QLabel(self.m.t('win.settings.autoUpdateNote'))
-            self.auto_note_lbl.setObjectName('muted')
-            self.auto_note_lbl.setWordWrap(True)
-            acol.addWidget(self.auto_title_lbl)
-            acol.addWidget(self.auto_note_lbl)
-            ra_lay.addLayout(acol, 1)
-            self.auto_switch = LauncherSwitch(self.m.auto_update_launcher)
-            self.auto_switch.toggled.connect(self.m.set_auto_update_launcher)
-            ra_lay.addWidget(self.auto_switch)
-            grp.add_row(r_auto)
-            grp.add_divider()
-
         # Row 3: Run setup again (OnboardingDialog)
         r_setup = QWidget()
         rs_lay = QHBoxLayout(r_setup)
@@ -1890,11 +2171,18 @@ class MainWindow(QMainWindow):
         row.addWidget(self.act_detail, 1)
 
         self.act_progress = QProgressBar()
-        self.act_progress.setRange(0, 100)
+        self.act_progress.setObjectName('barProgress')
+        self.act_progress.setRange(0, 1000)
         self.act_progress.setTextVisible(False)
-        self.act_progress.setFixedWidth(160)
+        self.act_progress.setFixedWidth(240)
         self.act_progress.hide()
         row.addWidget(self.act_progress)
+        self.act_pct = QLabel('')
+        self.act_pct.setStyleSheet(f'font-size: 12px; font-weight: 700; color: {style.ACCENT};')
+        self.act_pct.setFixedWidth(38)
+        self.act_pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.act_pct.hide()
+        row.addWidget(self.act_pct)
 
         self.act_view_btn = QPushButton(self.m.t('library.viewBuild'))
         self.act_view_btn.setObjectName('ghost')
@@ -1913,14 +2201,18 @@ class MainWindow(QMainWindow):
     def _refresh_activity_bar(self) -> None:
         if self.m.running:
             self.act_dot.set_color(style.AMBER)
-            self.act_title.setText(self.m.t('activity.ios' if self.m.target == 'ios' else 'activity.mac'))
+            if self._build_run:
+                self.act_title.setText(self.m.t('activity.ios' if self.m.target == 'ios' else 'activity.mac'))
+            else:
+                self.act_title.setText(self.m.t('win.transfer.running'))
             curr_stage = next((s for s in self.m.stages if s.state == 'running'), None)
-            done_cnt = sum(1 for s in self.m.stages if s.state == 'done')
-            total_cnt = max(7, len(self.m.stages))
-            pct = int(min(95, (done_cnt * 100) // total_cnt))
-            self.act_detail.setText(f"{curr_stage.name}: {curr_stage.detail}" if curr_stage else '')
-            self.act_progress.setValue(pct)
+            frac = self._run_fraction()
+            self.act_detail.setText(f"{curr_stage.name}: {curr_stage.detail}" if curr_stage and curr_stage.detail
+                                    else (curr_stage.name if curr_stage else ''))
+            self.act_progress.setValue(int(frac * 1000))
             self.act_progress.show()
+            self.act_pct.setText(f'{int(frac * 100)}%')
+            self.act_pct.show()
             self.act_view_btn.setText(self.m.t('library.viewBuild'))
             self.act_view_btn.setVisible(self._current_page != 'builds')
             self.act_stop_btn.setText(self.m.t('btn.stop'))
@@ -1930,6 +2222,7 @@ class MainWindow(QMainWindow):
             self.act_title.setText(self.m.t('library.localNote'))
             self.act_detail.setText(self.footer.text())
             self.act_progress.hide()
+            self.act_pct.hide()
             self.act_view_btn.hide()
             self.act_stop_btn.hide()
 
@@ -1955,22 +2248,14 @@ class MainWindow(QMainWindow):
         self.build_heading.set_text(t('build.heading'), t('build.intro'))
         self.files_group.set_title(t('section.files'))
         self.files_group.set_footer(t('msg.workdirHint'))
-        self.folder_cta_title.setText(t('build.folderCTA') + ' · ' + t('data.note'))
-        self.folder_cta_sub.setText(t('build.folderNote') + ' (' + t('data.folderHint') + ')')
-        self.pick_folder_btn.setText(t('data.pickFolder'))
-        arrow = '▾' if self._options_expanded else '▸'
-        self.opt_toggle_btn.setText(f"{arrow}  {t('build.options').replace('&', '&&')}")
+        self.opt_toggle_btn.setText(self._disclosure_text('build.options', self._options_expanded))
         self.out_title_lbl.setText(t('build.saveTo'))
-        self.out_btn.setText(t('build.outDir'))
+        self.out_btn.setText(t('data.change'))
         self.out_clear_btn.setText(t('data.clear'))
 
-        self.target_group.set_title(t('section.target'))
-        self.bc_title_lbl.setText(t('opt.bc'))
-        self.bc_note_lbl.setText(t('opt.bc.note'))
-
-        self.stages_card.set_title(t('prog.title'))
-        self.log_group.set_title(t('build.log'))
-        self.log_label.setText(t('build.log'))
+        self.stages_card.set_title(t('section.progress'))
+        self.log_group.set_title(t('section.log'))
+        self.log_label.setText(self._disclosure_text('build.log', self._log_open))
         self.export_log_btn.setText(t('log.export'))
         self.log.setPlaceholderText(t('log.placeholder'))
 
@@ -2007,6 +2292,15 @@ class MainWindow(QMainWindow):
         self.reveal_ipa_btn.setText(f"{t('shell.showInFinder')} (IPA)")
         self.reveal_arc_btn.setText(f"{t('shell.showInFinder')} (romfs)")
         self.top_bar.recenter_nav()
+
+        self.device_settings_group.set_title(t('win.settings.devices'))
+        self.settings_install_title.setText(t('win.settings.install'))
+        self.settings_install_note.setText(t('win.settings.installNote'))
+        self.settings_install_btn.setText(t('win.settings.installBtn'))
+        self.offer_title_lbl.setText(t('win.settings.offer'))
+        self.offer_note_lbl.setText(t('win.settings.offerNote'))
+        self.auto_title_lbl.setText(t('settings.autoUpdateLauncher'))
+        self.auto_note_lbl.setText(t('win.settings.autoUpdateNote'))
 
         self.app_group.set_title(t('section.app'))
         self.app_lang_lbl.setText(t('settings.language'))
@@ -2066,10 +2360,15 @@ class MainWindow(QMainWindow):
 
     def _refresh_deps(self) -> None:
         t = self.m.t
-        while self.deps_rows.count():
-            item = self.deps_rows.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        for rows in (self.deps_rows, self.device_deps_rows):
+            while rows.count():
+                item = rows.takeAt(0)
+                old = item.widget()
+                if old is not None:     # off the screen now: deleteLater alone left the old row drawn for a frame
+                    old.hide()
+                    old.setParent(None)
+                    old.deleteLater()
+        self._refresh_device_deps()
 
         if not self.m.deps_checked:
             _set_dot(self.deps_dot, style.NEUTRAL_DOT)
@@ -2084,10 +2383,11 @@ class MainWindow(QMainWindow):
             self._refresh_running()
             return
 
-        req_missing = sum(1 for d in self.m.deps if not d.ok and d.required)
-        opt_missing = sum(1 for d in self.m.deps if not d.ok and not d.required)
-        fixable = any(not d.ok and d.install for d in self.m.deps)
-        any_busy = any(d.installing for d in self.m.deps)
+        build_deps = [d for d in self.m.deps if d.id not in DEVICE_DEP_IDS]
+        req_missing = sum(1 for d in build_deps if not d.ok and d.required)
+        opt_missing = sum(1 for d in build_deps if not d.ok and not d.required)
+        fixable = any(not d.ok and d.install for d in build_deps)
+        any_busy = any(d.installing for d in build_deps)
         if req_missing == 0 and opt_missing == 0:
             _set_dot(self.deps_dot, style.GREEN)
             self.deps_summary.setText(t('dep.allReady'))
@@ -2103,11 +2403,32 @@ class MainWindow(QMainWindow):
         self.install_all_btn.setVisible(fixable)
         self.install_all_btn.setEnabled(not any_busy)
 
-        for d in self.m.deps:
+        for d in build_deps:
             self.deps_rows.addWidget(self._make_dep_row(d))
 
         self._refresh_running()
+        self._refresh_install_card()
         self._maybe_show_onboarding()
+
+    def _refresh_device_deps(self) -> None:
+        """iPhone and iPad: the rows signing and installing need, with their own summary."""
+        t = self.m.t
+        rows = [d for d in self.m.deps if d.id in DEVICE_DEP_IDS]
+        self.device_deps_toggle.setText(self._disclosure_text('win.settings.signing', self._device_deps_open))
+        self.device_recheck_btn.setText(t('dep.recheck'))
+        if not self.m.deps_checked:
+            _set_dot(self.device_deps_dot, style.NEUTRAL_DOT)
+            self.device_deps_summary.setText(t('dep.checking'))
+        else:
+            missing = sum(1 for d in rows if not d.ok)
+            _set_dot(self.device_deps_dot, style.GREEN if rows and not missing else style.AMBER)
+            self.device_deps_summary.setText(t('dep.allReady') if rows and not missing
+                                             else t('win.settings.signingMissing', missing))
+            for d in rows:
+                self.device_deps_rows.addWidget(self._make_dep_row(d))
+        ready = self.m.device_install_ready
+        self.settings_install_btn.setEnabled(ready and not self.m.running and bool(self.m.built_games())
+                                             if pu.IS_WIN else False)
 
     def _make_dep_row(self, d: Dep) -> QFrame:
         t = self.m.t
@@ -2202,6 +2523,13 @@ class MainWindow(QMainWindow):
         }
 
         _set_dot(self.folder_cta_dot, style.GREEN if (folder or self.m.base_path) else style.NEUTRAL_DOT)
+        chosen = self.m.game_dir if (self.m.game_dir and (folder or self.m.base_path)) else ''
+        self.folder_cta_title.setText(t('build.folderSelected' if chosen else 'build.folderCTA'))
+        self.folder_cta_sub.setText(chosen or t('build.folderNote'))
+        self.folder_cta_sub.setObjectName('mono' if chosen else 'muted')
+        self.folder_cta_sub.style().unpolish(self.folder_cta_sub)
+        self.folder_cta_sub.style().polish(self.folder_cta_sub)
+        self.pick_folder_btn.setText(t('data.change' if chosen else 'data.choose'))
 
         for key, widgets in self.input_rows.items():
             widgets['title'].setText(t(widgets['title_key']))
@@ -2269,17 +2597,13 @@ class MainWindow(QMainWindow):
             self.keycheck_row.hide()
 
         self.out_label.setText(self.m.out_dir or t('build.saveDefault'))
+        self.out_label.setObjectName('mono' if self.m.out_dir else 'muted')
+        self.out_label.style().unpolish(self.out_label)
+        self.out_label.style().polish(self.out_label)
         self.out_clear_btn.setVisible(bool(self.m.out_dir))
+        self.m.remember_choices()       # the choices last to the next start (Model.restore_choices)
         self._refresh_install_card()
         self._refresh_running()
-
-    def _refresh_target(self) -> None:
-        t = self.m.t
-        ios = self.m.target == 'ios'
-        self.target_title_lbl.setText(t('build.ios') if ios else t('build.mac'))
-        self.target_btn.setText(t('target.ios' if ios else 'target.mac'))
-        self.target_btn.setToolTip(t('target.tip'))
-        self.target_hint.setText(t('target.hint.ios' if ios else 'target.hint.mac'))
 
     def _toggle_target(self) -> None:
         if self.m.running or pu.IS_WIN:
@@ -2293,6 +2617,7 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         self.stages_card.setVisible(bool(self.m.stages))
+        self._refresh_big_progress()
         for st in self.m.stages:
             r = QHBoxLayout()
             r.setSpacing(8)
@@ -2311,22 +2636,50 @@ class MainWindow(QMainWindow):
             detail = QLabel(st.detail if st.state == 'running' else '')
             detail.setObjectName('mono')
             r.addWidget(detail, 1, Qt.AlignRight)
+            if st.state == 'running' and st.percent:
+                pct = QLabel(f'{int(st.percent)}%')
+                pct.setObjectName('muted')
+                pct.setFixedWidth(40)
+                pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                r.addWidget(pct)
             w = QWidget()
             w.setLayout(r)
             self.stages_col.addWidget(w)
         self._refresh_activity_bar()
 
+    def _run_fraction(self) -> float:
+        """How far the run in progress is: a build reports about seven stages, an install three."""
+        return overall_fraction(self.m.stages, BUILD_STAGES if self._build_run else 3)
+
+    def _refresh_big_progress(self) -> None:
+        t = self.m.t
+        stages = self.m.stages
+        if not stages:
+            return
+        running = next((x for x in stages if x.state == 'running'), None)
+        failed = next((x for x in stages if x.state == 'failed'), None)
+        if self.m.running:
+            title = t('activity.ios') if self._build_run else t('win.transfer.running')
+            cur = running or stages[-1]
+            detail = cur.name + (' · ' + cur.detail if cur.detail else '')
+            self.big_progress.set_progress(title, self._run_fraction(), detail)
+        elif failed is not None or self._failed:
+            self.big_progress.set_progress(t('win.progress.failed'), self._run_fraction(),
+                                           failed.name if failed else '', True)
+        else:
+            self.big_progress.set_progress(t('win.progress.done'), 1.0, self.footer.text())
+
     def _refresh_running(self) -> None:
         t = self.m.t
-        if hasattr(self, 'win_install_btn'):     # Install on device waits for a running build or install
-            self.win_install_btn.setEnabled(self.m.device_install_ready and bool(self.m.devices)
-                                            and not self.m.running)
+        if hasattr(self, 'play_device_card'):
+            self.play_device_card.setEnabled(not self.m.running)
+            self.play_ipa_card.setEnabled(not self.m.running)
         if self.m.running:
             self.build_btn.setText(t('build.cancel'))
             self.build_btn.setObjectName('danger')
             self.build_btn.setEnabled(True)
         else:
-            self.build_btn.setText(t('build.start'))
+            self.build_btn.setText(t('build.startGame'))
             self.build_btn.setObjectName('primary')
             self.build_btn.setEnabled(self.m.can_build)
             if not self.m.can_build and not self._failed:
@@ -2342,7 +2695,9 @@ class MainWindow(QMainWindow):
                     why = t('status.needInputs')
                 self.footer.setText(why)
             elif self.m.can_build and not self.m.ipa_path and not self.m.mac_app_path and self.m.failure is None and not self._failed:
-                self.footer.setText('')
+                # as on the Mac: where the build goes
+                out = self.m.out_dir or (str(Path(self.m.base_path).parent) if self.m.base_path else self.m.game_dir)
+                self.footer.setText(t('status.output', out) if out else '')
 
         # SetupHintCard visibility on Builds page
         setup_needed = not self.m.repo_ok or (self.m.deps_checked and not self.m.all_deps_ok)
@@ -2379,11 +2734,14 @@ class MainWindow(QMainWindow):
             self.footer.setText(note or t('msg.buildFailed'))
             if self._current_page != 'builds':
                 self._switch_page('builds')
+            self._set_log_open(True)
+            QApplication.processEvents()
             self.scroll.ensureWidgetVisible(self.log, 0, 0)
         self._show_failure()
         self.reveal_ipa_btn.hide()
         self.reveal_arc_btn.hide()
         self.reveal_app_btn.setVisible(bool(self.m.mac_app_path) and Path(self.m.mac_app_path).exists())
+        self._refresh_big_progress()
         self._refresh_install_card()
         self._refresh_library()
         self._refresh_activity_bar()
@@ -2574,11 +2932,14 @@ class MainWindow(QMainWindow):
             return
         self._failed = False
         self._stale_shaders_shown = False
+        self._build_run = True
         self.reveal_ipa_btn.hide()
         self.reveal_arc_btn.hide()
         self.reveal_app_btn.hide()
         self.footer.setText('')
         self.m.start_build()
+        # the run's bar, in view (it sits under the button)
+        QTimer.singleShot(150, lambda: self.scroll.ensureWidgetVisible(self.stages_card, 0, 40))
 
     # ================================================================ Full-Window Drag & Drop
 

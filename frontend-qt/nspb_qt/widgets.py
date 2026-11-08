@@ -718,3 +718,197 @@ class DropOverlayWidget(QWidget):
         p.setFont(f)
         p.setPen(QColor(style.ACCENT))
         p.drawText(box, Qt.AlignCenter, self.hint_text)
+
+
+# ---------------------------------------------------------------- the Builds page's Mac look
+
+class GlyphIcon(QWidget):
+    """A small line icon drawn with QPainter (the Mac launcher uses SF Symbols): 'phone', 'package' or 'refresh'."""
+
+    def __init__(self, kind: str, size: int = 28, color: str = style.MUTED, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        self._color = color
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_color(self, color: str) -> None:
+        self._color = color
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        pen = QPen(QColor(self._color), max(1.4, w / 18.0))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        if self.kind == 'phone':
+            r = QRectF(w * 0.30, h * 0.08, w * 0.40, h * 0.84)
+            p.drawRoundedRect(r, w * 0.08, w * 0.08)
+            p.drawLine(QPointF(w * 0.44, h * 0.16), QPointF(w * 0.56, h * 0.16))
+        elif self.kind == 'package':
+            # a box with a down arrow: a file to download and sign elsewhere
+            p.drawRoundedRect(QRectF(w * 0.14, h * 0.40, w * 0.72, h * 0.48), w * 0.06, w * 0.06)
+            p.drawLine(QPointF(w * 0.5, h * 0.08), QPointF(w * 0.5, h * 0.62))
+            p.drawLine(QPointF(w * 0.36, h * 0.48), QPointF(w * 0.5, h * 0.62))
+            p.drawLine(QPointF(w * 0.64, h * 0.48), QPointF(w * 0.5, h * 0.62))
+        elif self.kind == 'refresh':
+            r = QRectF(w * 0.22, h * 0.22, w * 0.56, h * 0.56)
+            p.drawArc(r, 60 * 16, 300 * 16)
+            tip = QPointF(w * 0.64, h * 0.26)
+            p.drawLine(tip, QPointF(w * 0.78, h * 0.20))
+            p.drawLine(tip, QPointF(w * 0.70, h * 0.38))
+
+
+class PlayOnCard(QFrame):
+    """One of the big choices under Play on (TargetCard.swift's targetCard): an icon, a title, a note and a radio
+    ring; the chosen one has a cream border. Clicking selects it."""
+
+    clicked = Signal()
+
+    def __init__(self, icon: str, title: str = '', note: str = '', parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName('playOnCard')
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(132)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._selected = False
+        col = QVBoxLayout(self)
+        col.setContentsMargins(20, 18, 20, 18)
+        col.setSpacing(12)
+        top = QHBoxLayout()
+        self.icon = GlyphIcon(icon, 30)
+        top.addWidget(self.icon)
+        top.addStretch(1)
+        self.ring = _RadioRing()
+        top.addWidget(self.ring, 0, Qt.AlignTop)
+        col.addLayout(top)
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet('font-size: 16px; font-weight: 700; background: transparent;')
+        self.note_label = QLabel(note)
+        self.note_label.setObjectName('muted')
+        self.note_label.setWordWrap(True)
+        col.addWidget(self.title_label)
+        col.addWidget(self.note_label)
+        col.addStretch(1)
+        self._restyle()
+
+    def set_text(self, title: str, note: str) -> None:
+        self.title_label.setText(title)
+        self.note_label.setText(note)
+
+    def set_selected(self, on: bool) -> None:
+        self._selected = bool(on)
+        self._restyle()
+
+    def is_selected(self) -> bool:
+        return self._selected
+
+    def _restyle(self) -> None:
+        if self._selected:
+            css = (f'QFrame#playOnCard {{ background: rgba(255, 240, 214, 0.05); '
+                   f'border: 1.5px solid rgba(255, 240, 214, 0.75); border-radius: 14px; }}')
+        else:
+            css = (f'QFrame#playOnCard {{ background: {style.CARD}; border: 1px solid {style.BORDER}; '
+                   f'border-radius: 14px; }} QFrame#playOnCard:hover {{ border-color: #3a3a3e; }}')
+        self.setStyleSheet(css)
+        self.ring.set_selected(self._selected)
+        self.icon.set_color(style.ACCENT if self._selected else style.MUTED)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self.isEnabled() and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class _RadioRing(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._on = False
+        self.setFixedSize(20, 20)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_selected(self, on: bool) -> None:
+        self._on = on
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._on:
+            p.setPen(QPen(QColor(style.ACCENT), 5.0))
+            p.drawEllipse(QRectF(3.5, 3.5, 13, 13))
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 64), 1.5))
+            p.drawEllipse(QRectF(2, 2, 16, 16))
+
+
+class BigProgress(QWidget):
+    """The progress a player looks for: a 10 px bar with the percentage and what runs now beside it."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.title = QLabel('')
+        self.title.setStyleSheet('font-size: 15px; font-weight: 700;')
+        top.addWidget(self.title, 1)
+        self.pct = QLabel('')
+        self.pct.setStyleSheet(f'font-size: 15px; font-weight: 700; color: {style.ACCENT};')
+        top.addWidget(self.pct)
+        col.addLayout(top)
+        from PySide6.QtWidgets import QProgressBar
+        self.bar = QProgressBar()
+        self.bar.setObjectName('bigProgress')
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        col.addWidget(self.bar)
+        self.detail = QLabel('')
+        self.detail.setObjectName('muted')
+        self.detail.setWordWrap(True)
+        col.addWidget(self.detail)
+
+    def set_progress(self, title: str, fraction: float, detail: str = '', failed: bool = False) -> None:
+        f = max(0.0, min(1.0, fraction))
+        self.title.setText(title)
+        self.pct.setText(f'{int(f * 100)}%')
+        self.pct.setStyleSheet(f'font-size: 15px; font-weight: 700; color: {style.RED if failed else style.ACCENT};')
+        self.bar.setValue(int(f * 1000))
+        self.bar.setProperty('failed', failed)
+        self.bar.style().unpolish(self.bar)
+        self.bar.style().polish(self.bar)
+        self.detail.setText(detail)
+        self.detail.setVisible(bool(detail))
+
+
+def centered_column(content: QWidget, max_width: int = 900) -> QWidget:
+    """`content` at most `max_width` wide and centred, as the Mac launcher's pages are (LauncherPageScroll: 900)."""
+    host = QWidget()
+    row = QHBoxLayout(host)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(0)
+    content.setMaximumWidth(max_width)
+    row.addStretch(1)
+    row.addWidget(content, 100)
+    row.addStretch(1)
+    return host
+
+
+def overall_fraction(stages, expected: int) -> float:
+    """How far a run is, from its stages: each done stage counts whole, a running one by its own percentage, over at
+    least `expected` stages (a build reports them one by one)."""
+    total = max(expected, len(stages), 1)
+    done = 0.0
+    for s in stages:
+        if s.state == 'done':
+            done += 1.0
+        elif s.state == 'running':
+            done += max(0.0, min(100.0, float(s.percent or 0))) / 100.0
+    return min(1.0, done / total)

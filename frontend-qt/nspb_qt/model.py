@@ -1,6 +1,7 @@
 """State, dependency detection and the build runner. No UI here: the window connects to signals."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -58,6 +59,15 @@ class Dep:
 
 # ---------------------------------------------------------------- build stages
 
+def archive_folder(output: str, key: str) -> Path:
+    """Where a game's data is packed: <output>/games/<title ID>/ (romfs.img and aoc/), one folder per game."""
+    return Path(output, 'games', key or 'game')
+
+
+#: What a build bakes into an iPhone app for GPUs without BC textures (see start_build).
+BC_CPU_ENV = 'DM_PROF_TEX_BC_CPU=1\n'
+
+
 @dataclass
 class Stage:
     name: str
@@ -86,6 +96,7 @@ class Model(QObject, DeviceMixin):
     libraryChanged = Signal()
     devicesChanged = Signal()             # Windows: the connected iPhones and iPads (device_model.py)
     autoInstallRequested = Signal(str)    # Windows: a device to update the launcher on (its UDID)
+    newDeviceFound = Signal(str)          # Windows: a device without the launcher was plugged in (its UDID)
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -125,6 +136,9 @@ class Model(QObject, DeviceMixin):
         self.target = 'ios'   # 'ios' (an IPA) or 'mac-app' (a double-clickable Mac app; macOS only)
         self.bc_on_cpu = False
         self.ipa_kind = 'shared'   # 'shared' (shell.ipaShared) or 'oneGame' (shell.ipaOneGame)
+        # Windows: where an iPhone build goes. 'device': the shared app, signed and installed over the cable;
+        # 'ipa': an unsigned IPA for another signing tool (ipa_kind says which). Elsewhere always 'ipa'.
+        self.output_mode = 'device' if pu.IS_WIN else 'ipa'
         self.library = lib.GameLibrary()
         self.artwork = lib.ArtworkStore(on_updated=lambda _tid: self._emit_library_changed())
         self.repo_busy = False
@@ -155,6 +169,79 @@ class Model(QObject, DeviceMixin):
         except OSError:
             self.log_path = None
         self._device_init()
+        # The build's choices last from one start to the next (the Mac launcher keeps the output folder, the target and
+        # the texture switch; this one also keeps prod.keys and the last game, so a new start does not ask for them
+        # again). Not under the offscreen test platform, whose runs must not read or write the player's settings.
+        self._persist_choices = os.environ.get('QT_QPA_PLATFORM') != 'offscreen'
+        if self._persist_choices:
+            self.restore_choices()
+
+    # ---- the choices kept between starts
+
+    def _setting(self, key: str) -> str:
+        return str(self.settings.value(key, '', type=str) or '')
+
+    def restore_choices(self) -> None:
+        """prod.keys, the output folder (else the games folder, which Settings says new builds use), the output
+        mode and kind, the texture switch, and the last game's files when they are still there."""
+        keys = self._setting('buildKeysPath')
+        if keys and os.path.isfile(keys):
+            self.keys_path = keys
+        out = self._setting('buildOutputDirectory')
+        if out and os.path.isdir(out):
+            self.out_dir = out
+        elif self.library.games_folder and os.path.isdir(self.library.games_folder):
+            self.out_dir = self.library.games_folder
+        self.bc_on_cpu = self._setting('bcOnCPU') == 'true'
+        if self._setting('ipaKind') in ('shared', 'oneGame'):
+            self.ipa_kind = self._setting('ipaKind')
+        if pu.IS_WIN and self._setting('outputMode') in ('device', 'ipa'):
+            self.output_mode = self._setting('outputMode')
+        try:
+            last = json.loads(self._setting('lastInputs') or '{}')
+        except ValueError:
+            last = {}
+        if not isinstance(last, dict):
+            return
+        folder = str(last.get('folder') or '')
+        base = str(last.get('base') or '')
+        if folder and os.path.exists(folder):
+            self.take_game_folder(folder)
+        elif base and os.path.isfile(base):
+            self.game_dir = str(last.get('gameDir') or '')
+            self.base_path = base
+            upd = str(last.get('update') or '')
+            self.update_path = upd if os.path.isfile(upd) else ''
+            self.dlc_paths = [str(d) for d in last.get('dlc') or [] if os.path.isfile(str(d))]
+
+    def remember_choices(self) -> None:
+        """Write what restore_choices reads. Called by the window after every change of a choice."""
+        if not getattr(self, '_persist_choices', False):
+            return
+        s = self.settings
+        s.setValue('buildKeysPath', self.keys_path or '')
+        s.setValue('buildOutputDirectory', self.out_dir or '')
+        s.setValue('bcOnCPU', 'true' if self.bc_on_cpu else 'false')
+        s.setValue('ipaKind', self.ipa_kind)
+        s.setValue('outputMode', self.output_mode)
+        f = self.game_folder
+        last = {'folder': (f.nup or f.folder) if f is not None else '', 'gameDir': self.game_dir,
+                'base': '' if f is not None else self.base_path,
+                'update': '' if f is not None else self.update_path,
+                'dlc': [] if f is not None else list(self.dlc_paths)}
+        s.setValue('lastInputs', json.dumps(last))
+
+    def use_games_folder_for_builds(self, folder: str) -> None:
+        """A games folder just chosen is where new builds go too (Settings says so; the Mac launcher sets its output
+        folder the same way)."""
+        if folder and not self.running:
+            self.out_dir = folder
+            self.remember_choices()
+
+    @property
+    def exports_one_game(self) -> bool:
+        """The build makes one game's own IPA with its data inside, not a framework for the shared app."""
+        return self.ipa_kind == 'oneGame' and (not pu.IS_WIN or self.output_mode == 'ipa')
 
     # ---- strings
 
@@ -1669,7 +1756,7 @@ class Model(QObject, DeviceMixin):
         # Windows, shared app: the game's framework for the shared app (route C), which the
         # install puts into the ready-made app and signs (device_model.py). The Mac launcher
         # does the same with Xcode.
-        shell_fw = pu.IS_WIN and not mac_app and self.ipa_kind == 'shared'
+        shell_fw = pu.IS_WIN and not mac_app and not self.exports_one_game
         if mac_app:
             args += ['--platform', 'mac-app']
             self.mac_app_path = str(Path(self.out_dir or base_dir, f'{tid_hex}.app'))
@@ -1679,11 +1766,16 @@ class Model(QObject, DeviceMixin):
         elif self.out_dir:
             self.ipa_path = str(Path(self.out_dir, f'{tid_hex}.ipa'))
             args += ['-o', self.ipa_path]
-        if self.bc_on_cpu and not mac_app:
+        # Older iPhones and iPads (before the A17 Pro, iPads before the M1) have no BC texture formats: the profile's
+        # tex_bc_cpu decodes them on the CPU. The engine reads it as DM_PROF_TEX_BC_CPU (hle_profile.c read_env); the
+        # Mac launcher writes that name, and DM_TEX_BC_CPU, which this launcher wrote, was never read. It changes
+        # nothing on a GPU with BC support (nvn_mtl.m: g_bc_cpu = !supportsBCTextureCompression && tex_bc_cpu), so a
+        # Windows shared-app game always carries it: the one framework then plays on every iPhone and iPad.
+        if (self.bc_on_cpu or shell_fw) and not mac_app:
             try:
                 Path(self.effective_work_dir).mkdir(parents=True, exist_ok=True)
                 env_file = Path(self.effective_work_dir, '_env.txt')
-                env_file.write_text('DM_TEX_BC_CPU=1\n', encoding='utf-8')
+                env_file.write_text(BC_CPU_ENV, encoding='utf-8')
                 args += ['--env-file', str(env_file)]
                 self.log(self.t('msg.bcOn') + '\n')
             except OSError as e:
@@ -1715,7 +1807,7 @@ class Model(QObject, DeviceMixin):
         self.log(self.t('msg.running', py + ' ' + ' '.join(args)) + '\n')
 
         env = pu.child_env()
-        if self.ipa_kind == 'oneGame' and not mac_app:
+        if self.exports_one_game and not mac_app:
             env['DM_FULL_ROMFS'] = '1'
         droot = pu.dotnet_root(self.dotnet_path) if self.dotnet_ok else None
         if droot:
@@ -1764,7 +1856,7 @@ class Model(QObject, DeviceMixin):
                     if st.state == 'running':
                         st.state = 'done'
                 self.stagesChanged.emit()
-                if self.ipa_kind == 'oneGame':
+                if self.exports_one_game:
                     self._record_library_ios_completion()
                     self.finished.emit(True, self.t('shell.oneGameDone', self.ipa_path))
                 elif shell_fw:
@@ -1906,8 +1998,10 @@ class Model(QObject, DeviceMixin):
         romfs_img = ver_dir / 'RomFS.img'
         romfs = str(ver_dir / 'RomFS')
         # games/<id>/ is the per-game layout main.m looks in first, and the file inside it is
-        # romfs.img — one file, which copies to a phone at full speed where 300,000 did not
-        dest = str(Path(self.out_dir or Path(self.base_path).parent, 'romfs'))
+        # romfs.img — one file, which copies to a phone at full speed where 300,000 did not. One folder per game, as
+        # the Mac launcher packs it (BuildStore+Archive.swift): a shared <output>/romfs held the last game built
+        # there only, so an earlier game's data could no longer be sent to a device.
+        dest = str(archive_folder(self.out_dir or str(Path(self.base_path).parent), self.build_key))
         self.stages.append(Stage(name=self.t('prog.archiveShort'), state='running'))
         self.stagesChanged.emit()
 

@@ -412,6 +412,48 @@ class InstallEndToEnd(DeviceTestCase):
         self.assertEqual(wi.done_message(False, True), 'dev.installed')
         self.assertEqual(wi.done_message(False, None), 'dev.installed')
 
+    def _signing(self):
+        """sign_and_install that also "installs" the app on the pretend device, as the tool would."""
+        orig = signer.sign_and_install
+
+        def run(*a, **k):
+            r = orig(*a, **k)
+            info = json.loads(self.out.read_text())
+            self.dev.apps[info['bundle']] = {'CFBundleIdentifier': info['bundle'], 'CFBundleExecutable': 'DmShell'}
+            return r
+        signer.sign_and_install = run
+        self.addCleanup(setattr, signer, 'sign_and_install', orig)
+
+    def test_the_app_holds_the_games_chosen_for_the_device(self):
+        for tid in ('0100000000000A00', '0100000000000B00'):
+            shell.add_built_game(self.root, make_framework(self.tmp / tid / 'shell-framework', tid))
+        self._signing()
+        out = wi.install(self.root, self.dev.udid, titles=['0100000000000B00'], template=self.tpl, signer_exe=self.exe)
+        self.assertTrue(out.ok, out)
+        self.assertEqual(json.loads(self.out.read_text())['frameworks'], ['DmGame0100000000000B00.framework'])
+        self.assertEqual(wi.Devices(self.root).get(self.dev.udid).titles, ['0100000000000B00'])
+        # an update without a choice keeps the device's games, not every built game
+        again = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
+        self.assertTrue(again.ok, again)
+        self.assertEqual(json.loads(self.out.read_text())['frameworks'], ['DmGame0100000000000B00.framework'])
+        state = wi.Devices(self.root).get(self.dev.udid)
+        self.assertEqual([g.titleID for g in wi.device_games(self.root, state)], ['0100000000000B00'])
+
+    def test_a_device_on_an_older_ios_is_told_before_signing(self):
+        shell.add_built_game(self.root, make_framework(self.tmp / 'w' / 'shell-framework', '0100000000000A00'))
+        with open(self.tpl / 'Info.plist', 'rb') as f:
+            info = plistlib.load(f)
+        info['MinimumOSVersion'] = '26.0'
+        with open(self.tpl / 'Info.plist', 'wb') as f:
+            plistlib.dump(info, f)
+        self.dev.ios = '18.5'
+        out = wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe)
+        self.assertEqual((out.ok, out.message[0], out.message[2:]), (False, 'win.install.oldIOS', ('18.5', '26.0')))
+        self.assertFalse(self.out.exists())            # the signing tool never ran
+        self.dev.ios = '26.1'
+        self._signing()
+        self.assertTrue(wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe).ok)
+
     def test_install_stops_early_with_a_reason(self):
         self.assertEqual(wi.install(self.root, self.dev.udid, template=self.tpl, signer_exe=self.exe).message,
                          ('win.install.noGames',))

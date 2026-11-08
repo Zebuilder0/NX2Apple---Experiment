@@ -53,6 +53,7 @@ class FakeDevice:
                  developer_mode: bool | None = None):
         self.udid, self.name, self.paired, self.tls, self.free, self.locked = udid, name, paired, tls, free, locked
         self.developer_mode = developer_mode      # None: the device does not say (iOS 15)
+        self.ios = ''                             # ProductVersion ('': not answered)
         self.revealed = 0                         # AMFI reveal requests (the Developer Mode switch shown)
         self.apps: dict[str, dict] = {}
         self.files: dict[str, bytes] = {}          # AFC paths of the vended container
@@ -174,6 +175,8 @@ class FakeDevice:
                     self._send(s, {'Request': r, 'Value': self.name})
                 elif req.get('Key') == 'AmountDataAvailable':
                     self._send(s, {'Request': r, 'Value': self.free})
+                elif req.get('Key') == 'ProductVersion' and self.ios:
+                    self._send(s, {'Request': r, 'Value': self.ios})
                 elif (req.get('Domain'), req.get('Key')) == ('com.apple.security.mac.amfi', 'DeveloperModeStatus') \
                         and self.developer_mode is not None:
                     self._send(s, {'Request': r, 'Value': self.developer_mode})

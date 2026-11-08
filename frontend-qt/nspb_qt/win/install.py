@@ -45,6 +45,7 @@ class DeviceState:
     games: str = ''                 # library_hash() at the last install
     name: str = ''
     receipts: dict = field(default_factory=dict)   # title ID → the game data's stamp on this device
+    titles: list = field(default_factory=list)     # the title IDs in the app on this device ([]: every built game)
 
 
 class Devices:
@@ -61,7 +62,8 @@ class Devices:
             if isinstance(d, dict):
                 self.items[udid] = DeviceState(str(d.get('bundle', '')), float(d.get('signed', 0) or 0),
                                                str(d.get('games', '')), str(d.get('name', '')),
-                                               dict(d.get('receipts') or {}))
+                                               dict(d.get('receipts') or {}),
+                                               [str(t).upper() for t in d.get('titles') or []])
 
     def get(self, udid: str) -> DeviceState | None:
         return self.items.get(udid)
@@ -93,6 +95,14 @@ def library_hash(games: list[shell.Game], template: Path | None) -> str:
     return h.hexdigest()[:16]
 
 
+def device_games(root: Path, state: DeviceState | None) -> list[shell.Game]:
+    """The built games the app on a device holds: the ones chosen for it, else (never chosen) every built game."""
+    games = shell.Library.load(root).present()
+    if state is None or not state.titles:
+        return games
+    return shell.present_titles(games, state.titles)
+
+
 def needs_update(state: DeviceState | None, current: str, now: float | None = None) -> bool:
     """Whether a connected device's app should be signed and installed again on its own: only a
     device this PC installed the app on before, when the signature is getting old or the games
@@ -110,6 +120,7 @@ Callback = Callable[..., None]
 
 
 def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None,
+            titles: list[str] | set[str] | None = None,
             log: Callable[[str], None] = lambda s: None,
             stage: Callable[[str, str, str, float], None] = lambda *a: None,
             cancelled: Callable[[], bool] = lambda: False,
@@ -118,6 +129,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
             banner: Callable[[str], str | None] | None = None) -> Outcome:
     """Sign and install the shared app on `udid`, then copy each `(title ID, game data folder)`
     of `data`: by default every game's data the device has not received yet (`shell.pending_data`).
+    `titles` are the games the app holds (a game left out is removed from the app on the device); by default the
+    ones it held after the last install from this PC, else every built game.
     `stage(key, state, detail, percent)` reports the steps: key is an en.json key, state
     'running', 'done' or 'failed'."""
     root = Path(root)
@@ -127,7 +140,13 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     exe = signer_exe or signer.find()
     if not exe:
         return Outcome(False, ('win.sign.fail.missing',))
-    games = shell.Library.load(root).present()
+    known = Devices(root)
+    prev = known.get(udid) or DeviceState()
+    every = shell.Library.load(root).present()
+    if titles is not None:
+        games = shell.present_titles(every, titles)
+    else:
+        games = device_games(root, prev if prev.bundle else None)
     if not games:
         return Outcome(False, ('win.install.noGames',))
     try:
@@ -145,6 +164,10 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         return Outcome(False, ('win.install.notPaired',), 'win.install.notPaired.next')
     dv.describe(dev)
     name = dev.name or 'iPhone'
+    need = shell.template_min_ios(template)
+    if dev.ios and need and shell.version_tuple(dev.ios) < shell.version_tuple(need):
+        # the app's own minimum: the signing tool would install it and iOS would refuse to open it
+        return Outcome(False, ('win.install.oldIOS', name, dev.ios, need), 'win.install.oldIOS.next')
 
     # 1. the app with every game in it
     stage('win.install.stage.prepare', 'running', '', 0)
@@ -169,8 +192,6 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     stage('win.install.stage.sign', 'done', name, 100)
 
     # 3. remember it: the bundle ID the signer gave the app, found on the device
-    known = Devices(root)
-    prev = known.get(udid) or DeviceState()
     try:
         bundle = dv.find_shell(dev, preferred=prev.bundle)
     except dv.DeviceError as e:
@@ -179,7 +200,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     if not bundle:
         return Outcome(False, ('win.install.notFound',))
     state = DeviceState(bundle=bundle, signed=time.time(), games=library_hash(games, template),
-                        name=name, receipts=prev.receipts if prev.bundle == bundle else {})
+                        name=name, receipts=prev.receipts if prev.bundle == bundle else {},
+                        titles=sorted(g.titleID.upper() for g in games))
     known.put(udid, state)
 
     # 4. the game data the device lacks

@@ -557,12 +557,22 @@ class OnboardingDialog(QDialog):
             if it.widget():
                 it.widget().deleteLater()
 
+    #: The steps, in order. Windows adds the iPhone or iPad step (signing and installing on a device), which the Mac
+    #: launcher does not need: Xcode does both there.
+    DEVICE_IDS = ('amds', 'signer', 'apple_id', 'shell_template')
+
+    def steps(self) -> list[str]:
+        return ['welcome', 'tools'] + (['device'] if pu.IS_WIN else []) + ['keys', 'games']
+
     def _render_step(self) -> None:
         self._clear_body()
-        self.step_badge.setText(self.m.t('onboarding.stepCount', self.step + 1, 4))
+        steps = self.steps()
+        self.step = max(0, min(self.step, len(steps) - 1))
+        name = steps[self.step]
+        self.step_badge.setText(self.m.t('onboarding.stepCount', self.step + 1, len(steps)))
         self.back_btn.setVisible(self.step > 0)
 
-        if self.step == 0:
+        if name == 'welcome':
             self.head_title.setText(self.m.t('onboarding.welcome.title'))
             self.head_note.setText(self.m.t('onboarding.welcome.note'))
             self.next_btn.setText(self.m.t('onboarding.start'))
@@ -599,13 +609,18 @@ class OnboardingDialog(QDialog):
             grp.add_row(r2)
             self.body_layout.addWidget(grp)
 
-        elif self.step == 1:
+        elif name == 'tools':
             self.head_title.setText(self.m.t('onboarding.background.title'))
             self.head_note.setText(self.m.t('dep.title'))
             self.next_btn.setText(self.m.t('onboarding.continue'))
 
             grp = CardGroup()
-            for idx, d in enumerate(self.m.deps[:5]):
+            build_rows = [d for d in self.m.deps if d.id not in self.DEVICE_IDS]
+            if not self.m.deps_checked:
+                wait = QLabel(self.m.t('dep.checking'))
+                wait.setObjectName('muted')
+                self.body_layout.addWidget(wait)
+            for idx, d in enumerate(build_rows):
                 if idx > 0:
                     grp.add_divider()
                 r = QWidget()
@@ -621,48 +636,65 @@ class OnboardingDialog(QDialog):
                 grp.add_row(r)
             self.body_layout.addWidget(grp)
 
-            # Windows: what installing on an iPhone or iPad needs (device_model.py), optional
-            dev_rows = [d for d in self.m.deps if d.id in ('amds', 'signer', 'apple_id', 'shell_template')]
-            if pu.IS_WIN and dev_rows:
-                head = QLabel(self.m.t('win.setup.devices'))
-                head.setObjectName('muted')
-                self.body_layout.addWidget(head)
-                g2 = CardGroup()
-                for idx, d in enumerate(dev_rows):
-                    if idx > 0:
-                        g2.add_divider()
-                    r = QWidget()
-                    rl = QHBoxLayout(r)
-                    rl.setContentsMargins(18, 10, 18, 10)
-                    rl.addWidget(StatusDot(style.GREEN if d.ok else style.AMBER))
-                    tl = QLabel(self.m.t(d.title_key))
-                    tl.setObjectName('rowTitle')
-                    rl.addWidget(tl, 1)
-                    if d.id == 'amds' and not d.ok:
-                        b = QPushButton(self.m.t('win.dep.amds.get'))
-                        b.clicked.connect(self.m.open_itunes_page)
-                        rl.addWidget(b)
-                    elif d.id == 'apple_id' and not d.ok:
-                        b = QPushButton(self.m.t('win.dep.appleId.signIn'))
-                        b.clicked.connect(self.m.sign_in_apple_id)
-                        rl.addWidget(b)
-                    else:
-                        st = QLabel(self.m.t('onboarding.ready') if d.ok else self.m.t('onboarding.failed'))
-                        st.setObjectName('muted')
-                        rl.addWidget(st)
-                    g2.add_row(r)
-                self.body_layout.addWidget(g2)
-                note = QLabel(self.m.t('win.dep.appleId.guide'))
-                note.setObjectName('muted')
-                note.setWordWrap(True)
-                self.body_layout.addWidget(note)
-
-            if any(not d.ok and d.install for d in self.m.deps):
+            if any(not d.ok and d.install for d in build_rows):
                 ibtn = QPushButton(self.m.t('dep.installAll'))
                 ibtn.clicked.connect(self.m.install_all_missing)
                 self.body_layout.addWidget(ibtn)
 
-        elif self.step == 2:
+        elif name == 'device':
+            # Windows: what signing and installing on an iPhone or iPad need (device_model.py). Optional: a build and
+            # the IPA export work without them.
+            self.head_title.setText(self.m.t('win.setup.deviceTitle'))
+            self.head_note.setText(self.m.t('win.setup.deviceNote'))
+            self.next_btn.setText(self.m.t('onboarding.continue'))
+            dev_rows = [d for d in self.m.deps if d.id in self.DEVICE_IDS]
+            g2 = CardGroup()
+            for idx, d in enumerate(dev_rows):
+                if idx > 0:
+                    g2.add_divider()
+                r = QWidget()
+                rl = QHBoxLayout(r)
+                rl.setContentsMargins(18, 10, 18, 10)
+                rl.addWidget(StatusDot(style.GREEN if d.ok else style.AMBER))
+                col = QVBoxLayout()
+                col.setSpacing(2)
+                tl = QLabel(self.m.t(d.title_key))
+                tl.setObjectName('rowTitle')
+                col.addWidget(tl)
+                if not d.ok:
+                    hl = QLabel(self.m.t(d.hint_key))
+                    hl.setObjectName('muted')
+                    hl.setWordWrap(True)
+                    col.addWidget(hl)
+                rl.addLayout(col, 1)
+                if d.id == 'amds' and not d.ok:
+                    b = QPushButton(self.m.t('win.dep.amds.get'))
+                    b.clicked.connect(self.m.open_itunes_page)
+                    rl.addWidget(b)
+                elif d.id == 'apple_id' and not d.ok and any(x.id == 'signer' and x.ok for x in dev_rows):
+                    b = QPushButton(self.m.t('win.dep.appleId.signIn'))
+                    b.clicked.connect(self.m.sign_in_apple_id)
+                    rl.addWidget(b)
+                else:
+                    st = QLabel(self.m.t('onboarding.ready') if d.ok else self.m.t('onboarding.failed'))
+                    st.setObjectName('muted')
+                    rl.addWidget(st)
+                g2.add_row(r)
+            if not dev_rows:
+                wait = QLabel(self.m.t('dep.checking'))
+                wait.setObjectName('muted')
+                self.body_layout.addWidget(wait)
+            else:
+                self.body_layout.addWidget(g2)
+            note = QLabel(self.m.t('win.dep.appleId.guide') + ' ' + self.m.t('win.setup.deviceAfter'))
+            note.setObjectName('muted')
+            note.setWordWrap(True)
+            self.body_layout.addWidget(note)
+            recheck = QPushButton(self.m.t('dep.recheck'))
+            recheck.clicked.connect(self.m.check_deps)
+            self.body_layout.addWidget(recheck, 0, Qt.AlignLeft)
+
+        elif name == 'keys':
             self.head_title.setText(self.m.t('onboarding.keys.title'))
             self.head_note.setText(self.m.t('onboarding.keys.note'))
             self.next_btn.setText(self.m.t('onboarding.continue'))
@@ -688,7 +720,7 @@ class OnboardingDialog(QDialog):
             grp.add_row(r)
             self.body_layout.addWidget(grp)
 
-        elif self.step == 3:
+        elif name == 'games':
             self.head_title.setText(self.m.t('onboarding.games.title'))
             self.head_note.setText(self.m.t('onboarding.games.note'))
             self.next_btn.setText(self.m.t('onboarding.openLibrary'))
@@ -719,6 +751,7 @@ class OnboardingDialog(QDialog):
         f, _ = QFileDialog.getOpenFileName(self, self.m.t('data.keys'), '', 'Keys (prod.keys *.keys *);;All files (*)')
         if f:
             self.m.keys_path = f
+            self.m.remember_choices()
             self.m.repoChanged.emit()
             self._render_step()
 
@@ -726,6 +759,7 @@ class OnboardingDialog(QDialog):
         d = QFileDialog.getExistingDirectory(self, self.m.t('library.folderTitle'), self.m.library.games_folder or str(Path.home()))
         if d:
             self.m.library.set_games_folder(d, repo_path=self.m.engine_path, default_keys=self.m.keys_path)
+            self.m.use_games_folder_for_builds(d)
             for g in self.m.library.games:
                 self.m.artwork.request_banner_async(g.title_id)
             self.m._emit_library_changed()
@@ -737,7 +771,7 @@ class OnboardingDialog(QDialog):
             self._render_step()
 
     def _next_step(self) -> None:
-        if self.step < 3:
+        if self.step < len(self.steps()) - 1:
             self.step += 1
             self._render_step()
         else:

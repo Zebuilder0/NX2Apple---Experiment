@@ -265,10 +265,14 @@ titles, Metroid Dread — do not need any of that.
 
 ## Install on an iPhone or iPad (the shared app)
 
-With **Shared app** chosen, a Windows build works like the Mac launcher's **iPhone / iPad** target: the game goes into
-one app on the device that holds all your games, signed with your own Apple ID, with no sideloader to run by hand.
+Builds → Play on has two cards, as the Mac launcher has This Mac and iPhone / iPad. **Install on device** works like the
+Mac launcher's iPhone / iPad target: the game goes into one app on the device that holds all your games, signed with
+your own Apple ID, with no sideloader to run by hand. **Export as IPA** makes an unsigned IPA for AltStore, SideStore or
+another tool: the shared app with every built game (written beside the build as `NX2Apple.ipa` when it ends), or one game
+with its data inside. Only the chosen card's section shows below it.
 
-**Once:** Settings → Device dependencies (also in the setup) has four rows for it, all optional for building:
+**Once:** Settings → iPhone and iPad → Signing and installing (and its own step in the setup) has four rows, all
+optional for building. The build tools keep their own list under Build tools:
 
 | Row | What it is | What you do |
 |---|---|---|
@@ -294,15 +298,30 @@ note says where to turn it on. Turning it on stays on the device: iOS restarts a
 3. copy the game data the device lacks into the app's `Documents/games/<title ID>/` (`win/device.py`: usbmuxd,
    lockdownd, house_arrest and AFC, standard library only), through a `.part` file renamed at the end.
 
-The bundle ID is `org.nxnative.shell.<team ID>` every time, so installing again keeps the saves and the game data.
+The bundle ID is `org.nxnative.shell.<team ID>` every time, so installing again keeps the saves and the game data. Each
+game's data is packed into `<output>/games/<title ID>/` (romfs.img and aoc/), one folder per game as the Mac launcher
+packs it, so a game built earlier can still be sent to another device. A device on an iOS older than the app's
+`MinimumOSVersion` (26) is told so before anything is signed.
 
-**Update launcher:** the same button (it says **Update launcher** once the device has the app) signs and installs the
-app again without a build, with every game in it. With **Update the launcher when a device connects** on (Settings,
-the default), a device that has the app from this PC is signed and installed again by itself when it is plugged in
-and the signature is 5 days old (a free Apple ID's lasts 7) or the games changed. The Mac launcher has the same switch.
+**Older iPhones and iPads** (before the A17 Pro, iPads before the M1) have no BC texture formats. A Windows shared-app
+game always carries `DM_PROF_TEX_BC_CPU=1`, which decodes them on the CPU there and changes nothing on a GPU that has
+them (`nvn_mtl.m`), so one framework plays on every device. The **Older devices** switch is for a one-game IPA. Before
+this, the switch wrote `DM_TEX_BC_CPU`, a name the engine never read.
 
-**Export IPA** in the same card packs the shared app with every game, unsigned, for AltStore, SideStore or another tool.
-**One game, all inside** is unchanged.
+**Transfer to device:** a game built for the shared app has **Transfer to device** as its main button in the library
+(**Show in folder** is under Manage). It opens a window: the device, and the built games its app should hold, ticked
+with the ones already there. The install runs in that window with one progress bar and the log; closed while it runs,
+it shrinks to a card in the window's bottom-right corner. Settings → iPhone and iPad → **Install the launcher on a
+device** opens the same window, and so does a device without NX2Apple being plugged in (**Offer the launcher when a new
+device connects**, on by default; a device that has the app from another computer is not asked). `devices.json`
+remembers which games each device holds.
+
+With **Update the launcher when a device connects** on (Settings, the default), a device that has the app from this PC
+is signed and installed again by itself when it is plugged in and the signature is 5 days old (a free Apple ID's lasts
+7) or its games changed. The Mac launcher has the same switch.
+
+The build's choices (prod.keys, the last game's files, Save to, Play on) stay from one start to the next. Choosing a
+games folder makes it the Save to folder, as on the Mac.
 
 Limits: an Apple ID with several developer teams is asked which one in the sign-in window, once. A free Apple ID allows 3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here was tried on a
 device from this fork yet: `tests/test_device_install.py` runs the whole install against a pretend device.

@@ -108,7 +108,10 @@ class BuildButton(unittest.TestCase):
         m.deps = self._rows()
         w._refresh_deps()
         self.assertTrue(w.build_btn.isEnabled())
-        self.assertEqual(w.footer.text(), '', 'a line about a dependency does not stay once the dependency is there')
+        # a line about a dependency does not stay once the dependency is there: the row says where the build goes, as
+        # the Mac launcher's does ("Output: <folder>")
+        out = m.out_dir or (str(Path(m.base_path).parent) if m.base_path else m.game_dir)
+        self.assertEqual(w.footer.text(), m.t('status.output', out) if out else '')
 
 
 if __name__ == '__main__':

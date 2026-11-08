@@ -72,30 +72,33 @@ class DeviceWindow(unittest.TestCase):
                     'j…@example.com' if signed_in else '', required=False),
                 Dep('shell_template', 'win.dep.template', 'win.dep.template.hint', ok, 'DmShell.app', required=False)]
 
-    def _buttons(self, w):
-        return [b.text() for b in w.deps_rows_host.findChildren(QPushButton)]
+    def _buttons(self, w, host='device_deps_host'):
+        return [b.text() for b in getattr(w, host).findChildren(QPushButton)]
 
     def test_rows_offer_itunes_and_sign_in(self):
         m, w = self._window(self._rows(signed_in=False, ready=False))
         texts = self._buttons(w)
         self.assertIn('Get iTunes', texts)
         self.assertIn('Sign in…', texts)
+        # the device rows have their own section: the build tools list keeps only the build's rows
+        self.assertNotIn('Get iTunes', self._buttons(w, 'deps_rows_host'))
         self.assertFalse(m.device_install_ready)
-        self.assertTrue(w.win_dev_container.isVisibleTo(w))
-        self.assertFalse(w.win_install_btn.isEnabled())
-        self.assertIn('Settings, Device dependencies', w.win_dev_note.text())
+        self.assertTrue(w.device_group.isVisibleTo(w))
+        self.assertIn('Settings, iPhone and iPad', w.win_dev_note.text())
+        self.assertEqual(w.win_id_btn.text(), 'Sign in…')
         # the optional rows do not hold the build back
         self.assertTrue(m.all_deps_ok)
 
-    def test_signed_in_offers_sign_out_and_install_waits_for_a_device(self):
+    def test_signed_in_offers_sign_out_and_waits_for_a_device(self):
         m, w = self._window(self._rows(signed_in=True))
         self.assertIn('Sign out', self._buttons(w))
+        self.assertEqual(w.win_id_btn.text(), 'Sign out')
+        self.assertIn('j…@example.com', w.win_id_note.text())
         self.assertTrue(m.device_install_ready)
-        self.assertEqual(w.win_install_btn.text(), 'Install on device')
-        self.assertFalse(w.win_install_btn.isEnabled())       # no device connected
         self.assertIn('No iPhone or iPad connected', w.win_dev_note.text())
+        self.assertFalse(w.settings_install_btn.isEnabled())     # no game built for the shared app yet
 
-    def test_a_known_device_offers_update_launcher(self):
+    def test_a_known_device_shows_when_it_was_signed(self):
         from nspb_qt.win import device as dv
         from nspb_qt.win import install as wi
         m, w = self._window(self._rows(signed_in=True))
@@ -103,22 +106,143 @@ class DeviceWindow(unittest.TestCase):
         m.install_udid = 'UDID1'
         wi.Devices(Path(m.shell_cache_path)).put('UDID1', wi.DeviceState(bundle='org.nxnative.shell.T', signed=1.0))
         w._refresh_install_card()
-        self.assertEqual(w.win_install_btn.text(), 'Update launcher')
-        self.assertTrue(w.win_install_btn.isEnabled())
         self.assertEqual(w.win_dev_combo.currentText(), 'Jane’s iPhone')
         self.assertIn('Last signed', w.win_dev_note.text())
 
-    def test_one_game_ipa_hides_the_device_row(self):
+    def test_play_on_switches_between_the_device_and_an_ipa(self):
         m, w = self._window(self._rows(signed_in=True))
+        self.assertEqual(m.output_mode, 'device')
+        self.assertTrue(w.play_device_card.is_selected())
+        self.assertTrue(w.device_group.isVisibleTo(w))
+        self.assertFalse(w.install_group.isVisibleTo(w))      # no IPA steps when the build goes to a device
+        self.assertFalse(w.bc_card.isVisibleTo(w))            # a shared-app game always carries the texture switch
+        self.assertTrue(w.older_note.isVisibleTo(w))
+        w.play_ipa_card.clicked.emit()
+        self.assertEqual(m.output_mode, 'ipa')
+        self.assertTrue(w.play_ipa_card.is_selected())
+        self.assertFalse(w.device_group.isVisibleTo(w))
+        self.assertTrue(w.install_group.isVisibleTo(w))
+        self.assertFalse(m.exports_one_game)
         w._on_ipa_kind_changed('oneGame')
-        self.assertFalse(w.win_dev_container.isVisibleTo(w))
+        self.assertTrue(m.exports_one_game)
+        self.assertTrue(w.bc_card.isVisibleTo(w))             # a one-game IPA takes the switch
+        self.assertFalse(w.older_note.isVisibleTo(w))
+        w._set_output_mode('device')
+        self.assertFalse(m.exports_one_game)                  # the kind of IPA does not apply to a device
 
-    def test_auto_update_switch_is_saved(self):
+    def test_settings_switches_are_saved(self):
         m, w = self._window(self._rows(signed_in=True))
-        start = m.auto_update_launcher
-        w.auto_switch.toggled.emit(not start)
-        self.assertEqual(m.auto_update_launcher, not start)
-        m.set_auto_update_launcher(start)
+        for switch, read, write in ((w.auto_switch, 'auto_update_launcher', m.set_auto_update_launcher),
+                                    (w.offer_switch, 'offer_new_devices', m.set_offer_new_devices)):
+            start = getattr(m, read)
+            switch.toggled.emit(not start)
+            self.assertEqual(getattr(m, read), not start)
+            write(start)
+
+    def _built(self, m, *tids):
+        import json
+        from nspb_qt import shell
+        root = Path(m.shell_cache_path)
+        for tid in tids:
+            fw = root / 'frameworks' / f'DmGame{tid}.framework'
+            fw.mkdir(parents=True, exist_ok=True)
+            (fw / 'game.manifest.json').write_text(json.dumps({'title_id': tid, 'name': 'Game ' + tid[-4:]}))
+            lib = shell.Library.load(root)
+            lib.add(shell.Game(tid, 'Game ' + tid[-4:], str(fw)))
+            lib.save(root)
+
+    def test_transfer_ticks_the_device_games_and_the_chosen_one(self):
+        from nspb_qt.transfer import TransferDialog
+        from nspb_qt.win import device as dv
+        from nspb_qt.win import install as wi
+        m, w = self._window(self._rows(signed_in=True))
+        self._built(m, '0100000000000A00', '0100000000000B00', '0100000000000C00')
+        m.devices = [dv.Device('UDID1', 7, 'USB', 'Jane’s iPhone')]
+        wi.Devices(Path(m.shell_cache_path)).put('UDID1', wi.DeviceState(bundle='org.nxnative.shell.T', signed=1.0,
+                                                                         titles=['0100000000000A00']))
+        started = []
+        m.transfer_games = lambda udid, titles: started.append((udid, titles))
+        d = TransferDialog(m, w, udid='UDID1', preselect=['0100000000000C00'])
+        self.addCleanup(d.deleteLater)
+        self.assertEqual(d.titles(), ['0100000000000A00', '0100000000000C00'])
+        self.assertEqual(d.go_btn.text(), 'Transfer')                 # the device has the app: it is updated
+        self.assertTrue(d.go_btn.isEnabled())
+        d._checks['0100000000000A00'].setChecked(False)
+        self.assertIn('1 game(s) on the device are not ticked', d.hint.text())
+        d._start()
+        self.assertEqual(started, [('UDID1', ['0100000000000C00'])])
+        self.assertTrue(d.active)
+        # closed while it runs: the corner card follows it
+        d.close()
+        self.assertFalse(d.isVisible())
+        w.transfer_toast.follow(d)
+        self.assertTrue(w.transfer_toast.isVisible())
+        self.assertIn('Jane’s iPhone', w.transfer_toast.title.text())
+        m.finished.emit(True, 'Installed on Jane’s iPhone')
+        self.assertFalse(d.active)
+        self.assertEqual(d.finished_ok, True)
+        self.assertEqual(w.transfer_toast.pct.text(), '100%')
+
+    def test_a_new_device_without_the_app_gets_the_question(self):
+        from nspb_qt.win import device as dv
+        m, w = self._window(self._rows(signed_in=True))
+        self._built(m, '0100000000000A00')
+        m.devices = [dv.Device('UDID2', 9, 'USB', 'Kat’s iPad')]
+        m.newDeviceFound.emit('UDID2')
+        d = w._transfer
+        self.assertIsNotNone(d)
+        self.assertTrue(d.new_device)
+        self.assertIn('Kat’s iPad is connected', d.head.text())
+        self.assertEqual(d.titles(), ['0100000000000A00'])        # never installed: every built game is ticked
+        self.assertEqual(d.go_btn.text(), 'Install')
+        d.close()
+
+
+@unittest.skipIf(QApplication is None, 'PySide6 is not installed')
+class SavedChoices(unittest.TestCase):
+    """prod.keys, the output folder, the output mode and the last game last from one start to the next."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_choices_come_back_at_the_next_start(self):
+        from PySide6.QtCore import QSettings
+        from nspb_qt.model import Model
+        tmp = Path(tempfile.mkdtemp())
+        keys = tmp / 'prod.keys'
+        keys.write_text('header_key = 00\n')
+        base = tmp / 'Game [0100ABCD00000000][v0].nsp'
+        base.write_bytes(b'x')
+        out = tmp / 'out'
+        out.mkdir()
+        ini = str(tmp / 'settings.ini')
+
+        def model():
+            with mock.patch.object(Model, 'check_deps', lambda self: None):
+                m = Model()
+            m.settings = QSettings(ini, QSettings.IniFormat)
+            m._persist_choices = True
+            self.addCleanup(m.deleteLater)
+            return m
+        a = model()
+        a.keys_path, a.base_path, a.out_dir, a.game_dir = str(keys), str(base), str(out), str(tmp)
+        a.output_mode, a.ipa_kind, a.bc_on_cpu = 'ipa', 'oneGame', True
+        a.remember_choices()
+        a.settings.sync()
+        b = model()
+        b.restore_choices()
+        self.assertEqual((b.keys_path, b.base_path, b.out_dir, b.game_dir), (str(keys), str(base), str(out), str(tmp)))
+        self.assertEqual((b.ipa_kind, b.bc_on_cpu), ('oneGame', True))
+        # a file that is gone is not brought back, and the games folder is the output when none was chosen
+        keys.unlink()
+        b.settings.setValue('buildOutputDirectory', '')
+        b.library.games_folder = str(tmp)
+        c = model()
+        c.library.games_folder = str(tmp)
+        c.restore_choices()
+        self.assertEqual(c.keys_path, '')
+        self.assertEqual(c.out_dir, str(tmp))
 
 
 if __name__ == '__main__':
