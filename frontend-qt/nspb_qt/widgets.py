@@ -857,6 +857,8 @@ class BigProgress(QWidget):
         col.setSpacing(8)
         top = QHBoxLayout()
         top.setSpacing(10)
+        self.spinner = Spinner(18)
+        top.addWidget(self.spinner)
         self.title = QLabel('')
         self.title.setStyleSheet('font-size: 15px; font-weight: 700;')
         top.addWidget(self.title, 1)
@@ -875,7 +877,10 @@ class BigProgress(QWidget):
         self.detail.setWordWrap(True)
         col.addWidget(self.detail)
 
-    def set_progress(self, title: str, fraction: float, detail: str = '', failed: bool = False) -> None:
+    def set_progress(self, title: str, fraction: float, detail: str = '', failed: bool = False,
+                     busy: bool = False) -> None:
+        """`busy`: work runs now, so the wheel turns even while the percentage stands still."""
+        self.spinner.set_spinning(busy and not failed)
         f = max(0.0, min(1.0, fraction))
         self.title.setText(title)
         self.pct.setText(f'{int(f * 100)}%')
@@ -912,3 +917,61 @@ def overall_fraction(stages, expected: int) -> float:
         elif s.state == 'running':
             done += max(0.0, min(100.0, float(s.percent or 0))) / 100.0
     return min(1.0, done / total)
+
+
+class Spinner(QWidget):
+    """A busy wheel (the Mac's ProgressView): a cream arc turning on a faint ring, for work that has no percentage to
+    show yet. It turns only while spinning and visible. The angle comes from the clock, so a row rebuilt every
+    progress update (the stage list) keeps turning smoothly instead of starting over."""
+
+    PERIOD = 0.9          # seconds per turn
+
+    def __init__(self, size: int = 16, color: str = style.ACCENT, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from PySide6.QtCore import QTimer
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._color = color
+        self._spinning = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self.update)
+        self.hide()
+
+    def set_spinning(self, on: bool) -> None:
+        self._spinning = bool(on)
+        self.setVisible(self._spinning)
+        if self._spinning and not self._timer.isActive():
+            self._timer.start()
+        elif not self._spinning:
+            self._timer.stop()
+
+    def is_spinning(self) -> bool:
+        return self._spinning
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._spinning and not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def paintEvent(self, _event) -> None:
+        import time
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = float(min(self.width(), self.height()))
+        pen_w = max(1.6, w / 8.0)
+        r = QRectF(pen_w / 2 + 0.5, pen_w / 2 + 0.5, w - pen_w - 1, w - pen_w - 1)
+        ring = QColor(self._color)
+        ring.setAlpha(45)
+        pen = QPen(ring, pen_w)
+        p.setPen(pen)
+        p.drawEllipse(r)
+        pen.setColor(QColor(self._color))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        start = -int((time.monotonic() % self.PERIOD) / self.PERIOD * 360 * 16)
+        p.drawArc(r, start, 100 * 16)

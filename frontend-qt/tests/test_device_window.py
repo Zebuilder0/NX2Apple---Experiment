@@ -139,6 +139,31 @@ class DeviceWindow(unittest.TestCase):
             self.assertEqual(getattr(m, read), not start)
             write(start)
 
+    def test_a_wheel_turns_while_work_runs(self):
+        from nspb_qt.widgets import Spinner
+        m, w = self._window(self._rows(signed_in=True))
+        wheel = Spinner(16)
+        self.assertFalse(wheel.is_spinning())
+        wheel.set_spinning(True)
+        self.assertTrue(wheel.is_spinning())
+        wheel.grab()                                   # paints without an error
+        wheel.set_spinning(False)
+        self.assertTrue(wheel.isHidden())
+        # while the check runs (Model.check_deps emits at once: SavedChoices tests it), the panel shows its wheel
+        m.deps_checked = False
+        w._refresh_deps()
+        self.assertTrue(w.deps_spinner.is_spinning())
+        self.assertTrue(w.act_spinner.is_spinning())
+        self.assertFalse(w.recheck_btn.isEnabled())
+        m.deps_checked = True
+        w._refresh_deps()
+        self.assertFalse(w.deps_spinner.is_spinning())
+        # the Apple ID row waits for its sign-in window
+        m.signing_in = True
+        w._refresh_deps()
+        self.assertTrue(any(s.is_spinning() for s in w.device_deps_host.findChildren(Spinner)))
+        m.signing_in = False
+
     def _built(self, m, *tids):
         import json
         from nspb_qt import shell
@@ -205,6 +230,19 @@ class SavedChoices(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_check_again_says_checking_at_once(self):
+        from nspb_qt.model import Model
+        real = Model.check_deps
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        self.addCleanup(m.deleteLater)
+        emitted = []
+        m.depsChanged.connect(lambda: emitted.append(m.deps_checked))
+        with mock.patch.object(Model, 'sync_engine', lambda self: None), \
+                mock.patch('threading.Thread.start', lambda self: None):
+            real(m)
+        self.assertEqual(emitted, [False])          # before the check's thread has done anything
 
     def test_choices_come_back_at_the_next_start(self):
         from PySide6.QtCore import QSettings

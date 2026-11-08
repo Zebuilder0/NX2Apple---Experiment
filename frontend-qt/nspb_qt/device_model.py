@@ -26,8 +26,9 @@ ITUNES_URL = 'https://support.apple.com/en-us/106372'
 #: is on (a local query of Apple's USB service, no network).
 AUTO_POLL_MS = 20_000
 
-#: How long an install waits for a game's banner that is still downloading after its build.
-BANNER_WAIT = 45
+#: How long an install waits for a game's banner that is still downloading after its build. Short: the install
+#: shows it is waiting, and a banner that comes later goes in at the next install.
+BANNER_WAIT = 15
 
 
 class DeviceMixin:
@@ -40,6 +41,7 @@ class DeviceMixin:
         self.devices_note = ''                  # why the list is empty, for the window
         self.install_udid = str(self.settings.value('installDevice', '', type=str) or '')
         self.apple_account = None               # win.signer.Account after a dependency check
+        self.signing_in = False                 # the sign-in window is open (the Apple ID row waits for it)
         self._install_cancel = False
         self._auto_seen: set[str] = set()
         self._auto_busy = False
@@ -119,11 +121,14 @@ class DeviceMixin:
             self.log(self.t('win.sign.fail.missing') + '\n')
             return
         self.log(self.t('win.appleId.opened') + '\n')
+        self.signing_in = True
+        self.depsChanged.emit()
 
         def wait() -> None:
             try:
                 p.wait()
             finally:
+                self.signing_in = False
                 self.check_deps()
         threading.Thread(target=wait, daemon=True).start()
 
@@ -263,7 +268,7 @@ class DeviceMixin:
             try:
                 out = wi.install(Path(self.shell_cache_path), udid, data=data, titles=titles,
                                  log=self.log, stage=stage, cancelled=lambda: self._install_cancel,
-                                 started=started, banner=self._banner_for)
+                                 started=started, banner=self._banner_for, t=self.t)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
                 out = wi.Outcome(False, ('win.install.prepareFailed', str(e)))
             self._proc = None

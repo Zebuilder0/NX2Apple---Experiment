@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import style
-from .widgets import BigProgress, CardGroup, overall_fraction
+from .widgets import BigProgress, CardGroup, Spinner, overall_fraction
 
 #: The install's stages (prepare, sign and install, copy the data): what the bar is the fraction of.
 INSTALL_STAGES = 3
@@ -271,7 +271,7 @@ class TransferDialog(QDialog):
         self.go_btn.hide()
         self.close_btn.setText(self.m.t('win.transfer.hide'))
         self.progress.set_progress(self.m.t('win.transfer.toast', self._device_name()), 0.0,
-                                   self.m.t('win.install.stage.prepare'))
+                                   self.m.t('win.install.stage.prepare'), busy=True)
         self.m.set_install_device(self._udid)
         self.m.transfer_games(self._udid, titles)
 
@@ -296,7 +296,7 @@ class TransferDialog(QDialog):
         if not self.active:
             return
         text, frac, failed = self.stage_text()
-        self.progress.set_progress(self.m.t('win.transfer.toast', self._device_name()), frac, text, failed)
+        self.progress.set_progress(self.m.t('win.transfer.toast', self._device_name()), frac, text, failed, busy=True)
         self.progressed.emit()
 
     def _on_log(self, s: str) -> None:
@@ -362,6 +362,8 @@ class TransferToast(QFrame):
         col.setContentsMargins(16, 12, 12, 14)
         col.setSpacing(6)
         top = QHBoxLayout()
+        self.spinner = Spinner(14)
+        top.addWidget(self.spinner)
         self.title = QLabel('')
         self.title.setStyleSheet('font-weight: 700; background: transparent;')
         top.addWidget(self.title, 1)
@@ -411,6 +413,7 @@ class TransferToast(QFrame):
         self.pct.setStyleSheet(f'font-weight: 700; color: {style.RED if failed else style.ACCENT}; background: transparent;')
         self.bar.setValue(int(frac * 1000))
         self.x_btn.setVisible(d.finished_ok is not None)
+        self.spinner.set_spinning(d.finished_ok is None)
 
     def place(self) -> None:
         p = self.parentWidget()

@@ -479,6 +479,10 @@ class Model(QObject, DeviceMixin, QueueMixin):
 
     def check_deps(self) -> None:
         self.deps_checked = False
+        try:
+            self.depsChanged.emit()      # the window says "Checking…" with its wheel at once, not when the check ends
+        except RuntimeError:
+            pass
         self.sync_engine()   # at the start: a checkout whose engine/ is missing or older than its pin (#214)
         threading.Thread(target=self._check_deps_worker, daemon=True).start()
 

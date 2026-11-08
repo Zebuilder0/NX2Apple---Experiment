@@ -248,6 +248,13 @@ class SharedApp(unittest.TestCase):
             del owner.artwork
             self.assertIsNone(dm.DeviceMixin._banner_for(owner, '0100ABCD00000000'))
 
+    def test_the_signing_step_reads_the_tools_lines(self):
+        self.assertEqual(wi.signer_step('[2026-11-06T10:00:00Z INFO  plumesign] Registering device'), 'Registering device')
+        self.assertEqual(wi.signer_step('$ plumesign sign --package <shared app>'), '')
+        self.assertEqual(wi.signer_step('Installation progress: 50%'), '')
+        self.assertEqual(wi.signer_step('   '), '')
+        self.assertEqual(len(wi.signer_step('x' * 200)), 70)
+
     def test_template_problems(self):
         self.assertIn('Info.plist', shell.template_problem(self.tmp))
         tpl = make_template(self.tmp / 't')
@@ -383,6 +390,10 @@ class InstallEndToEnd(DeviceTestCase):
         joined = ''.join(log)
         self.assertNotIn(self.dev.udid, joined)              # the signer's lines are redacted
         self.assertIn(('win.install.stage.sign', 'done', 'Test iPhone', 100), stages)
+        # while the tool works with Apple, the step shows its latest line instead of standing still at 0 %
+        self.assertIn(('win.install.stage.sign', 'running', 'win.install.contactingApple', 0), stages)
+        self.assertIn(('win.install.stage.sign', 'running', 'Registering device: Test iPhone (<device>)', 0), stages)
+        self.assertIn(('win.install.stage.sign', 'running', '50%', 50), stages)
         state = wi.Devices(self.root).get(self.dev.udid)
         self.assertEqual(state.bundle, SHELL_ID)
         self.assertEqual(out.copied_files, 1)

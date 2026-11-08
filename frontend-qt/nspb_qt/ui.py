@@ -53,6 +53,7 @@ from .widgets import (
     LauncherSegmented,
     LauncherSwitch,
     PlayOnCard,
+    Spinner,
     StatusDot,
     centered_column,
     make_divider,
@@ -1920,6 +1921,8 @@ class MainWindow(QMainWindow):
         dh.setSpacing(10)
         self.device_deps_dot = _dot(style.NEUTRAL_DOT)
         dh.addWidget(self.device_deps_dot)
+        self.device_deps_spinner = Spinner(14)
+        dh.addWidget(self.device_deps_spinner)
         dcol = QVBoxLayout()
         dcol.setSpacing(2)
         self.device_deps_toggle = QPushButton(self._disclosure_text('win.settings.signing', self._device_deps_open))
@@ -2038,6 +2041,8 @@ class MainWindow(QMainWindow):
         dh.setSpacing(10)
         self.deps_dot = _dot(style.NEUTRAL_DOT)
         dh.addWidget(self.deps_dot)
+        self.deps_spinner = Spinner(14)
+        dh.addWidget(self.deps_spinner)
         self.deps_title = QLabel(self.m.t('dep.title'))
         self.deps_title.setObjectName('rowTitle')
         dh.addWidget(self.deps_title)
@@ -2327,6 +2332,8 @@ class MainWindow(QMainWindow):
 
         self.act_dot = StatusDot(style.NEUTRAL_DOT, size=7)
         row.addWidget(self.act_dot)
+        self.act_spinner = Spinner(14)
+        row.addWidget(self.act_spinner)
 
         self.act_title = QLabel(self.m.t('library.localNote'))
         self.act_title.setStyleSheet('font-size: 12px; font-weight: 600;')
@@ -2365,6 +2372,9 @@ class MainWindow(QMainWindow):
         return bar
 
     def _refresh_activity_bar(self) -> None:
+        busy = self.m.running or not self.m.deps_checked or getattr(self.m, 'signing_in', False)
+        self.act_spinner.set_spinning(busy)
+        self.act_dot.setVisible(not busy)
         if self.m.running:
             self.act_dot.set_color(style.AMBER)
             if self._build_run:
@@ -2386,7 +2396,12 @@ class MainWindow(QMainWindow):
         else:
             self.act_dot.set_color(style.GREEN if self.m.can_build else style.NEUTRAL_DOT)
             self.act_title.setText(self.m.t('library.localNote'))
-            self.act_detail.setText(self.footer.text())
+            if not self.m.deps_checked:
+                self.act_detail.setText(self.m.t('dep.checking'))
+            elif getattr(self.m, 'signing_in', False):
+                self.act_detail.setText(self.m.t('win.appleId.waiting'))
+            else:
+                self.act_detail.setText(self.footer.text())
             self.act_progress.hide()
             self.act_pct.hide()
             self.act_view_btn.hide()
@@ -2536,11 +2551,15 @@ class MainWindow(QMainWindow):
                     old.deleteLater()
         self._refresh_device_deps()
 
-        if not self.m.deps_checked:
-            _set_dot(self.deps_dot, style.NEUTRAL_DOT)
+        checking = not self.m.deps_checked
+        self.deps_spinner.set_spinning(checking)
+        self.deps_dot.setVisible(not checking)
+        self.recheck_btn.setEnabled(not checking)
+        if checking:
             self.deps_summary.setText(t('dep.checking'))
             self.install_all_btn.hide()
             self._refresh_running()
+            self._refresh_activity_bar()
             return
         if not self.m.deps:
             _set_dot(self.deps_dot, style.RED)
@@ -2582,8 +2601,11 @@ class MainWindow(QMainWindow):
         rows = [d for d in self.m.deps if d.id in DEVICE_DEP_IDS]
         self.device_deps_toggle.setText(self._disclosure_text('win.settings.signing', self._device_deps_open))
         self.device_recheck_btn.setText(t('dep.recheck'))
-        if not self.m.deps_checked:
-            _set_dot(self.device_deps_dot, style.NEUTRAL_DOT)
+        checking = not self.m.deps_checked
+        self.device_deps_spinner.set_spinning(checking)
+        self.device_deps_dot.setVisible(not checking)
+        self.device_recheck_btn.setEnabled(not checking)
+        if checking:
             self.device_deps_summary.setText(t('dep.checking'))
         else:
             missing = sum(1 for d in rows if not d.ok)
@@ -2631,6 +2653,13 @@ class MainWindow(QMainWindow):
             b = QPushButton(t('win.dep.amds.get'))
             b.clicked.connect(self.m.open_itunes_page)
             r.addWidget(b)
+        elif d.id == 'apple_id' and getattr(self.m, 'signing_in', False):
+            wheel = Spinner(14)          # the sign-in window is open: this row waits for it
+            wheel.set_spinning(True)
+            r.addWidget(wheel)
+            wait = QLabel(t('win.appleId.waiting'))
+            wait.setObjectName('muted')
+            r.addWidget(wait)
         elif d.id == 'apple_id' and any(x.id == 'signer' and x.ok for x in self.m.deps):
             b = QPushButton(t('win.dep.appleId.signOut' if d.ok else 'win.dep.appleId.signIn'))
             b.clicked.connect(self.m.sign_out_apple_id if d.ok else self.m.sign_in_apple_id)
@@ -2793,7 +2822,12 @@ class MainWindow(QMainWindow):
                 'running': style.AMBER,
                 'failed': style.RED,
             }.get(st.state, style.NEUTRAL_DOT)
-            r.addWidget(_dot(color))
+            if st.state == 'running' and self.m.running:
+                wheel = Spinner(12)          # what runs now turns, whether or not it has a percentage
+                wheel.set_spinning(True)
+                r.addWidget(wheel)
+            else:
+                r.addWidget(_dot(color))
             name = QLabel(st.name)
             if st.state == 'running':
                 name.setStyleSheet('font-weight: 700;')
@@ -2829,7 +2863,7 @@ class MainWindow(QMainWindow):
             title = t('activity.ios') if self._build_run else t('win.transfer.running')
             cur = running or stages[-1]
             detail = cur.name + (' · ' + cur.detail if cur.detail else '')
-            self.big_progress.set_progress(title, self._run_fraction(), detail)
+            self.big_progress.set_progress(title, self._run_fraction(), detail, busy=True)
         elif failed is not None or self._failed:
             self.big_progress.set_progress(t('win.progress.failed'), self._run_fraction(),
                                            failed.name if failed else '', True)

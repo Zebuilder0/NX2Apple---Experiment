@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +116,18 @@ def needs_update(state: DeviceState | None, current: str, now: float | None = No
 
 data_stamp = shell.data_stamp
 
+_LOG_PREFIX = re.compile(r'^\[[^\]]*\]\s*')
+
+
+def signer_step(line: str) -> str:
+    """What the signing tool is doing, from one of its (redacted) log lines, for the step's detail: its message
+    without the time and level, '' for the command echo, the progress lines (the percentage shows those) and blank
+    lines."""
+    text = _LOG_PREFIX.sub('', line.strip())
+    if not text or text.startswith('$ ') or text.lower().startswith('installation progress'):
+        return ''
+    return text if len(text) <= 70 else text[:69] + '…'
+
 
 Callback = Callable[..., None]
 
@@ -126,7 +139,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
             cancelled: Callable[[], bool] = lambda: False,
             started: Callable[[object], None] | None = None,
             template: Path | None = None, signer_exe: Path | None = None,
-            banner: Callable[[str], str | None] | None = None) -> Outcome:
+            banner: Callable[[str], str | None] | None = None,
+            t: Callable[..., str] = lambda key, *a: key) -> Outcome:
     """Sign and install the shared app on `udid`, then copy each `(title ID, game data folder)`
     of `data`: by default every game's data the device has not received yet (`shell.pending_data`).
     `titles` are the games the app holds (a game left out is removed from the app on the device); by default the
@@ -171,8 +185,14 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
 
     # 1. the app with every game in it
     stage('win.install.stage.prepare', 'running', '', 0)
+    names = {g.titleID: g.name for g in games}
+
+    def artwork(title_id: str) -> str | None:
+        # a banner may still be downloading: the step says what it waits for instead of standing still
+        stage('win.install.stage.prepare', 'running', t('win.install.gettingArt', names.get(title_id, title_id)), 0)
+        return banner(title_id) if banner else None
     try:
-        app = shell.assemble(root, template, games, banner)
+        app = shell.assemble(root, template, games, artwork if banner else None)
     except (OSError, ValueError) as e:
         stage('win.install.stage.prepare', 'failed', str(e), 0)
         return Outcome(False, ('win.install.prepareFailed', str(e)))
@@ -181,10 +201,21 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     if cancelled():
         return Outcome(False, ('msg.stopped',))
 
-    # 2. sign and install
-    stage('win.install.stage.sign', 'running', name, 0)
-    r = signer.sign_and_install(app, dev.device_id, log=log, exe=exe, started=started,
-                                progress=lambda p: stage('win.install.stage.sign', 'running', f'{p}%', p))
+    # 2. sign and install. The signing tool talks to Apple for a while before it installs anything: the step shows
+    # the tool's own latest line, so the window moves while the percentage cannot.
+    stage('win.install.stage.sign', 'running', t('win.install.contactingApple'), 0)
+    last_pct = [0]
+
+    def on_progress(p: int) -> None:
+        last_pct[0] = p
+        stage('win.install.stage.sign', 'running', f'{p}%', p)
+
+    def sign_log(text: str) -> None:
+        log(text)
+        step = signer_step(text)
+        if step:
+            stage('win.install.stage.sign', 'running', step, last_pct[0])
+    r = signer.sign_and_install(app, dev.device_id, log=sign_log, exe=exe, started=started, progress=on_progress)
     if not r.ok:
         last = next((ln for ln in reversed(r.output.splitlines()) if ln.strip()), '')
         stage('win.install.stage.sign', 'failed', last[:160], 0)
