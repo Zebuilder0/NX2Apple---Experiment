@@ -31,6 +31,25 @@ EXE = 'plumesign.exe' if os.name == 'nt' else 'plumesign'
 
 #: How long one sign-and-install may take (a big shared app over a slow cable).
 SIGN_TIMEOUT = 40 * 60
+#: After the tool exits, how long its last output may take to arrive (a program it started may still hold the pipe).
+OUTPUT_GRACE = 10
+
+
+def end_tree(p: subprocess.Popen) -> None:
+    """End the tool and every program it started: taskkill /T on Windows, the process group elsewhere (sign_and_install
+    starts it in its own). A plain kill left a child holding the output pipe, and the run waited for it."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True, timeout=30, **_no_window())
+        else:
+            import signal
+            os.killpg(p.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        p.kill()
+    except OSError:
+        pass
 
 
 def data_dir() -> Path:
@@ -228,41 +247,41 @@ def sign_and_install(app: Path, device_id: int | str, *, log: Callable[[str], No
     cmd = sign_command(exe, app, device_id)
     log('$ plumesign sign --package <shared app> --apple-id --udid <device> --register-and-install\n')
     try:
+        # its own process group on macOS and Linux (the tests' pretend signer): the time limit ends it with whatever it
+        # started. Windows ends the tree with taskkill /T (end_tree).
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, text=True, encoding='utf-8',
-                             errors='replace', env=child_env(), **_no_window())
+                             errors='replace', env=child_env(), start_new_session=os.name != 'nt', **_no_window())
     except OSError as e:
         return Result(False, str(e), 'win.sign.fail.missing')
     if started:
         started(p)
-    # The limit is a watchdog that runs beside the reading: the loop below only ends when the tool closes its output,
-    # which a hung tool (a stalled connection, a question it cannot ask) never does, so a wait after the loop never
-    # got the chance to time out.
-    timed_out = threading.Event()
-
-    def overdue() -> None:
-        timed_out.set()
-        try:
-            p.kill()
-        except OSError:
-            pass
-    watchdog = threading.Timer(SIGN_TIMEOUT, overdue)
-    watchdog.daemon = True
-    watchdog.start()
+    # The output is read on a thread of its own and the limit is a wait on the process: reading in this thread ends only
+    # when every holder of the pipe has closed it, which a hung tool never does (the old wait after the read loop never
+    # got the chance to time out), and which a program the tool started can keep from happening after the tool is ended.
     tail: list[str] = []
     assert p.stdout is not None
+
+    def read() -> None:
+        nonlocal tail
+        try:
+            for line in p.stdout:
+                clean = redact(line.rstrip('\n'))
+                tail = (tail + [clean])[-60:]
+                log(clean + '\n')
+                if progress and (m := _PROGRESS.search(line)):
+                    progress(int(m.group(1)))
+        except (OSError, ValueError):
+            pass                      # the pipe was closed under the reader: the run is over
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
     try:
-        for line in p.stdout:
-            clean = redact(line.rstrip('\n'))
-            tail = (tail + [clean])[-60:]
-            log(clean + '\n')
-            if progress and (m := _PROGRESS.search(line)):
-                progress(int(m.group(1)))
-        p.wait()
-    finally:
-        watchdog.cancel()
-    if timed_out.is_set():
+        p.wait(timeout=SIGN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        end_tree(p)
+        reader.join(5)
         return Result(False, 'the signing tool did not finish in time', 'win.sign.fail.network')
+    reader.join(OUTPUT_GRACE)         # what the tool wrote before it exited; not forever if a child keeps the pipe
     out = '\n'.join(tail)
     ok = p.returncode == 0 and 'Installation complete' in out
     return Result(ok, out, '' if ok else classify(out))

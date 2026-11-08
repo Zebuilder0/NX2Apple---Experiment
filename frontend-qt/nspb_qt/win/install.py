@@ -356,6 +356,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         except dv.Cancelled:
             return stop('win.install.stage.data', bundle, copied)
         except dv.DeviceError as e:
+            if cancelled():         # Stop came, and the copy ended with another error on its way out: still a stop
+                return stop('win.install.stage.data', bundle, copied)
             stage('win.install.stage.data', 'failed', str(e)[:160], 0)
             return Outcome(False, ('win.install.dataFailed', str(e)), 'win.install.dataFailed.next', bundle)
         plan.finish(number, game_bytes)

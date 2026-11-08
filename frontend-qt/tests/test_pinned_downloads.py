@@ -5,7 +5,6 @@ network, no PySide6.
 """
 from __future__ import annotations
 
-import re
 import sys
 import tempfile
 import unittest

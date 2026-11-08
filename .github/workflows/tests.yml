@@ -348,7 +348,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 > /dev/null
-          python -m pip install PySide6-Essentials==6.12.0
+          # with the packages the Windows app's build venv uses (the versions build-qt.yml ships): the multi-core NSO
+          # rewrite (win/mp_worker.py) needs capstone and lz4, and its tests run here
+          python -m pip install PySide6-Essentials==6.12.0 lz4==4.4.5 capstone==5.0.9
       - name: Engine (tools/engine.py sync, issue #214; some tests read engine/)
         run: python tools/engine.py sync
       - name: Tests

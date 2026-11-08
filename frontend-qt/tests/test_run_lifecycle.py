@@ -6,7 +6,6 @@ closed. The install part needs no PySide6; the model part runs offscreen with it
 """
 from __future__ import annotations
 
-import json
 import os
 import plistlib
 import subprocess
@@ -92,6 +91,22 @@ class InstallStop(unittest.TestCase):
         self.assertTrue(out.stopped)
         self.assertEqual(out.failure, '')
 
+    def test_a_stop_that_ends_the_copy_with_another_error_is_still_a_stop(self):
+        flag = []
+
+        def copy(*a, **k):
+            flag.append(1)
+            raise dv.DeviceError('the device connection closed')
+        out = self.run_install(lambda: bool(flag), copy=copy)
+        self.assertTrue(out.stopped)
+
+    def test_a_copy_error_without_a_stop_is_a_failure(self):
+        def copy(*a, **k):
+            raise dv.DeviceError('the device connection closed')
+        out = self.run_install(lambda: False, copy=copy)
+        self.assertFalse(out.stopped)
+        self.assertEqual(out.message[0], 'win.install.dataFailed')
+
     def test_a_stop_during_signing_is_a_stop(self):
         out = self.run_install(lambda: True, sign_ok=False)
         self.assertTrue(out.stopped)
@@ -114,12 +129,13 @@ class SignerTimeLimit(unittest.TestCase):
     def test_a_signer_that_hangs_is_ended_at_the_limit(self):
         tmp = Path(tempfile.mkdtemp())
         hang = tmp / 'plumesign'
-        hang.write_text('#!/bin/sh\necho start\nexec sleep 30\n')
+        # the shell starts sleep as a child that holds the output pipe: ending the shell alone kept the run waiting
+        hang.write_text('#!/bin/sh\necho start\nsleep 30\necho late\n')
         hang.chmod(0o755)
         t0 = time.time()
         with mock.patch.object(signer, 'SIGN_TIMEOUT', 1):
             r = signer.sign_and_install(tmp / 'DmShell.app', 3, exe=hang)
-        self.assertLess(time.time() - t0, 10, 'the time limit did not end the signing tool')
+        self.assertLess(time.time() - t0, 8, 'the time limit did not end the signing tool and what it started')
         self.assertFalse(r.ok)
         self.assertEqual(r.failure, 'win.sign.fail.network')
         self.assertIn('did not finish in time', r.output)
