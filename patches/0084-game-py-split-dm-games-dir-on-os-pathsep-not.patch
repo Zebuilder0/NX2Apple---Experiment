@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 8 Nov 2026 03:33:54 +0000
+Subject: [PATCH] game.py: split DM_GAMES_DIR on os.pathsep, not ':'
+
+The NSP script joins DM_GAMES_DIR with os.pathsep (it puts a provisional or derived profile's folder
+first), and patch_nso.py splits it the same way. game.py split it on ':', which is os.pathsep on
+macOS and Linux but not on Windows, where the separator is ';' and ':' follows the drive letter.
+On Windows "D:\Games\<id>_build\profile" became "D" and "\Games\<id>_build\profile", so a derived
+profile (an update the profile does not register) was never found. Every tool silently used the
+registered profile, and the build then stopped in report_profile_status with
+KeyError: 'v1376256', because the registered profile has no build row for that version (Mario
+Kart 8 Deluxe 3.0.x, built for the iOS shell from Windows).
+
+Upstream-Status: pending
+Reason: Windows builds of a derived or provisional profile used the registered profile and stopped with a KeyError
+Issue: none yet (found building Mario Kart 8 Deluxe v1376256 on Windows, Zebuilder0/NX2Apple---Experiment claude/sharp-mayer-avybc7)
+---
+ dm/games/game.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/dm/games/game.py b/dm/games/game.py
+index cb28a9e..1c49803 100644
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -4,7 +4,7 @@
+ #   game.py modules <id> <folder of rewritten modules> (the modules to load from it: the build row of its main's build, else the profile's modules);
+ #   game.py dir <id> (print the profile folder); game.py link <id> <link> (point a symlink at the profile folder: make cannot take paths with spaces)
+ #   From Python: import game; g = game.load() (takes DM_GAME; there is no default game: unset is an error that lists the profiles); game.by_title(title ID); g.get / g.words / g.int / g.builds() / g.table(file name)
+-# DM_GAMES_DIR (folders separated by ':') adds profile folders outside the repository, searched after dm/games: the NSP script writes a provisional profile for a game without one into
++# DM_GAMES_DIR (folders separated by os.pathsep: ':', ';' on Windows) adds profile folders outside the repository, searched after dm/games: the NSP script writes a provisional profile for a game without one into
+ #   <NSP folder>/<id>_build/profile/<id>/ and points DM_GAMES_DIR at <id>_build/profile, so the shader tools, the host build and build_ipa.sh all find it.
+ #   DM_GAMES_FIRST=1 searches DM_GAMES_DIR before dm/games (the NSP script's --provisional: a provisional profile for a game that has one in dm/games, to test the guesses)
+ import os, re, sys
+@@ -60,7 +60,8 @@ class Game:
+ 
+ 
+ def extra_dirs():   # profile folders outside the repository (DM_GAMES_DIR), searched after dm/games
+-    return [Path(p) for p in os.environ.get('DM_GAMES_DIR', '').split(':') if p]
++    # os.pathsep, as the NSP script and patch_nso.py write and read it: ':' split a Windows path at its drive letter
++    return [Path(p) for p in os.environ.get('DM_GAMES_DIR', '').split(os.pathsep) if p]
+ 
+ 
+ def search_dirs():   # dm/games, then DM_GAMES_DIR; DM_GAMES_FIRST=1 the other way round

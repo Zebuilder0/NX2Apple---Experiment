@@ -50,6 +50,23 @@ class FrameworkSources(unittest.TestCase):
             build_app.framework_sources(tmp)
 
 
+@unittest.skipUnless(HAS_ENGINE, 'no engine/: run python3 tools/engine.py sync')
+class ProfileFoldersOnWindows(unittest.TestCase):
+    """The NSP script puts a derived profile's folder in DM_GAMES_DIR joined with os.pathsep (';' on Windows), and game.py
+    must split it the same way: ':' cut "D:\\Games\\<id>_build\\profile" at the drive letter, every tool took the registered
+    profile, and the build stopped with KeyError: 'v1376256' (patches/0084)."""
+
+    def test_a_windows_list_keeps_its_drive_letters(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('engine_game_py', ENGINE / 'dm' / 'games' / 'game.py')
+        game = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(game)
+        with mock.patch.object(game.os, 'pathsep', ';'), \
+                mock.patch.dict(os.environ, {'DM_GAMES_DIR': r'D:\Games\0100152000022000_build\profile;E:\more'}):
+            self.assertEqual([str(p) for p in game.extra_dirs()],
+                             [str(Path(r'D:\Games\0100152000022000_build\profile')), str(Path(r'E:\more'))])
+
+
 class LauncherGuard(unittest.TestCase):
     def test_the_framework_keeps_the_menu_and_leaves_the_launcher_out(self):
         src = (QT / 'nspb_qt' / 'win' / 'ios' / 'Launcher.m').read_text(encoding='utf-8')
