@@ -8,6 +8,7 @@ import json
 import os
 import plistlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -95,6 +96,30 @@ class DylibLink(unittest.TestCase):
         self.assertNotIn('-Wl,-rpath,@executable_path/Frameworks', args)
         self.assertEqual(check.call_args[0][1], build_app.MH_DYLIB)
         sign.assert_not_called()
+
+    def test_the_objects_go_in_a_file_list_not_the_command_line(self):
+        # 267 objects under a long build folder passed Windows' 32,767-character limit (WinError 206)
+        folder = 'D:\\Local-Switch\\Switch Games\\3rd Party\\Snipperclips\\0100704000B3A000_build\\obj\\dm\\host'
+        objs = [Path(f'{folder}\\module_{i:03}_with_a_long_name.o') for i in range(267)]
+        seen = {}
+
+        def run(args, **kw):
+            seen['args'] = args
+            fl = args[args.index('-filelist') + 2]
+            seen['list'] = Path(fl).read_text(encoding='utf-8')
+            seen['path'] = fl
+            return mock.Mock(returncode=0, stdout='', stderr='')
+        with mock.patch.object(build_app.subprocess, 'run', side_effect=run), \
+                mock.patch.object(build_app, 'check_executable'), \
+                mock.patch.object(build_app.macho_sign, 'sign', return_value=0):
+            build_app.link(Path('clang'), Path('sdk'), objs, ['UIKit'], Path('out/DmIOS'), '26.0', [], None, None)
+        args = seen['args']
+        self.assertEqual(args[args.index('-filelist') - 1], '-Xlinker')
+        self.assertEqual(args[args.index('-filelist') + 1], '-Xlinker')
+        self.assertEqual(seen['list'].splitlines(), [str(o) for o in objs])
+        self.assertFalse(any(str(o) in args for o in objs))
+        self.assertLess(len(subprocess.list2cmdline(args)), 2000)
+        self.assertFalse(Path(seen['path']).exists())       # removed after the link
 
     def test_info_plist_is_a_framework(self):
         p = build_app.framework_info_plist(executable='DmGameX', bundle_id='org.nxnative.x.game', name='X',

@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -473,8 +474,16 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     entitle = os.environ.get('NSPB_ENTITLEMENTS', '1') != '0' and not dylib_install_name
     kind = (('-dynamiclib', f'-Wl,-install_name,{dylib_install_name}', '-Wl,-adhoc_codesign')
             if dylib_install_name else ('-Wl,-rpath,@executable_path/Frameworks',))
+    # The objects go to the linker in a file list (ld64's -filelist, one path per line, which lld
+    # reads), not on the command line: Windows starts no program whose command line is longer
+    # than 32,767 characters, and 267 objects under a long build folder ("D:\...\3rd Party\
+    # Snipperclips\<id>_build\obj\...") stopped the link with "[WinError 206] The filename or
+    # extension is too long". -Xlinker keeps a comma in the list's path from splitting it.
+    fd, filelist = tempfile.mkstemp(prefix='nspb-link-', suffix='.filelist')
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+        f.writelines(f'{o}\n' for o in objs)
     args = [str(clang), '-target', f'arm64-apple-ios{deployment}', '-isysroot', str(sdk),
-            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out), *map(str, objs),
+            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out), '-Xlinker', '-filelist', '-Xlinker', filelist,
             *kind, '-lobjc', '-lSystem',
             *(('-Wl,-adhoc_codesign',) if entitle else ()),
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
@@ -484,7 +493,10 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     if lld_dir:
         env['PATH'] = str(lld_dir) + os.pathsep + env.get('PATH', '')
     t(f'link: {len(objs)} objects, {len(frameworks)} frameworks (ld64.lld)')
-    r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
+    finally:
+        os.unlink(filelist)
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('link failed (see the linker output above)')
