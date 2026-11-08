@@ -26,6 +26,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 APP_NAME = 'DmShell.app'
 EXECUTABLE = 'DmShell'
@@ -191,10 +192,31 @@ def template_version(app: Path) -> str:
         return ''
 
 
-def assemble(root: Path, template: Path, games: list[Game]) -> Path:
+#: The pictures the app's library reads beside a framework (ShellHost GameCatalogue.imageExtensions)
+BANNER_EXTS = ('png', 'jpg', 'jpeg', 'heic', 'webp')
+
+
+def place_banner(framework: Path, source: str | None) -> str | None:
+    """The 16:9 picture the app's library shows for a game, as `<framework>/banner.<ext>`: the
+    player's own pick, else the eShop banner the launcher caches (the Mac launcher's
+    ShellInstall.placeBanner). Without one, an older banner goes and the library shows the
+    framework's square icon.png. Returns the picture used."""
+    framework = Path(framework)
+    for ext in BANNER_EXTS:
+        (framework / f'banner.{ext}').unlink(missing_ok=True)
+    if not source or not os.path.isfile(source):
+        return None
+    ext = Path(source).suffix.lower().lstrip('.')
+    shutil.copyfile(source, framework / f'banner.{ext if ext in BANNER_EXTS else "jpg"}')
+    return source
+
+
+def assemble(root: Path, template: Path, games: list[Game],
+             banner: 'Callable[[str], str | None] | None' = None) -> Path:
     """`<root>/stage/DmShell.app`: a fresh copy of the empty app with every game's framework in
-    `Frameworks/`. Always from the template, never from an earlier signed copy: the signer adds
-    the team ID to the bundle ID, and signing a signed copy would add it twice."""
+    `Frameworks/`, each with its banner (`banner(title ID)` → a picture, as the Mac launcher puts
+    it in). Always from the template, never from an earlier signed copy: the signer adds the team
+    ID to the bundle ID, and signing a signed copy would add it twice."""
     if not games:
         raise ValueError('no game is built for the shared app yet')
     stage = Path(root) / 'stage'
@@ -209,6 +231,11 @@ def assemble(root: Path, template: Path, games: list[Game]) -> Path:
     for g in games:
         src = Path(g.framework)
         shutil.copytree(src, fw_dir / src.name)
+        if banner:
+            try:
+                place_banner(fw_dir / src.name, banner(g.titleID))
+            except OSError:          # a picture that cannot be copied leaves the icon, not a failed install
+                pass
     return app
 
 

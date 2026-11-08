@@ -183,6 +183,54 @@ class SharedApp(unittest.TestCase):
         self.assertEqual(shell.pending_data(root, [a, b], {}), [(a.titleID, da)])
         self.assertEqual(shell.pending_data(self.tmp / 'none', [a], {}), [])
 
+    def test_each_game_gets_its_banner_as_the_mac_puts_it(self):
+        root = self.tmp / 'root'
+        built = make_framework(self.tmp / 'w' / 'shell-framework', '0100ABCD00000000', 'Zelda')
+        shell.add_built_game(root, built)
+        make_framework(self.tmp / 'w2' / 'shell-framework', '0100EEEE00000000', 'Other')
+        shell.add_built_game(root, self.tmp / 'w2' / 'shell-framework' / 'DmGame0100EEEE00000000.framework')
+        art = self.tmp / 'zelda.png'
+        art.write_bytes(b'png bytes')
+        odd = self.tmp / 'odd.bmp'
+        odd.write_bytes(b'bmp')
+        pics = {'0100ABCD00000000': str(art), '0100EEEE00000000': None}
+        app = shell.assemble(root, make_template(self.tmp / 'tpl'), shell.Library.load(root).present(), pics.get)
+        fw = app / 'Frameworks'
+        self.assertEqual((fw / 'DmGame0100ABCD00000000.framework' / 'banner.png').read_bytes(), b'png bytes')
+        self.assertFalse(any((fw / 'DmGame0100EEEE00000000.framework').glob('banner.*')))   # no picture: the icon shows
+        # an old banner goes, and a picture of another kind is named .jpg (ShellInstall.placeBanner)
+        target = fw / 'DmGame0100EEEE00000000.framework'
+        (target / 'banner.webp').write_bytes(b'old')
+        self.assertEqual(shell.place_banner(target, str(odd)), str(odd))
+        self.assertEqual(sorted(p.name for p in target.glob('banner.*')), ['banner.jpg'])
+        self.assertIsNone(shell.place_banner(target, None))
+        self.assertFalse(any(target.glob('banner.*')))
+
+    def test_banner_waits_for_a_download_still_running(self):
+        from unittest import mock
+        from nspb_qt import device_model as dm
+
+        class Art:
+            def __init__(self, ready_after):
+                self.calls, self.ready_after, self._fetching = 0, ready_after, set()
+            def image_path(self, tid, repo=''):
+                self.calls += 1
+                return '/art.jpg' if self.ready_after is not None and self.calls > self.ready_after else None
+            def request_banner_async(self, tid):
+                self._fetching.add(tid.upper())
+
+        owner = type('Owner', (), {'engine_path': ''})()
+        with mock.patch.object(dm.time, 'sleep'):
+            owner.artwork = Art(ready_after=2)          # cached on the second look after the request
+            self.assertEqual(dm.DeviceMixin._banner_for(owner, '0100abcd00000000'), '/art.jpg')
+            owner.artwork = Art(ready_after=None)       # a download that ends without a picture
+            owner.artwork._fetching = set()
+            owner.artwork.request_banner_async = lambda tid: None
+            self.assertIsNone(dm.DeviceMixin._banner_for(owner, '0100ABCD00000000'))
+            self.assertEqual(owner.artwork.calls, 2)    # it stops at once, not after BANNER_WAIT
+            del owner.artwork
+            self.assertIsNone(dm.DeviceMixin._banner_for(owner, '0100ABCD00000000'))
+
     def test_template_problems(self):
         self.assertIn('Info.plist', shell.template_problem(self.tmp))
         tpl = make_template(self.tmp / 't')

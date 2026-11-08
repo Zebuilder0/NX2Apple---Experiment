@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import webbrowser
 import zipfile
 from pathlib import Path
@@ -24,6 +25,9 @@ ITUNES_URL = 'https://support.apple.com/en-us/106372'
 #: How often a connected device is looked for while "Update the launcher when a device connects"
 #: is on (a local query of Apple's USB service, no network).
 AUTO_POLL_MS = 20_000
+
+#: How long an install waits for a game's banner that is still downloading after its build.
+BANNER_WAIT = 45
 
 
 class DeviceMixin:
@@ -207,7 +211,7 @@ class DeviceMixin:
             try:
                 out = wi.install(Path(self.shell_cache_path), udid, data=data,
                                  log=self.log, stage=stage, cancelled=lambda: self._install_cancel,
-                                 started=started)
+                                 started=started, banner=self._banner_for)
             except Exception as e:      # a bug must end the run visibly, not leave it "running"
                 out = wi.Outcome(False, ('win.install.prepareFailed', str(e)))
             self._proc = None
@@ -219,6 +223,26 @@ class DeviceMixin:
             self.log(note + '\n')       # the footer is one line: the log keeps the whole note
             self.finished.emit(out.ok, note)
         threading.Thread(target=work, daemon=True).start()
+
+    def _banner_for(self, title_id: str) -> str | None:
+        """The game's picture for the app's library: what this launcher's own library shows (the
+        player's pick, the cached eShop banner, the engine's gallery picture). Right after a build the
+        banner may still be downloading (request_banner_async): it waits for it a little."""
+        art = getattr(self, 'artwork', None)
+        if art is None:
+            return None
+        path = art.image_path(title_id, self.engine_path)
+        if path:
+            return path
+        art.request_banner_async(title_id)
+        deadline = time.time() + BANNER_WAIT
+        while time.time() < deadline:
+            time.sleep(1)
+            if path := art.image_path(title_id, self.engine_path):
+                return path
+            if title_id.upper() not in getattr(art, '_fetching', ()):
+                break                       # the download ended without a picture
+        return None
 
     def cancel_install(self) -> None:
         self._install_cancel = True
@@ -295,7 +319,7 @@ class DeviceMixin:
         root = Path(self.shell_cache_path)
         games = shell.Library.load(root).present()
         try:
-            app = shell.assemble(root, tpl, games)
+            app = shell.assemble(root, tpl, games, self._banner_for)
             write_ipa(app, Path(dest))
         except (OSError, ValueError) as e:
             return False, self.t('shell.exportFailed', str(e))

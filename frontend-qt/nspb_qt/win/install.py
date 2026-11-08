@@ -114,7 +114,8 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
             stage: Callable[[str, str, str, float], None] = lambda *a: None,
             cancelled: Callable[[], bool] = lambda: False,
             started: Callable[[object], None] | None = None,
-            template: Path | None = None, signer_exe: Path | None = None) -> Outcome:
+            template: Path | None = None, signer_exe: Path | None = None,
+            banner: Callable[[str], str | None] | None = None) -> Outcome:
     """Sign and install the shared app on `udid`, then copy each `(title ID, game data folder)`
     of `data`: by default every game's data the device has not received yet (`shell.pending_data`).
     `stage(key, state, detail, percent)` reports the steps: key is an en.json key, state
@@ -148,7 +149,7 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
     # 1. the app with every game in it
     stage('win.install.stage.prepare', 'running', '', 0)
     try:
-        app = shell.assemble(root, template, games)
+        app = shell.assemble(root, template, games, banner)
     except (OSError, ValueError) as e:
         stage('win.install.stage.prepare', 'failed', str(e), 0)
         return Outcome(False, ('win.install.prepareFailed', str(e)))
