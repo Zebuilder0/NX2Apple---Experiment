@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]

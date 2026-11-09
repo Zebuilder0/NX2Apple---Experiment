@@ -24,8 +24,10 @@ from . import inputs
 from . import library as lib
 from . import platform_util as pu
 from . import romfs_languages
+from .device_model import DeviceMixin
 from .i18n import Lang
 from .l10n import t
+from .signals import emit_safely
 
 
 # ---------------------------------------------------------------- dependency rows
@@ -66,10 +68,70 @@ class Dep:
 @dataclass
 class Stage:
     name: str
-    state: str = 'pending'      # pending | running | done | failed
+    state: str = 'pending'      # pending | running | done | failed | stopped (the player stopped the run there)
     detail: str = ''
     percent: float = 0.0
     id: int = 0
+
+
+def app_settings() -> QSettings:
+    """The launcher's settings: the player's own, or an ini file in NSPB_STATE_DIR when that is set (a portable copy,
+    the tests' sandbox, tests/qt_sandbox.py), so the settings always live with the rest of the state
+    (library.default_state_dir)."""
+    state = os.environ.get('NSPB_STATE_DIR')
+    ini = getattr(QSettings, 'IniFormat', None)
+    if state and ini is not None:
+        return QSettings(str(Path(state) / 'settings.ini'), ini)
+    return QSettings('NS Port Builder', 'NSPortBuilder')
+
+
+def end_process_tree(p: subprocess.Popen) -> None:
+    """End `p` and what it started: on Windows `taskkill /T` (the build script's tools inherit its output pipe, and a
+    plain terminate left them running and the read of that pipe waiting for them), elsewhere terminate."""
+    try:
+        if p.poll() is not None:
+            return
+    except OSError:
+        return
+    if pu.IS_WIN:
+        try:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(p.pid)], capture_output=True, timeout=30,
+                           **pu.no_window_kwargs())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        p.terminate()
+    except OSError:
+        pass
+
+
+#: What the Older devices switch writes into a build's env file: the engine reads DM_PROF_<key> for its profile keys
+#: (dm/host/hle_profile.c read_env), and tex_bc_cpu decodes BC textures on the CPU where the GPU cannot (A16 and
+#: earlier, iPads before the M1). The framework keeps the file as dm/env.txt and the app applies it when the game
+#: starts. It changes nothing on a GPU with BC textures, so one build plays on every device. (The Mac launcher writes
+#: the same, BuildStore+Run.swift; this launcher wrote DM_TEX_BC_CPU, a name the engine never reads.)
+BC_CPU_ENV = 'DM_PROF_TEX_BC_CPU=1\n'
+
+
+@dataclass(frozen=True)
+class RunInputs:
+    """What a build was started with. The end of its run (the archive, the library entry, the IPA or the install, the
+    failure's explanation and its folder) reads these, never the page: the player may open another game from the
+    library, drop files on the window or add a game to the queue (which empties the rows) while a build runs."""
+    base: str = ''
+    update: str = ''
+    dlc: tuple = ()
+    keys: str = ''
+    out_dir: str = ''
+    home: str = ''              # the folder of the game's files (a game folder's own folder)
+    work_dir: str = ''          # the build's <title ID>_build folder
+    title_id: str = ''          # the title chosen for a multi-game package, '' for the default one
+    tid_hex: str = ''           # the build's key: the title ID it is named after
+    ipa_kind: str = 'shared'
+    mac_app: bool = False
+    use_shell_fw: bool = False  # a framework for the shared app, not an IPA of its own
+    output_mode: str = 'ipa'    # Windows: 'device' (install on the device) or 'ipa', as chosen when Build was pressed
+    ipa_path: str = ''          # a one-game IPA's own path
 
 
 _STAGE_LINE_RE = re.compile(r'^(?:([✓✗⚠])\s*)?\[(\d+)/(\d+)\]\s+(.+)$')
@@ -212,7 +274,7 @@ def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, in
 
 # ---------------------------------------------------------------- the model
 
-class Model(QObject):
+class Model(QObject, DeviceMixin):
     """Everything the window reads, and every action it can take.
 
     Long work runs on a thread and reports through signals, so the window never blocks: Qt
@@ -228,6 +290,9 @@ class Model(QObject):
     appUpdateFound = Signal(str, str)     # tag, url
     appRelaunching = Signal()
     libraryChanged = Signal()
+    devicesChanged = Signal()             # the connected iPhones and iPads (device_model.refresh_devices)
+    autoInstallRequested = Signal(str)    # a device to update (from the poll's thread, handled on the model's)
+    newDeviceFound = Signal(str)          # a device without the launcher: the window offers to install it
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -238,9 +303,9 @@ class Model(QObject):
     _metal_zip: Path | None = None
     _sdk_archive: Path | None = None
 
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.settings = QSettings('NS Port Builder', 'NSPortBuilder')
+        self.settings = settings if settings is not None else app_settings()
         self.lang = Lang.initial()
         self.repo_path = self._find_repo()
         self.python_path, self.python_ok, self.python_ver = pu.find_python()
@@ -252,7 +317,14 @@ class Model(QObject):
         self.install_all_total = 0
         self.install_all_pct = 0
         self.stages: list[Stage] = []
+        # One run at a time (begin_run / end_run): a build with its archive step and what follows it, an install, an
+        # IPA export. `running` lasts until the run's real end, so nothing else starts in between.
         self.running = False
+        self.run_kind = ''              # 'build', 'install' or 'export': what the activity bar says runs
+        self.run_stopped = False        # the last run ended because the player stopped it (not a failure)
+        self._cancel_requested = False  # Stop was pressed during this run (cancel_run)
+        self._sync_waiters: list[Callable[[bool], None]] = []   # callers waiting for the engine sync that runs
+        self.run_inputs: RunInputs | None = None   # what the build that runs (or ran last) was started with
         self.log_tail = ''
         self.engine_syncing = False   # tools/engine.py sync runs: the window shows a status line
         self.engine_failure: bf.Failure | None = None   # how the last sync stopped (engine.py's failure_kind), shown as a failure row with Try again
@@ -272,8 +344,13 @@ class Model(QObject):
         self.archive_path = ''
         self.mac_app_path = ''
         self.target = 'ios'   # 'ios' (an IPA) or 'mac-app' (a double-clickable Mac app; macOS only)
-        self.bc_on_cpu = False
+        # Older devices: on by default on Windows, where a build goes to iPhones and iPads of every age (it changes
+        # nothing on a newer GPU, BC_CPU_ENV)
+        self.bc_on_cpu = bool(pu.IS_WIN)
         self.ipa_kind = 'shared'   # 'shared' (shell.ipaShared) or 'oneGame' (shell.ipaOneGame)
+        # Windows: where an iPhone build goes. 'device': the shared app, signed with the player's Apple ID and installed
+        # over the cable (device_model.py); 'ipa': an unsigned IPA (ipa_kind says which). Elsewhere always 'ipa'.
+        self.output_mode = 'ipa'
         self.library = lib.GameLibrary()
         self.artwork = lib.ArtworkStore(on_updated=lambda _tid: self._emit_library_changed())
         self.repo_busy = False
@@ -298,7 +375,9 @@ class Model(QObject):
             # LOCALAPPDATA is set on every normal Windows session, but a stripped environment
             # (a service, a scheduled task, this project's own test harness) may lack it: fall
             # back to the home directory rather than failing to start over a log file.
-            if pu.IS_WIN:
+            if os.environ.get('NSPB_STATE_DIR'):      # a portable copy, the tests: the log stays with the state
+                base = Path(os.environ['NSPB_STATE_DIR']) / 'logs'
+            elif pu.IS_WIN:
                 root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
                 base = root / 'NS Port Builder' / 'logs'
             else:
@@ -308,6 +387,13 @@ class Model(QObject):
             self.log_path.write_text('', encoding='utf-8')
         except OSError:
             self.log_path = None
+        problem = getattr(self.library, 'load_problem', '')
+        if problem:     # a damaged library.json was moved aside, not overwritten: say where it is
+            self.log(problem + '\n')
+        self._device_init()
+        # The build's choices last from one start to the next (the Mac launcher keeps the output folder, the target and
+        # the texture switch; this one also keeps prod.keys and the last game, so a new start does not ask again).
+        self.restore_choices()
 
     # ---- strings
 
@@ -332,6 +418,152 @@ class Model(QObject):
                     .replace('This Mac', 'This PC')
                 )
         return res
+
+    # ---- the choices kept between starts
+
+    def _setting(self, key: str) -> str:
+        v = self.settings.value(key, '')
+        return v if isinstance(v, str) else ('' if v is None else str(v))
+
+    def _setting_bool(self, key: str, default: bool) -> bool:
+        """A switch kept in the settings: an ini file keeps 'true' / 'false', the registry may keep a bool."""
+        v = self.settings.value(key, None)
+        if v is None or v == '':
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ('true', '1', 'yes')
+
+    def restore_choices(self) -> None:
+        """prod.keys, the output folder (else the games folder, which new builds use), the output mode and IPA kind, the
+        Older devices switch, and the last game's files when they are still there."""
+        keys = self._setting('buildKeysPath')
+        if keys and os.path.isfile(keys):
+            self.keys_path = keys
+        out = self._setting('buildOutputDirectory')
+        games_folder = getattr(self.library, 'games_folder', '') or ''
+        if out and os.path.isdir(out):
+            self.out_dir = out
+        elif games_folder and os.path.isdir(games_folder):
+            self.out_dir = games_folder
+        if self._setting('bcOnCPU') in ('true', 'false'):
+            self.bc_on_cpu = self._setting('bcOnCPU') == 'true'
+        if self._setting('ipaKind') in ('shared', 'oneGame'):
+            self.ipa_kind = self._setting('ipaKind')
+        if pu.IS_WIN:
+            mode = self._setting('outputMode')
+            self.output_mode = mode if mode in ('device', 'ipa') else 'device'
+        try:
+            last = json.loads(self._setting('lastInputs') or '{}')
+        except ValueError:
+            last = {}
+        if not isinstance(last, dict):
+            return
+        folder = str(last.get('folder') or '')
+        base = str(last.get('base') or '')
+        try:
+            if folder and os.path.exists(folder):
+                self.take_game_folder(folder)
+            elif base and os.path.isfile(base):
+                self.game_dir = str(last.get('gameDir') or '')
+                self.base_path = base
+                upd = str(last.get('update') or '')
+                self.update_path = upd if os.path.isfile(upd) else ''
+                self.dlc_paths = [str(d) for d in last.get('dlc') or [] if os.path.isfile(str(d))]
+        except Exception as e:      # a game that can no longer be read: start with empty rows, not a crash
+            self.log(f'[choices] {e}\n')
+
+    def remember_choices(self) -> None:
+        """Write what restore_choices reads. The window calls it after every change of a choice. Not while the queue
+        has loaded a queued game's choices: those are not the player's (the queue gives the page its own back)."""
+        if getattr(self, 'queue_drives_inputs', lambda: False)():
+            return
+        s = self.settings
+        s.setValue('buildKeysPath', self.keys_path or '')
+        s.setValue('buildOutputDirectory', self.out_dir or '')
+        s.setValue('bcOnCPU', 'true' if self.bc_on_cpu else 'false')
+        s.setValue('ipaKind', self.ipa_kind)
+        s.setValue('outputMode', self.output_mode)
+        f = self.game_folder
+        last = {'folder': (getattr(f, 'nup', '') or f.folder) if f is not None else '', 'gameDir': self.game_dir,
+                'base': '' if f is not None else self.base_path,
+                'update': '' if f is not None else self.update_path,
+                'dlc': [] if f is not None else list(self.dlc_paths)}
+        s.setValue('lastInputs', json.dumps(last))
+
+    def use_games_folder_for_builds(self, folder: str) -> None:
+        """A games folder just chosen is where new builds go too (the Mac launcher sets its output folder the same
+        way)."""
+        if folder and not self.running:
+            self.out_dir = folder
+            self.remember_choices()
+
+    @property
+    def installs_on_device(self) -> bool:
+        """Windows: a build for iPhone and iPad goes into the shared app and onto the chosen device, not into an IPA."""
+        return pu.IS_WIN and self.output_mode == 'device'
+
+    # ---- the run
+
+    def begin_run(self, kind: str) -> bool:
+        """Start a run of `kind` ('build', 'install', 'export'); False when one is running already. The run lasts
+        until end_run: a build's archive step and what follows it (the IPA, the install) belong to it, so neither the
+        queue nor a second build nor an install can start in the gap."""
+        if self.running:
+            return False
+        self.running = True
+        self.run_kind = kind
+        self.run_stopped = False
+        self._cancel_requested = False
+        emit_safely(self.runningChanged, True)
+        return True
+
+    def end_run(self, ok: bool, note: str, *, stopped: bool = False) -> None:
+        """The one end of every run: `running` goes false, then `finished` says how it ended. `stopped`: the player
+        stopped it, which the window shows as stopped, not as a failure."""
+        self._proc = None
+        if hasattr(self, 'transfer_info'):
+            self.transfer_info = None
+        self.running = False
+        self.run_stopped = stopped
+        emit_safely(self.runningChanged, False)
+        emit_safely(self.finished, ok, note)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested
+
+    def cancel_run(self) -> None:
+        """Stop, from any Stop button: the run checks the flag between its steps, and the tool running now (the build
+        script, the RomFS packer, the signing tool) is ended at once, with what it started (on Windows the build
+        script's tools hold its output open: end_process_tree)."""
+        if not self.running:
+            return
+        self._cancel_requested = True
+        self._stop_pso_poll()
+        p = self._proc
+        if p is not None:
+            end_process_tree(p)
+
+    def _stop_stages(self) -> str:
+        """The stages still running are stopped, not failed; the note of a stopped run."""
+        for st in self.stages:
+            if st.state == 'running':
+                st.state = 'stopped'
+        emit_safely(self.stagesChanged)
+        self.log(self.t('msg.stopped') + '\n')
+        return self.t('msg.stopped')
+
+    def _run_inputs(self) -> RunInputs:
+        """The inputs of the run going on, else what the page holds now (a step called on its own, outside a run)."""
+        if self.running and self.run_inputs is not None:
+            return self.run_inputs
+        f = self.game_folder
+        home = f.folder if f is not None else (str(Path(self.base_path).parent) if self.base_path else '')
+        return RunInputs(base=self.base_path, update=self.update_path, dlc=tuple(self.dlc_paths), keys=self.keys_path,
+                         out_dir=self.out_dir, home=home, work_dir=getattr(self, 'effective_work_dir', ''),
+                         tid_hex=self.build_key, ipa_kind=self.ipa_kind, mac_app=self.target == 'mac-app',
+                         output_mode=self.output_mode, ipa_path=self.ipa_path)
 
     # ---- shell cache folder (mirrors BuildStore+ShellRoot.swift)
 
@@ -482,7 +714,10 @@ class Model(QObject):
         """Run `tools/engine.py sync` on a thread when engine/ is stale (after a pull, at the start, before a build that
         needs it). A no-op for a checkout from before #214 or a current engine/. `then(ok)` runs after it."""
         if getattr(self, '_engine_syncing', False):
-            if then: then(True)
+            # a sync runs: this caller hears how that one ends (a build pressed meanwhile must not find the engine
+            # still stale and say it is invalid)
+            if then:
+                self._sync_waiters.append(then)
             return
         if not engine.is_stale(self.repo_path):
             self.engine_failure = None
@@ -510,7 +745,7 @@ class Model(QObject):
                     self.engine_syncing = False
                     self.engine_failure = bf.Failure(engine.ENGINE_SYNC)
                     self._emit_repo_changed()
-                    if then: then(False)
+                    self._end_sync(then, False)
                     return
                 extra = {'PATH': str(Path(git).parent) + os.pathsep + pu.child_env()['PATH']}
             ok, kind = engine.run_sync(cmd, self.repo_path, self.log, env=pu.child_env(extra), **pu.no_window_kwargs())
@@ -518,9 +753,17 @@ class Model(QObject):
             self.engine_syncing = False
             self.engine_failure = None if ok else bf.Failure(kind or engine.ENGINE_SYNC)
             self._emit_repo_changed()
-            if then: then(ok)
+            self._end_sync(then, ok)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _end_sync(self, then: Callable[[bool], None] | None, ok: bool) -> None:
+        waiters, self._sync_waiters = self._sync_waiters, []
+        for cb in ([then] if then else []) + waiters:
+            try:
+                cb(ok)
+            except Exception as e:      # one caller's error must not keep the others waiting
+                self.log(f'[sync] {e}\n')
 
     def retry_engine_sync(self) -> None:
         """The failure row's Try again: clears the row and runs the sync again."""
@@ -858,6 +1101,9 @@ class Model(QObject):
         if note := wtc.host_arch_note():
             out.append(Dep('host_arch', 'dep.hostArch', 'dep.hostArch.hint',
                            DepState.OK, note))
+        # Installing on an iPhone or iPad from this PC (device_model.py): optional rows, a build and the IPA export
+        # work without them
+        out.extend(self._device_rows())
         return out
 
 
@@ -1130,6 +1376,14 @@ class Model(QObject):
             except RuntimeError:
                 pass
             return
+        want = app_update.digest_hex(rel.digest)
+        if not want:
+            # the Mac app refuses an update it cannot verify, and so does this one: the executable it would run next
+            # comes from this zip (audit M13)
+            self.app_update_status = self.t('app.noDigest', rel.tag)
+            self.log(self.app_update_status + '\n')
+            self._emit_repo_changed()
+            return
 
         self.app_update_busy = True
         self.app_update_progress = 0.0
@@ -1159,9 +1413,12 @@ class Model(QObject):
                 root = app_update.fresh_staging_root()
                 zip_path = root / 'update.zip'
                 try:
+                    # checked against the release's SHA-256 as it arrives (download() requires it: without it every
+                    # update raised a TypeError, reported as a network failure, audit N1)
                     wf.download(
                         rel.url,
                         zip_path,
+                        want,
                         progress=on_progress,
                     )
                 except Exception as exc:
@@ -1170,7 +1427,7 @@ class Model(QObject):
                     return
 
                 try:
-                    staged = app_update.stage_zip(zip_path, rel, root, require_digest=False)
+                    staged = app_update.stage_zip(zip_path, rel, root, require_digest=True)
                 except app_update.StageError as err:
                     if err.key == 'app.digestMismatch':
                         self.app_update_status = self.t('app.digestMismatch', rel.tag)
@@ -2219,7 +2476,9 @@ class Model(QObject):
         self.ipa_path = self.archive_path = self.mac_app_path = ''
         mac_app = self.target == 'mac-app'
         self.effective_work_dir = work_dir if has_work_dir else str(Path(base_dir if folder is not None else input_dir, f'{tid_hex}_build'))
-        use_shell_fw = not mac_app and self.ipa_kind == 'shared' and self.supports_shell_framework()
+        device = self.installs_on_device and not mac_app
+        ipa_kind = 'shared' if device else self.ipa_kind
+        use_shell_fw = not mac_app and ipa_kind == 'shared' and self.supports_shell_framework()
         if mac_app:
             args += ['--platform', 'mac-app']
             self.mac_app_path = str(Path(self.out_dir or base_dir, f'{tid_hex}.app'))
@@ -2242,7 +2501,7 @@ class Model(QObject):
             try:
                 Path(self.effective_work_dir).mkdir(parents=True, exist_ok=True)
                 env_file = Path(self.effective_work_dir, '_env.txt')
-                env_file.write_text('DM_TEX_BC_CPU=1\n', encoding='utf-8')
+                env_file.write_text(BC_CPU_ENV, encoding='utf-8')
                 args += ['--env-file', str(env_file)]
                 self.log(self.t('msg.bcOn') + '\n')
             except OSError as e:
@@ -2263,8 +2522,14 @@ class Model(QObject):
             )
             self._emit_library_changed()
 
-        self.running = True
-        self.runningChanged.emit(True)
+        run = RunInputs(base=self.base_path, update=self.update_path, dlc=tuple(self.dlc_paths), keys=self.keys_path,
+                        out_dir=self.out_dir, home=base_dir, work_dir=self.effective_work_dir, title_id=title_id or '',
+                        tid_hex=tid_hex, ipa_kind=ipa_kind, mac_app=mac_app, use_shell_fw=use_shell_fw,
+                        output_mode=self.output_mode if pu.IS_WIN else 'ipa', ipa_path=self.ipa_path)
+        mac_app_path = self.mac_app_path
+        if not self.begin_run('build'):
+            return
+        self.run_inputs = run
         self._stop_pso_poll()
         with self._ensure_pso_lock():
             self.stages = []
@@ -2278,7 +2543,7 @@ class Model(QObject):
         self.log(self.t('msg.running', py + ' ' + ' '.join(args)) + '\n')
 
         env = pu.child_env()
-        if self.ipa_kind == 'oneGame' and not mac_app:
+        if ipa_kind == 'oneGame' and not mac_app:
             env['DM_FULL_ROMFS'] = '1'
         droot = pu.dotnet_root(self.dotnet_path) if self.dotnet_ok else None
         if droot:
@@ -2319,19 +2584,21 @@ class Model(QObject):
                 self._stop_pso_poll()
                 self._proc = None
             self._flush_lines()
+            if self._cancel_requested:
+                return False, ''          # Stop ended the script: work() ends the run as stopped, nothing to explain
             if ok and mac_app:
-                ok = bool(self.mac_app_path) and Path(self.mac_app_path).exists()
+                ok = bool(mac_app_path) and Path(mac_app_path).exists()
                 note = self.t('target.macDone' if ok else 'target.missingApp')
                 if ok and input_game:
-                    input_game.app_path = self.mac_app_path
+                    input_game.app_path = mac_app_path
                     self.library.upsert(input_game)
                     self._emit_library_changed()
             elif ok:
                 for st in self.stages:
                     if st.state == 'running':
                         st.state = 'done'
-                self.stagesChanged.emit()
-                if self.ipa_kind != 'oneGame':
+                emit_safely(self.stagesChanged)
+                if run.ipa_kind != 'oneGame':
                     return self.pack_archive(title_id, export_shell=use_shell_fw)
                 if not self.ipa_path:
                     self.ipa_path = str(Path(base_dir, f'{tid_hex}.ipa'))
@@ -2340,7 +2607,7 @@ class Model(QObject):
             else:
                 if self.stages:
                     self.stages[-1].state = 'failed'
-                    self.stagesChanged.emit()
+                    emit_safely(self.stagesChanged)
                 # The last real line says more than the exit code: "Build failed (exit code 1)"
                 # on its own sent a reporter looking for a log that was not on screen (#52)
                 last = getattr(self, '_last_error', '')
@@ -2352,18 +2619,21 @@ class Model(QObject):
             return ok, note
 
         def work() -> None:
+            stopped = False
             try:
                 ok, note = run_build()
             except Exception as e:
                 self.log(f'{e}\n')
-                if self.stages:
+                if self.stages and not self._cancel_requested:
                     self.stages[-1].state = 'failed'
-                    self.stagesChanged.emit()
+                    emit_safely(self.stagesChanged)
                 ok, note = False, self.t('msg.buildFailedReason', str(e))
-            finally:
-                self.running = False
-                self.runningChanged.emit(False)
-            self.finished.emit(ok, note)
+            if self._cancel_requested and not ok:
+                # Stop: neither a success nor a failure to explain (the script, the packer or the export was ended)
+                self.failure = None
+                ok, note, stopped = False, self._stop_stages(), True
+            # the one end of the run, on every path: running goes false, then finished (upstream's order)
+            self.end_run(ok, note, stopped=stopped)
 
         self._thread = threading.Thread(target=work, daemon=True)
         self._thread.start()
@@ -2379,11 +2649,12 @@ class Model(QObject):
         return self.t(f.what_key)
 
     def _keys_readable(self) -> bool | None:
-        """Whether the chosen keys file can be opened: None when none is chosen."""
-        if not self.keys_path:
+        """Whether the keys file of the build that ran can be opened: None when none was chosen."""
+        keys = self.run_inputs.keys if self.run_inputs is not None else self.keys_path
+        if not keys:
             return None
         try:
-            with open(self.keys_path, 'rb'):
+            with open(keys, 'rb'):
                 return True
         except OSError:
             return False
@@ -2391,7 +2662,8 @@ class Model(QObject):
     def failure_folder(self, f: 'bf.Failure') -> str:
         """The folder "Show folder" opens: the one with the game files, else the one the message names. For a full disk the
         build folder (`<title ID>_build`) when it is there, since that is where the space went."""
-        game_dir = str(Path(self.base_path).parent) if self.base_path else ''
+        base = self.run_inputs.base if self.run_inputs is not None else self.base_path   # the failed build's game
+        game_dir = str(Path(base).parent) if base else ''
         folder = game_dir or (f.detail if f.kind == bf.NO_TITLE_ID else '') or ''
         if f.kind == bf.DISK_FULL and game_dir:
             try:
@@ -2417,9 +2689,8 @@ class Model(QObject):
                                  install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
-        self._stop_pso_poll()
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        """The Build button and the activity bar's Stop: the same as every Stop (cancel_run)."""
+        self.cancel_run()
 
     # ---- the script's own progress lines
 
@@ -2694,6 +2965,13 @@ class Model(QObject):
             wtid = _from_work(work)
             if wtid:
                 return wtid
+        if self.running and self.run_inputs is not None:
+            # during a run, the run's own build key: never the page's game or the library's selection, which the
+            # player may have changed since Build was pressed
+            r = self.run_inputs
+            wtid = _from_work(r.work_dir) if r.work_dir != work else ''
+            return wtid or (r.tid_hex.upper() if re.fullmatch(r'[0-9A-Fa-f]{16}', r.tid_hex or '') else
+                            (title_id or r.tid_hex or 'game'))
         arch = getattr(self, 'archive_path', '') or ''
         if arch:
             ap = Path(arch)
@@ -2765,7 +3043,8 @@ class Model(QObject):
 
     def pack_archive(self, title_id: str | None = None, *, export_shell: bool = False) -> tuple[bool, str]:
         """Run the final shared-build step on the build worker."""
-        work = getattr(self, 'effective_work_dir', '')
+        r = self._run_inputs()
+        work = r.work_dir
         tid = self._verified_title_id(work, title_id)
         extract = Path(work, 'extract')
         versions = []
@@ -2785,14 +3064,16 @@ class Model(QObject):
         ver_dir = versions[-1][1]
         romfs_img = ver_dir / 'RomFS.img'
         romfs = str(ver_dir / 'RomFS')
-        base_parent = Path(self.game_folder.folder) if self.game_folder is not None else Path(self.base_path).parent
+        base_parent = Path(r.home)
         # games/<id>/ is the per-game layout the shell reads and matches BuildStore+Archive.swift
         if export_shell or bool(title_id) or re.fullmatch(r'[0-9A-Fa-f]{16}', tid):
-            dest = str(Path(self.out_dir or base_parent, 'games', tid.upper() if re.fullmatch(r'[0-9A-Fa-f]{16}', tid) else tid))
+            dest = str(Path(r.out_dir or base_parent, 'games', tid.upper() if re.fullmatch(r'[0-9A-Fa-f]{16}', tid) else tid))
         else:
-            dest = str(Path(self.out_dir or base_parent, 'romfs'))
+            dest = str(Path(r.out_dir or base_parent, 'romfs'))
+        if self._cancel_requested:
+            return False, ''
         self.stages.append(Stage(name=self.t('prog.archiveShort'), state='running'))
-        self.stagesChanged.emit()
+        emit_safely(self.stagesChanged)
 
         ok = True
         out_img = Path(dest, 'romfs.img')
@@ -2830,11 +3111,15 @@ class Model(QObject):
                 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, encoding='utf-8', errors='replace', env=env,
                                      **pu.no_window_kwargs())
-                assert p.stdout is not None
-                for line in p.stdout:
-                    self.log(line)
-                p.wait()
-                ok = p.returncode == 0
+                self._proc = p            # Stop reaches the packer too (cancel_run): it can take minutes
+                try:
+                    assert p.stdout is not None
+                    for line in p.stdout:
+                        self.log(line)
+                    p.wait()
+                finally:
+                    self._proc = None
+                ok = p.returncode == 0 and not self._cancel_requested
                 id_dst.unlink(missing_ok=True)
                 if ok and id_src.is_file():
                     shutil.copy2(id_src, id_dst)
@@ -2855,9 +3140,11 @@ class Model(QObject):
             self.log(f'{e}\n')
             ok = False
         if self.stages:
-            self.stages[-1].state = 'done' if ok else 'failed'
+            self.stages[-1].state = 'done' if ok else ('stopped' if self._cancel_requested else 'failed')
         self.archive_path = dest if ok else ''
-        self.stagesChanged.emit()
+        emit_safely(self.stagesChanged)
+        if self._cancel_requested:
+            return False, ''
         if ok and export_shell:
             return self._export_shell_after_archive(True, '')
         if ok:
@@ -2869,7 +3156,8 @@ class Model(QObject):
             return False, archive_note or self.t('msg.archiveFailed')
         from .win import shell_export as se
 
-        work = getattr(self, 'effective_work_dir', '')
+        r = self._run_inputs()
+        work = r.work_dir
         fw = se.built_framework(work)
         tid = self._verified_title_id(work, se.title_id_of_framework(fw) if fw else '')
         if fw is None:
@@ -2887,7 +3175,7 @@ class Model(QObject):
         if not game_name:
             game_name = (
                 lib.GameFolder.profile_name(tid, self.engine_path)
-                or (lib.clean_game_name(self.base_path) if self.base_path else '')
+                or (lib.clean_game_name(r.base) if r.base else '')
                 or tid
             )
 
@@ -2895,10 +3183,20 @@ class Model(QObject):
             for st in self.stages:
                 if st.name == stage_name:
                     st.state = state
-                    self.stagesChanged.emit()
+                    emit_safely(self.stagesChanged)
                     return
             self.stages.append(Stage(name=stage_name, state=state))
-            self.stagesChanged.emit()
+            emit_safely(self.stagesChanged)
+
+        if self._cancel_requested:
+            return False, ''
+        if r.output_mode == 'device' and pu.IS_WIN:
+            # Install on device: the game goes into the shared app's library and onto the chosen device, as the rest of
+            # this run; no IPA is zipped
+            ok, msg = self.after_framework_build(fw, tid, game_name, self.archive_path)
+            if ok:
+                self._record_library_ios_completion(tid, name=game_name)
+            return ok, msg
 
         py = self.python_path or sys.executable
         picked = self.artwork.custom_paths.get(tid.upper())
@@ -2921,20 +3219,22 @@ class Model(QObject):
         return ok, msg
 
     def _record_library_ios_completion(self, title_id: str | None = None, name: str = '') -> None:
+        """The built game in the library, with the files the build was started with (RunInputs), not the page's."""
+        r = self._run_inputs()
         inputs_map: dict[str, list[str]] = {}
-        if self.base_path:
-            inputs_map['base'] = [self.base_path]
-        if self.update_path:
-            inputs_map['update'] = [self.update_path]
-        if self.dlc_paths:
-            inputs_map['dlc'] = list(self.dlc_paths)
-        if self.keys_path:
-            inputs_map['keys'] = [self.keys_path]
+        if r.base:
+            inputs_map['base'] = [r.base]
+        if r.update:
+            inputs_map['update'] = [r.update]
+        if r.dlc:
+            inputs_map['dlc'] = list(r.dlc)
+        if r.keys:
+            inputs_map['keys'] = [r.keys]
         g = self.library.record_completed_ios(
             ipa_path=self.ipa_path,
             archive_path=self.archive_path,
-            base_path=self.base_path,
-            output_dir=self.out_dir,
+            base_path=r.base,
+            output_dir=r.out_dir,
             inputs=inputs_map,
             repo_path=self.engine_path,
             title_id=title_id,

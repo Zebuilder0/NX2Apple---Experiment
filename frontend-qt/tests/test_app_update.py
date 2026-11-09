@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 import re
 import shutil
-import sys
 import tempfile
 import unittest
 import zipfile
@@ -35,6 +37,65 @@ class AppUpdateTests(unittest.TestCase):
         self.assertIn('--name "NX2Apple"', wf)
         self.assertNotIn('--name "NS Port Builder"', wf)
         self.assertIn("Compress-Archive -Path 'NX2Apple' -DestinationPath '../NX2Apple-windows-x64.zip'", wf)
+
+    def _update_model(self, digest_of_zip: bool):
+        """A Model in a frozen Windows app with a newer release found, and the zip that release serves."""
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest('PySide6 is not installed')
+        from unittest import mock
+        from nspb_qt.model import Model
+        self.app = QApplication.instance() or QApplication([])
+        served = self.tmp / 'served.zip'
+        with zipfile.ZipFile(served, 'w') as zf:
+            zf.writestr('NX2Apple/NX2Apple.exe', b'MZ-fake-exe')
+            zf.writestr('NX2Apple/_internal/python312.dll', b'fake-dll')
+        digest = 'sha256:' + hashlib.sha256(served.read_bytes()).hexdigest() if digest_of_zip else None
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        self.addCleanup(m.deleteLater)
+        m.app_update = app_update.Release(tag='v9.9.9', url='https://example.com/NX2Apple-windows-x64.zip',
+                                          digest=digest)
+        return m, served
+
+    def _run_update(self, m, served):
+        """perform_app_update with the network and the relaunch replaced: the download keeps download()'s real
+        signature (autospec), so a call that does not match it fails here as it did on players' PCs."""
+        import time
+        from unittest import mock
+        from nspb_qt import platform_util as pu
+        from nspb_qt.win import fetch as wf
+
+        def fake_download(url, dest, sha256, size=None, log=None, progress=None, algo='sha256'):
+            shutil.copyfile(served, dest)
+            return Path(dest)
+        dl = mock.create_autospec(wf.download, side_effect=fake_download)
+        with mock.patch.object(pu, 'IS_WIN', True), mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(wf, 'download', dl), \
+                mock.patch.object(app_update, 'fresh_staging_root', lambda: self.tmp / 'stage'), \
+                mock.patch.object(app_update, 'relaunch_windows_update', return_value=True):
+            (self.tmp / 'stage').mkdir(exist_ok=True)
+            m.perform_app_update()
+            deadline = time.time() + 10
+            while m.app_update_busy and time.time() < deadline:
+                self.app.processEvents()
+                time.sleep(0.02)
+        return dl
+
+    def test_the_windows_update_downloads_against_the_release_checksum_and_relaunches(self) -> None:
+        m, served = self._update_model(digest_of_zip=True)
+        dl = self._run_update(m, served)
+        self.assertEqual(dl.call_count, 1)
+        self.assertEqual(dl.call_args.args[2], hashlib.sha256(served.read_bytes()).hexdigest())
+        self.assertEqual(m.app_update_status, m.t('app.relaunching', 'v9.9.9'))
+
+    def test_a_release_without_a_checksum_is_not_installed(self) -> None:
+        m, served = self._update_model(digest_of_zip=False)
+        dl = self._run_update(m, served)
+        self.assertEqual(dl.call_count, 0)
+        self.assertEqual(m.app_update_status, m.t('app.noDigest', 'v9.9.9'))
 
     def test_is_newer_compares_numeric_segments_and_release_candidates(self) -> None:
         self.assertTrue(app_update.is_newer('v1.2.2', '1.2.0'))

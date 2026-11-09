@@ -28,6 +28,8 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent

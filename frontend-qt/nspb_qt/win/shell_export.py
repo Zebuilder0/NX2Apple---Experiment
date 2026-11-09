@@ -463,6 +463,62 @@ def _cleanup_tmp_sidecars(tmp_ipa: Path) -> None:
             pass
 
 
+def add_to_library(
+    root: str | os.PathLike,
+    framework: str | os.PathLike,
+    title_id: str,
+    name: str,
+    *,
+    banners_dir: str | os.PathLike | None = None,
+    picked_artwork: str | None = None,
+    t_func: Callable[..., str] = lambda key, *a: key,
+    log: Callable[[str], None] = lambda _: None,
+) -> tuple[ShellLibrary | None, list[str], str]:
+    """Put a built game in the shared app's library: `shell.json`, its framework mirrored into `<root>/frameworks/`,
+    every game's banner beside its framework. The first step of an IPA export and of an install on a device.
+
+    Returns `(library, notes, error)`: the library as saved and the games left out, or `(None, [], message)`."""
+    root_p = Path(root)
+    sweep_discarded(frameworks_mirror(root_p))
+    library = ShellLibrary.load(root_p)
+    library.add(ShellGame(title_id=title_id, name=name, framework=str(framework)))
+    mirror_frameworks(library, root_p, log=log)
+    library.drop_missing()
+    notes, err = leave_out_incomplete(library, root_p, title_id, name, t_func, log=log)
+    if err is not None:
+        return None, [], t_func('shell.projectFailed', err)
+
+    for g in library.games:
+        picked = picked_artwork if g.title_id == title_id else None
+        banner = place_banner(g.title_id, g.framework, banners_dir=banners_dir, picked=picked)
+        if banner:
+            log(f'banner: {g.title_id} {banner}\n')
+
+    try:
+        library.save(root_p)
+    except OSError as e:
+        return None, [], t_func('shell.projectFailed', str(e))
+    return library, notes, ''
+
+
+def stage_app(template: str | os.PathLike, staged_app: str | os.PathLike, *, bundle_id: str,
+              repo: str | os.PathLike, python_exe: str) -> Path:
+    """A fresh copy of the empty `DmShell.app` at `staged_app`, ready for its games: no `Frameworks/`, the fonts,
+    the bundle ID and engine identity in its Info.plist, and an ad-hoc signature carrying the Increased Memory Limit
+    entitlement. Always from the template, never from an earlier staged or signed copy."""
+    app = Path(staged_app)
+    shutil.rmtree(app, ignore_errors=True)
+    if app.exists():
+        raise OSError(f'{app} cannot be replaced (is a file in it open?)')
+    app.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(template, app, symlinks=True)
+    shutil.rmtree(app / 'Frameworks', ignore_errors=True)
+    _prepare_fonts(app, Path(repo), python_exe)
+    _update_shell_plist(app, bundle_id, Path(repo))
+    macho_sign.sign(app / SCHEME, bundle_id, SHELL_ENTITLEMENTS)
+    return app
+
+
 def export_shell(
     *,
     root: str | os.PathLike,
@@ -497,25 +553,10 @@ def export_shell(
         return False, '', _t('shell.noFramework', name, folder), []
 
     # 1. Update shell.json and mirror frameworks into <root>/frameworks/
-    sweep_discarded(frameworks_mirror(root_p))
-    library = ShellLibrary.load(root_p)
-    library.add(ShellGame(title_id=tid_norm, name=name, framework=str(fw_p)))
-    mirror_frameworks(library, root_p, log=log)
-    library.drop_missing()
-    notes, err = leave_out_incomplete(library, root_p, tid_norm, name, _t, log=log)
-    if err is not None:
-        return False, '', _t('shell.projectFailed', err), []
-
-    for g in library.games:
-        picked = picked_artwork if g.title_id == tid_norm else None
-        banner = place_banner(g.title_id, g.framework, banners_dir=banners_dir, picked=picked)
-        if banner:
-            log(f'banner: {g.title_id} {banner}\n')
-
-    try:
-        library.save(root_p)
-    except OSError as e:
-        return False, '', _t('shell.projectFailed', str(e)), []
+    library, notes, err = add_to_library(root_p, fw_p, tid_norm, name, banners_dir=banners_dir,
+                                         picked_artwork=picked_artwork, t_func=_t, log=log)
+    if library is None:
+        return False, '', err, []
 
     # 2. Stage DmShell.app from the pre-built template
     pack_stage_name = _t('shell.exportPackStage')
@@ -536,16 +577,8 @@ def export_shell(
     try:
         shutil.rmtree(stage_dir, ignore_errors=True)
         _cleanup_tmp_sidecars(tmp_ipa)
-        staged_app.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(tpl, staged_app, symlinks=True)
-        # Ensure template carries no stale embedded frameworks; pack_ipa maps the live ones
-        shutil.rmtree(staged_app / 'Frameworks', ignore_errors=True)
-
-        _prepare_fonts(staged_app, repo_p, py_exe)
-        _update_shell_plist(staged_app, library.bundle_id, repo_p)
-
-        # Ad-hoc sign DmShell with the Increased Memory Limit entitlement
-        macho_sign.sign(staged_app / SCHEME, library.bundle_id, SHELL_ENTITLEMENTS)
+        # pack_ipa maps the live frameworks: the staged app carries none of its own
+        stage_app(tpl, staged_app, bundle_id=library.bundle_id, repo=repo_p, python_exe=py_exe)
 
         # 3. Pack Payload/DmShell.app and every game's framework into a temporary archive first,
         # then atomically replace export/NX2Apple.ipa so an existing IPA is preserved on failure.
@@ -589,3 +622,133 @@ def export_shell(
         stage_cb(pack_stage_name, 'done')
     msg = '\n'.join([_t('shell.exportDone', str(out_ipa))] + notes)
     return True, str(out_ipa), msg, notes
+
+
+# ---------------------------------------------------------------- the shared app on a device (Windows install)
+#
+# Windows has no Xcode: win/install.py signs the shared app with the player's Apple ID (plumesign) and installs it
+# over the cable. These read the same library and template the IPA export uses.
+
+#: Where an install assembles the app it signs: a folder of its own, since the export removes `export/stage` after
+#: every IPA and an install may follow a build's export.
+INSTALL_STAGE = 'install-stage'
+
+
+def install_stage(root: str | os.PathLike) -> Path:
+    return Path(root) / INSTALL_STAGE / APP_NAME
+
+
+def present_games(root: str | os.PathLike) -> list[ShellGame]:
+    """The games of the shared app's library whose framework is there and whole, in library order. A game whose build
+    folder is gone is its mirror in `<root>/frameworks/`."""
+    out: list[ShellGame] = []
+    for g in ShellLibrary.load(root).games:
+        fw = Path(g.framework)
+        if not fw.is_dir():
+            mirror = mirrored_framework(root, g.title_id)
+            if not mirror.is_dir():
+                continue
+            fw = mirror
+        if missing_file_in_framework(fw, g.title_id) is None:
+            out.append(ShellGame(title_id=g.title_id, name=g.name, framework=str(fw)))
+    return out
+
+
+def present_titles(games: list[ShellGame], titles) -> list[ShellGame]:
+    """The games of `games` whose title ID is in `titles` (all of them when `titles` is None), in library order."""
+    if titles is None:
+        return list(games)
+    want = {str(t).upper() for t in titles}
+    return [g for g in games if g.title_id.upper() in want]
+
+
+def assemble_app(root: str | os.PathLike, repo: str | os.PathLike, template: str | os.PathLike,
+                 games: list[ShellGame], *, bundle_id: str, python_exe: str = '',
+                 banner: Callable[[str], str | None] | None = None) -> Path:
+    """`<root>/install-stage/DmShell.app`: the empty app staged as for an export (stage_app), with every game's
+    framework in `Frameworks/` and each game's banner beside it (`banner(title ID)` gives a picture, else the one
+    already beside the framework stays). The signing tool signs this copy in place."""
+    if not games:
+        raise ValueError('no game is built for the shared app yet')
+    app = stage_app(template, install_stage(root), bundle_id=bundle_id, repo=repo,
+                    python_exe=_resolve_python_exe(python_exe))
+    fw_dir = app / 'Frameworks'
+    fw_dir.mkdir(exist_ok=True)
+    for g in games:
+        src = Path(g.framework)
+        dst = fw_dir / src.name
+        shutil.copytree(src, dst, symlinks=True)
+        picked = banner(g.title_id) if banner else None
+        if picked:
+            try:
+                place_banner(g.title_id, dst, picked=picked)
+            except OSError:       # a picture that cannot be copied leaves the icon, not a failed install
+                pass
+    return app
+
+
+def _template_info(app: str | os.PathLike) -> dict:
+    try:
+        with open(Path(app) / 'Info.plist', 'rb') as f:
+            info = plistlib.load(f)
+        return info if isinstance(info, dict) else {}
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return {}
+
+
+def template_min_ios(app: str | os.PathLike) -> str:
+    """The oldest iOS the empty app runs on (its MinimumOSVersion), '' when it does not say."""
+    return str(_template_info(app).get('MinimumOSVersion') or '')
+
+
+def template_version(app: str | os.PathLike | None) -> str:
+    """What changes when the launcher ships a new empty app: its version and its executable's size and time. A device
+    whose app was made from another template gets it installed again (win/install.py library_hash)."""
+    if not app:
+        return ''
+    try:
+        st = (Path(app) / SCHEME).stat()
+    except OSError:
+        return ''
+    return f'{_template_info(app).get("CFBundleShortVersionString") or ""}:{st.st_size}:{int(st.st_mtime)}'
+
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    out = []
+    for part in str(v).split('.'):
+        digits = ''.join(ch for ch in part if ch.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+#: What the Older devices switch puts in a build's env file (model.py), read by the engine as the profile key
+#: tex_bc_cpu (dm/host/hle_profile.c read_env): decode BC textures on the CPU where the GPU cannot.
+BC_CPU_ENV_KEY = 'DM_PROF_TEX_BC_CPU'
+
+
+def supports_older(framework: str | os.PathLike, engine: str | os.PathLike = '') -> bool:
+    """Whether a built game plays on a device whose GPU has no BC textures (before the A17 Pro and the M1): its build
+    carried DM_PROF_TEX_BC_CPU=1 (the Older devices switch, in the framework's dm/env.txt, which the app applies when
+    the game starts), or its profile turns tex_bc_cpu on (dm/games/<title ID>/game.tsv, compiled in). On a GPU with BC
+    textures it changes nothing (nvn_mtl.m: g_bc_cpu = !g_bc_gpu && tex_bc_cpu), so such a game plays everywhere."""
+    fw = Path(framework)
+    try:
+        for line in (fw / 'dm' / 'env.txt').read_text(encoding='utf-8', errors='replace').splitlines():
+            key, _, value = line.strip().partition('=')
+            if key.strip() == BC_CPU_ENV_KEY and value.strip().lower() in ('1', 'on', 'true', 'yes'):
+                return True
+    except OSError:
+        pass
+    tid = title_id_of_framework(fw)
+    if engine and tid:
+        try:
+            for line in (Path(engine) / 'dm' / 'games' / tid.upper() / 'game.tsv').read_text(
+                    encoding='utf-8', errors='replace').splitlines():
+                cols = line.split('\t')
+                if len(cols) >= 2 and cols[0].strip() == 'tex_bc_cpu' and cols[1].strip() == 'on':
+                    return True
+        except OSError:
+            pass
+    return False
