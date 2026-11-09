@@ -188,6 +188,19 @@ def sha256_of(path: Path, limit: int | None = None) -> str:
     return digest_of(path, 'sha256', limit)
 
 
+def member_target(staging: Path, name: str) -> Path:
+    """Where a zip member goes inside `staging`. A member that would land outside it (`..`, an absolute path, a drive
+    letter, written with either slash) stops the unpack: every archive here is checked against a pinned hash first, so
+    such a name means the archive is not the one that was pinned, and nothing of it is used."""
+    parts = [x for x in name.replace('\\', '/').split('/') if x not in ('', '.')]
+    root = staging.resolve()
+    out = (root.joinpath(*parts)).resolve() if parts else root
+    if name.startswith(('/', '\\')) or (len(name) > 1 and name[1] == ':') or '..' in parts or \
+            not out.is_relative_to(root) or out == root:
+        raise DownloadError(f'unsafe path inside the archive: {name!r}')
+    return out
+
+
 def _strip_root(member: str) -> str:
     """The zip's members all sit under one top-level folder; return the path below it."""
     parts = member.split('/', 1)
@@ -235,7 +248,7 @@ def install_llvm(arch: str | None = None, dest: Path | None = None,
                     rel = _strip_root(info.filename)
                     if not rel:
                         continue
-                    out = staging / rel
+                    out = member_target(staging, rel)
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with z.open(info) as src, open(out, 'wb') as dst:
                         shutil.copyfileobj(src, dst, 1 << 20)
@@ -248,6 +261,9 @@ def install_llvm(arch: str | None = None, dest: Path | None = None,
                             out.chmod(0o755)
                         except OSError:
                             pass
+        except DownloadError:             # an unsafe member: nothing of the archive is kept
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         except zipfile.BadZipFile as e:
             shutil.rmtree(staging, ignore_errors=True)
             raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -348,16 +364,16 @@ def install_dotnet(dest: Path | None = None,
             grand = sum(i.file_size for i in members) or 1
             done = 0
             for info in members:
-                out = staging / info.filename
-                # a zip member may try to escape the target (../ in the name)
-                if not str(out.resolve()).startswith(str(staging.resolve())):
-                    continue
+                out = member_target(staging, info.filename)   # a member that would escape stops the unpack
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
                 done += info.file_size
                 if unpack_progress:
                     unpack_progress(done, grand)
+    except DownloadError:             # an unsafe member: nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except zipfile.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -445,10 +461,16 @@ def install_zstd(dest: Path | None = None,
             for info in z.infolist():
                 if info.is_dir():
                     continue
-                out = staging / _strip_root(info.filename)
+                rel = _strip_root(info.filename)
+                if not rel:
+                    continue
+                out = member_target(staging, rel)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
+    except DownloadError:             # an unsafe member: nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except zipfile.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -549,10 +571,12 @@ def install_metal_from_zip(zip_path: Path, dest: Path | None = None,
     staging.mkdir(parents=True)
     try:
         with _zf.ZipFile(src) as z:
-            bad = [i.filename for i in z.infolist() if i.filename.startswith('/') or '..' in Path(i.filename).parts]
-            if bad:
-                raise DownloadError(f'unsafe paths inside {src.name}: {bad[:3]}')
+            for i in z.infolist():
+                member_target(staging, i.filename)          # raises for a member that would land outside staging
             z.extractall(staging)
+    except DownloadError:             # an unsafe member: nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except _zf.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{src.name} is not a zip file ({e})') from e
