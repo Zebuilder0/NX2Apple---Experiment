@@ -256,7 +256,7 @@ extension BuildStore {
                                    groupPython: deps.pythonPath.isEmpty ? "/usr/bin/python3" : deps.pythonPath)
         var buffer = "", lastError = ""
         let onOutput: @Sendable (Data) -> Void = { [weak self] d in
-            guard let chunk = String(data: d, encoding: .utf8) else { return }
+            let chunk = String(decoding: d, as: UTF8.self)   // whole characters (ProcessRunner.start): a stray byte reads as \u{FFFD}, the rest stays
             hop {
                 guard let self else { return }
                 buffer += chunk
@@ -274,6 +274,11 @@ extension BuildStore {
         let onExit: @Sendable (Int32) -> Void = { [weak self] status in
             hop {
                 guard let self else { return }
+                if !buffer.isEmpty {   // the tool's last line, without a line end: it is often the error
+                    let line = buffer; buffer = ""
+                    self.append(line + "\n")
+                    if line.contains("error:") || line.hasPrefix("ERROR:") { lastError = line.trimmingCharacters(in: .whitespaces) }
+                }
                 if self.stopping {
                     self.stopping = false; self.running = false
                     self.resetProgress(); self.doneNote = self.t("msg.stopped"); self.cleanupStaging()

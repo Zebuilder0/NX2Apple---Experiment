@@ -258,7 +258,7 @@ extension BuildStore {
         }
         do {
             proc = try runner.start(launch, onOutput: { @Sendable [weak self] d in
-                guard let s = String(data: d, encoding: .utf8) else { return }
+                let s = String(decoding: d, as: UTF8.self)   // whole characters (ProcessRunner.start): a stray byte reads as \u{FFFD}, the rest stays
                 hop { self?.ingest(s) }
             }, onExit: onExit)
         } catch { fail(String(format: t("msg.launchFailed"), error.localizedDescription)) }
