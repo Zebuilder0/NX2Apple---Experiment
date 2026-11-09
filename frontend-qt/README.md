@@ -118,6 +118,7 @@ The upstream file is never edited, so the daily sync cannot conflict with this w
 | `which`, `python3`, `ctypes.CDLL(None)` | `sitecustomize.py` rewrites them at the subprocess boundary |
 | app icon via `actool` | Pillow, five sizes |
 | `codesign` ad-hoc + entitlements | skipped, since the sideloader re-signs the IPA anyway |
+| `build_shell.sh` (the shared app on a device) | the app comes ready-made in the zip, games go in as frameworks, `plumesign` signs (see [Install on an iPhone or iPad](#install-on-an-iphone-or-ipad-the-shared-app)) |
 | the IPA's Unix `x` bit | `win/fix_ipa_modes.py` rewrites the zip's central directory in place |
 
 ## What you need to install
@@ -265,6 +266,87 @@ broken IPA:
 Games whose shaders are in the RomFS — Mario Wonder, Odyssey, Mario Kart 8 Deluxe, the Zelda
 titles, Metroid Dread — do not need any of that.
 
+## Install on an iPhone or iPad (the shared app)
+
+Builds → Play on has two cards, as the Mac launcher has This Mac and iPhone / iPad. **Install on device** works like the
+Mac launcher's iPhone / iPad target: the game goes into one app on the device that holds all your games, signed with
+your own Apple ID, with no sideloader to run by hand. **Export as IPA** makes an unsigned IPA for AltStore, SideStore or
+another tool: the shared app with every built game (`NX2Apple.ipa` in the shell cache's `export` folder, written when
+the build ends), or one game with its data inside. Only the chosen card's section shows below it.
+
+**Once:** Settings → iPhone and iPad → Signing and installing (and its own step in the setup) has four rows, all
+optional for building. The build tools keep their own list under Build tools:
+
+| Row | What it is | What you do |
+|---|---|---|
+| Apple device service (iTunes) | Apple Mobile Device Support, the USB service every iPhone tool on Windows needs | **Get iTunes** opens Apple's page. Install iTunes from apple.com, not the Microsoft Store. Plug the device in and tap Trust |
+| Signing tool (Impactor) | `tools\plumesign.exe`, built from [Impactor](https://github.com/claration/impactor) with [our patch](impactor/README.md) | Nothing, the zip carries it |
+| Apple ID for signing | Impactor's own session in `%APPDATA%\PlumeImpactor` | **Sign in…** opens Impactor's console window: Apple ID, password (hidden), code. The launcher never sees the password. **Sign out** removes the session |
+| Shared app (ready-made) | `DmShell.app` in the zip's `shell_template` folder, the empty app built on GitHub's macOS runner (`tools/build_shell_template.py`), the same the IPA export uses | Nothing, the zip carries it |
+
+On the device, turn on Developer Mode once (Settings → Privacy & Security → Developer Mode). iOS hides that switch
+until a development tool asks for it, which Xcode does on a Mac when a device is plugged in. On Windows the install asks
+for it (`win/device.py` `reveal_developer_mode`, Apple's AMFI service) when the device reports Developer Mode off, and its
+note says where to turn it on. Turning it on stays on the device: iOS restarts and asks for the passcode.
+
+**Each build:** the game is built as `DmGame<title ID>.framework` (`--shell-framework`, `win/build_app.py`
+`DM_FRAMEWORK_ONLY`), its data is packed into `<output>/games/<title ID>/`, the game goes into the shared app's library
+(`shell.json` in the shell cache folder, the Mac launcher's format, its framework mirrored beside it), then
+`device_model.py` runs `win/install.py`, as the rest of the same run:
+
+1. stage the empty app as the IPA export does (fonts, Info.plist, an ad-hoc signature carrying the Increased Memory
+   Limit entitlement: `win/shell_export.py` `assemble_app`) and put every chosen game's framework and banner into its
+   `Frameworks/`,
+2. `plumesign sign --apple-id --udid <device> --register-and-install`: signs the app and the frameworks, registers the
+   device, asks Apple for Increased Memory Limit (the app's executable requests it), installs over USB
+   (`win/signer.py`, every line of its output is redacted before it reaches the log, and a 40-minute limit ends it and
+   what it started),
+3. copy the game data the device lacks into the app's `Documents/games/<title ID>/` (`win/device.py`: usbmuxd,
+   lockdownd, house_arrest and AFC, standard library only), through a `.part` file renamed at the end.
+
+Stop is a stop at every step: the run ends as stopped, never as installed or as a failure to explain. The bundle ID is
+`org.nxnative.shell.<team ID>` every time, so installing again keeps the saves and the game data. A device on an iOS
+older than the app's `MinimumOSVersion` (26) is told so before anything is signed.
+
+**Older iPhones and iPads** (before the A17 Pro, iPads before the M1) have no BC texture formats. The **Older devices**
+switch, under Play on and on by default on Windows, writes `DM_PROF_TEX_BC_CPU=1` into the build's env file (the
+framework's `dm/env.txt`): the engine then decodes BC textures on the CPU where the GPU cannot, and changes nothing on a
+GPU that reads them (`nvn_mtl.m`), so one build plays on every device. A game built with it off says "newer devices
+only" in the library and the transfer window. Before this, the switch wrote `DM_TEX_BC_CPU`, a name the engine never
+read.
+
+**Transfer to device:** a game built for the shared app has **Transfer to device** as its main button in the library
+(**Show in folder** is under Manage). It opens a window: the device, and the built games its app should hold, ticked
+with the ones already there. The install runs in that window with one progress bar and the log; closed while it runs,
+it shrinks to a card in the window's bottom-right corner. Settings → iPhone and iPad → **Install the launcher on a
+device** opens the same window, and so does a device without NX2Apple being plugged in (**Offer the launcher when a new
+device connects**, on by default; a device that has the app from another computer is not asked). `devices.json`
+remembers which games each device holds.
+
+With **Update the launcher when a device connects** on (Settings, the default), a device that has the app from this PC
+is signed and installed again by itself when it is plugged in and the signature is 5 days old (a free Apple ID's lasts
+7) or its games changed. The Mac launcher has the same switch.
+
+The build's choices (prod.keys, the last game's files, Save to, Play on, Older devices) stay from one start to the next.
+Choosing a games folder makes it the Save to folder, as on the Mac.
+
+Limits: an Apple ID with several developer teams is asked which one in the sign-in window, once. A free Apple ID allows
+3 sideloaded apps (the shared app is one) and 10 app IDs a week. Nothing here has been tried on a device from this
+integration yet: `tests/test_device_install.py` and `tests/test_run_lifecycle.py` run the install against a pretend
+device and a pretend signer.
+
+## The build queue
+
+**Add to queue** beside Build game takes the game chosen on the page with its choices (files, prod.keys, Save to, Play
+on) and empties the game rows for the next one; it works while a build runs. **Start queue** builds the queued games one
+after another (`nspb_qt/queue_model.py`); a game that fails is marked and the queue goes on, and **Stop after this
+game** ends it after the current one. The queue card shows how long the waiting games take and how much free space
+each drive has after all of them, the game chosen above but not yet queued included, in red when it would not fit.
+The estimates start from a default (about 2.6 times the game files plus 2 GB, 15 minutes plus 4 a GB) and then take
+the median of this PC's own finished builds (the drop in free space and the time per GB of game files). Games built
+for the device are not installed one by one: when the queue ends, the device under Install on gets one install with
+all of them if it is plugged in. The queue is kept in the settings and survives a restart.
+
 ## Run a build
 
 ```bat
@@ -273,7 +355,8 @@ python -m nspb_qt.win.driver D:\Games\MarioWonder -k D:\keys\prod.keys
 
 The options are the upstream script's (`-h`). The IPA is unsigned, as on a Mac: sign it with
 Sideloadly (Windows), AltStore, or similar, and enable the Increased Memory Limit capability if
-the tool offers it. The IPA name and the RomFS archive come out where the macOS build puts them.
+the tool offers it. In the app, **Install on device** signs and installs for you instead (above). The IPA name and
+the RomFS archive come out where the macOS build puts them.
 
 ## Open risks
 
