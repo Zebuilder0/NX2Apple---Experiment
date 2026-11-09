@@ -79,6 +79,22 @@ def archive_folder(output: str, key: str) -> Path:
 BC_CPU_ENV = 'DM_PROF_TEX_BC_CPU=1\n'
 
 
+@dataclass(frozen=True)
+class RunInputs:
+    """What a build was started with. The end of its run (the archive, the library entry, the install or the IPA, the
+    failure's explanation and its folder) reads these, never the page: the player may pick the next game or Add to
+    queue (which empties the rows) while a build runs, and the built game was recorded with those files instead."""
+    base: str = ''
+    update: str = ''
+    dlc: tuple = ()
+    keys: str = ''
+    out_dir: str = ''
+    home: str = ''              # the folder of the game's files (a game folder's own folder)
+    title_id: str = ''
+    output_mode: str = ''       # Windows: 'device' or 'ipa', as chosen when Build was pressed
+    one_game: bool = False      # a one-game IPA, not a framework for the shared app
+
+
 @dataclass
 class Stage:
     name: str
@@ -134,6 +150,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.run_stopped = False        # the last run ended because the player stopped it (not a failure)
         self._cancel_requested = False  # Stop was pressed during this run (cancel_run)
         self._sync_waiters: list[Callable[[bool], None]] = []   # callers waiting for the engine sync that runs
+        self.run_inputs: RunInputs | None = None   # what the build that runs (or ran last) was started with
         self.log_tail = ''
         self.engine_syncing = False   # tools/engine.py sync runs: the window shows a status line
         self.engine_failure: bf.Failure | None = None   # how the last sync stopped (engine.py's failure_kind), shown as a failure row with Try again
@@ -1869,6 +1886,10 @@ class Model(QObject, DeviceMixin, QueueMixin):
         archive_dest = str(archive_folder(self.out_dir or base_dir, tid_hex))
         if not self.begin_run('build'):
             return
+        self.run_inputs = RunInputs(base=self.base_path, update=self.update_path, dlc=tuple(self.dlc_paths),
+                                    keys=self.keys_path, out_dir=self.out_dir, home=base_dir, title_id=tid_hex,
+                                    output_mode=self.output_mode, one_game=self.exports_one_game)
+        one_game = self.run_inputs.one_game
         self.stages = []
         self.log_tail = ''
         self._last_error = ''
@@ -1929,7 +1950,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                     if st.state == 'running':
                         st.state = 'done'
                 emit_safely(self.stagesChanged)
-                if self.exports_one_game:
+                if one_game:
                     self._record_library_ios_completion()
                     self.end_run(True, self.t('shell.oneGameDone', self.ipa_path))
                 elif shell_fw:
@@ -1967,11 +1988,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
         return self.t(f.what_key)
 
     def _keys_readable(self) -> bool | None:
-        """Whether the chosen keys file can be opened: None when none is chosen."""
-        if not self.keys_path:
+        """Whether the build's keys file can be opened: None when none was chosen."""
+        keys = self.run_inputs.keys if self.run_inputs is not None else self.keys_path
+        if not keys:
             return None
         try:
-            with open(self.keys_path, 'rb'):
+            with open(keys, 'rb'):
                 return True
         except OSError:
             return False
@@ -1979,7 +2001,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
     def failure_folder(self, f: 'bf.Failure') -> str:
         """The folder "Show folder" opens: the one with the game files, else the one the message names. For a full disk the
         build folder (`<title ID>_build`) when it is there, since that is where the space went."""
-        game_dir = str(Path(self.base_path).parent) if self.base_path else ''
+        base = self.run_inputs.base if self.run_inputs is not None else self.base_path   # the failed build's game
+        game_dir = str(Path(base).parent) if base else ''
         folder = game_dir or (f.detail if f.kind == bf.NO_TITLE_ID else '') or ''
         if f.kind == bf.DISK_FULL and game_dir:
             try:
@@ -2075,6 +2098,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
         # romfs.img — one file, which copies to a phone at full speed where 300,000 did not. One folder per game, as
         # the Mac launcher packs it (BuildStore+Archive.swift): a shared <output>/romfs held the last game built
         # there only, so an earlier game's data could no longer be sent to a device.
+        if dest is None and self.run_inputs is not None:      # the build's own place, not the page's choice now
+            dest = str(archive_folder(self.run_inputs.out_dir or self.run_inputs.home, self.run_inputs.title_id))
         home = self.game_folder.folder if self.game_folder is not None else str(Path(self.base_path).parent)
         dest = dest or str(archive_folder(self.out_dir or home, self.build_key))
         self.stages.append(Stage(name=self.t('prog.archiveShort'), state='running'))
@@ -2135,20 +2160,23 @@ class Model(QObject, DeviceMixin, QueueMixin):
         threading.Thread(target=work_, daemon=True).start()
 
     def _record_library_ios_completion(self) -> None:
+        """The built game in the library, with the files the build was started with (run_inputs), not the page's."""
+        r = self.run_inputs or RunInputs(base=self.base_path, update=self.update_path, dlc=tuple(self.dlc_paths),
+                                         keys=self.keys_path, out_dir=self.out_dir)
         inputs_map: dict[str, list[str]] = {}
-        if self.base_path:
-            inputs_map['base'] = [self.base_path]
-        if self.update_path:
-            inputs_map['update'] = [self.update_path]
-        if self.dlc_paths:
-            inputs_map['dlc'] = list(self.dlc_paths)
-        if self.keys_path:
-            inputs_map['keys'] = [self.keys_path]
+        if r.base:
+            inputs_map['base'] = [r.base]
+        if r.update:
+            inputs_map['update'] = [r.update]
+        if r.dlc:
+            inputs_map['dlc'] = list(r.dlc)
+        if r.keys:
+            inputs_map['keys'] = [r.keys]
         g = self.library.record_completed_ios(
             ipa_path=self.ipa_path,
             archive_path=self.archive_path,
-            base_path=self.base_path,
-            output_dir=self.out_dir,
+            base_path=r.base,
+            output_dir=r.out_dir,
             inputs=inputs_map,
             repo_path=self.engine_path,
         )

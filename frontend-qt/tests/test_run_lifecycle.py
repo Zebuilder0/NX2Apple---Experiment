@@ -216,6 +216,27 @@ class ModelRuns(unittest.TestCase):
             m.after_framework_build('/work', '')
         self.assertEqual(calls, [('U', True, True)])
 
+    def test_a_built_game_goes_where_it_was_meant_to_when_build_was_pressed(self):
+        """N2: Play on switched to Export as IPA while the build ran: the game still installs, as chosen at the start."""
+        from nspb_qt import device_model as dm
+        from nspb_qt.model import RunInputs
+        m = self.model()
+        m.begin_run('build')
+        m.run_inputs = RunInputs(title_id='0100ABCD00000000', output_mode='device')
+        m.output_mode = 'ipa'                       # the page now
+        calls, exports = [], []
+        game = shell.Game('0100ABCD00000000', 'Game', '/fw')
+        with mock.patch.object(dm.shell, 'built_framework', return_value=Path('/fw')), \
+                mock.patch.object(dm.shell, 'add_built_game', return_value=game), \
+                mock.patch.object(type(m), 'device_install_ready', new_callable=mock.PropertyMock, return_value=True):
+            m.install_udid = 'U'
+            m.device_by_udid = lambda u: object()
+            m.device_titles = lambda u: []
+            m.export_shell_ipa = lambda dest: exports.append(dest) or (True, 'exported')
+            m.install_on_device = lambda udid, **k: calls.append(udid) or True
+            m.after_framework_build('/work', '')
+        self.assertEqual((calls, exports), (['U'], []))
+
     def test_stop_ends_the_tool_that_runs_now(self):
         m = self.model()
         m.begin_run('install')
@@ -322,6 +343,77 @@ class ModelRuns(unittest.TestCase):
             release.set()
             self.assertTrue(self.wait(lambda: len(answers) == 2))
         self.assertEqual(sorted(answers), [('first', False), ('second', False)])
+
+
+@unittest.skipIf(QApplication is None, 'PySide6 is not installed')
+class RunInputsStayTheRuns(unittest.TestCase):
+    """N2: the player picks the next game (or adds one to the queue, which empties the rows) while a build runs. The end
+    of that build records the game it built, with its own files, not the ones on the page by then."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_the_library_records_the_files_the_build_started_with(self):
+        from nspb_qt import engine as eng
+        from nspb_qt import model as mm
+        from nspb_qt.model import Model
+        tmp = Path(tempfile.mkdtemp())
+        a = tmp / 'a'
+        b = tmp / 'b'
+        a.mkdir()
+        b.mkdir()
+        base_a = a / 'Game A [0100000000010000][v0].nsp'
+        upd_a = a / 'Game A [0100000000010800][v65536].nsp'
+        base_b = b / 'Game B [0100000000020000][v0].nsp'
+        keys = tmp / 'prod.keys'
+        for f in (base_a, upd_a, base_b, keys):
+            f.write_bytes(b'x')
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        self.addCleanup(m.deleteLater)
+        m.base_path, m.update_path, m.keys_path, m.out_dir = str(base_a), str(upd_a), str(keys), str(tmp / 'out')
+        m.ipa_kind = 'oneGame'                   # a one-game IPA: the run ends by recording it in the library
+        release = threading.Event()
+
+        class Build:
+            """The build script: it runs until the test has changed the page, then succeeds."""
+            returncode = 0
+
+            def __init__(self, *a, **k):
+                self.stdout = self.lines()
+
+            def lines(self):
+                yield '[1/1] build\n'
+                release.wait(10)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+        ends = []
+        m.finished.connect(lambda ok, note: ends.append(ok))
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True), \
+                mock.patch.object(eng, 'needs_sync_before_build', return_value=False), \
+                mock.patch.object(Model, 'supports_work_dir', lambda self: True), \
+                mock.patch.object(mm.subprocess, 'Popen', Build):
+            m.start_build()
+            self.assertTrue(m.running)
+            # meanwhile, on the page: the next game, as the file picker or Add to queue leaves it
+            m.leave_game_folder()
+            m.base_path, m.update_path, m.dlc_paths = str(base_b), '', []
+            release.set()
+            deadline = time.time() + 10
+            while not ends and time.time() < deadline:
+                self.app.processEvents()
+                time.sleep(0.02)
+        self.assertEqual(ends, [True])
+        built = next(g for g in m.library.games if g.title_id == '0100000000010000')
+        self.assertEqual(built.inputs.get('base'), [str(base_a)])
+        self.assertEqual(built.inputs.get('update'), [str(upd_a)])
+        self.assertFalse(any(g.title_id == '0100000000020000' for g in m.library.games),
+                         'the game picked during the build was recorded as the one built')
 
 
 @unittest.skipIf(QApplication is None, 'PySide6 is not installed')

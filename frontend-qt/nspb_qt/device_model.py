@@ -244,7 +244,9 @@ class DeviceMixin:
         self.log(self.t('win.install.added', game.name) + '\n')
         if archive and Path(archive).is_dir():
             shell.remember_data(Path(self.shell_cache_path), game.titleID, Path(archive))
-        if getattr(self, 'output_mode', 'device') == 'ipa':
+        run = getattr(self, 'run_inputs', None)
+        mode = run.output_mode if run is not None and run.output_mode else getattr(self, 'output_mode', 'device')
+        if mode == 'ipa':   # as chosen when Build was pressed, not what the page says now
             # Export as IPA: the shared app with every built game, unsigned, beside the build
             dest = Path(work_dir).parent / 'NX2Apple.ipa'
             try:
