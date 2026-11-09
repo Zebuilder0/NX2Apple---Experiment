@@ -221,9 +221,17 @@ struct LauncherView: View {
                 }
             }
             if !running {
+                // The end is handled on the next turn, once the model has set `done`. But running is false for a moment inside one
+                // turn between a build's own steps, and true again before this runs: the script's end and the archive step of an
+                // iPhone build (packArchive), the engine sync before a build, the device check (verifyShellDevice). The value
+                // SwiftUI sends when the view appears is false too, and Build can come before this runs. Clearing the entry
+                // regardless took it from the build that was running by then: that build ended with no entry to record, and the
+                // library never showed it as built.
+                let ending = activeBuildID
                 DispatchQueue.main.async {
+                    guard !m.running else { return }   // the same build went on: it keeps its entry
                     if m.done { recordBuild() }
-                    activeBuildID = nil
+                    if activeBuildID == ending { activeBuildID = nil }
                     engine.applyPendingEngine()   // an engine installed during the build takes over once it is recorded
                 }
             }
