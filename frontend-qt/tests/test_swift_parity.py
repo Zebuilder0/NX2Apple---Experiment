@@ -1161,8 +1161,8 @@ class LibraryAndSpaceTests(unittest.TestCase):
         class _FakeResp:
             def __init__(self, data: bytes) -> None:
                 self._data = data
-            def read(self) -> bytes:
-                return self._data
+            def read(self, n: int = -1) -> bytes:
+                return self._data if n < 0 else self._data[:n]
             def __enter__(self) -> _FakeResp:
                 return self
             def __exit__(self, *args: object) -> None:
