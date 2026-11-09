@@ -25,7 +25,7 @@ package enum BuildFailureClassifier {
         ("pso.low", .psoDiskFull, "pso_offline: [0-9.]+ GB free on the volume of [^\\n]+, metal-tt needs about [0-9.]+ GB for [0-9]+ bases:"),
         ("pso.merge", .psoDiskFull, "pso_offline: [0-9.]+ GB free before merging; need at least [0-9.]+ GB"),
         ("pso.failed", .psoDiskFull, "pso_offline: metal-tt failed[^\\n]+when it failed: likely out of disk space"),
-        ("disk.full", .diskFull, "No space left on device"),
+        ("disk.full", .diskFull, "No space left on device|There is not enough space on the disk"),
         ("icloud.detritus", .cloudFolder, "resource fork, Finder information, or similar detritus not allowed"),
         ("volume.swap", .volumeFormat, "\\[Errno 45\\] Operation not supported: '[^']*\\.app'"),
     ]

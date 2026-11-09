@@ -52,7 +52,9 @@ TABLE: list[tuple[str, str, str]] = [
     ('pso.low', PSO_DISK_FULL, r'pso_offline: [0-9.]+ GB free on the volume of [^\n]+, metal-tt needs about [0-9.]+ GB for [0-9]+ bases:'),
     ('pso.merge', PSO_DISK_FULL, r'pso_offline: [0-9.]+ GB free before merging; need at least [0-9.]+ GB'),
     ('pso.failed', PSO_DISK_FULL, r'pso_offline: metal-tt failed[^\n]+when it failed: likely out of disk space'),
-    ('disk.full', DISK_FULL, r'No space left on device'),
+    # the system's text for a full disk: POSIX (errno 28, macOS and Python's own writes on Windows), and Windows' own
+    # (ERROR_DISK_FULL, WinError 112: a copy through CopyFile2, the .NET tools, clang)
+    ('disk.full', DISK_FULL, r'No space left on device|There is not enough space on the disk'),
     ('icloud.detritus', CLOUD_FOLDER, r'resource fork, Finder information, or similar detritus not allowed'),
     ('volume.swap', VOLUME_FORMAT, r"\[Errno 45\] Operation not supported: '[^']*\.app'"),
 ]

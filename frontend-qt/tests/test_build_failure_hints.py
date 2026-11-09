@@ -84,6 +84,13 @@ class Classifier(unittest.TestCase):
         self.assertIsNone(bf.classify('[RED] ? (0100ABCD00000000) is a 32-bit ARM program (main.npdm)').game)
         self.assertIsNone(bf.classify('[RED] the shader translator does not run (x)').game)
 
+    def test_a_full_disk_on_windows_is_a_full_disk(self):
+        """Windows says it in its own words (ERROR_DISK_FULL) where a POSIX system says errno 28's."""
+        for line in ('[RED] OSError: [WinError 112] There is not enough space on the disk',
+                     'error: unable to write file: There is not enough space on the disk.'):
+            with self.subTest(line):
+                self.assertEqual(bf.classify(line).kind, bf.DISK_FULL)
+
     def test_the_table_is_the_swift_one(self):
         rows = re.findall(r'\("([\w.]+)", \.(\w+), "((?:[^"\\]|\\.)*)"\)', SWIFT)
         self.assertEqual(len(rows), len(bf.TABLE))
