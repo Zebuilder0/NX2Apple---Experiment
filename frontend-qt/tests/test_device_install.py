@@ -52,6 +52,39 @@ def make_framework(folder: Path, tid: str, name='Game') -> Path:
     return fw
 
 
+def embedded_entitlements(path: Path) -> dict | None:
+    """The entitlements a code-signing reader finds in a Mach-O, read the way apple-codesign does for plumesign
+    (crates/plume_core/src/utils/macho.rs embedded_entitlements): LC_CODE_SIGNATURE's SuperBlob, its slot 5, a blob with
+    the entitlements magic holding an XML plist dictionary. None when there is none."""
+    import struct
+    data = path.read_bytes()
+    if data[:4] != b'\xcf\xfa\xed\xfe':
+        return None
+    ncmds = struct.unpack_from('<I', data, 16)[0]
+    off = 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', data, off)
+        if cmd == 0x1D:                                     # LC_CODE_SIGNATURE
+            dataoff, _datasize = struct.unpack_from('<II', data, off + 8)
+            if dataoff + 12 > len(data):                    # a placeholder past the end: not signed yet
+                return None
+            magic, _length, count = struct.unpack_from('>III', data, dataoff)
+            if magic != 0xFADE0CC0:                         # CSMAGIC_EMBEDDED_SIGNATURE
+                return None
+            for i in range(count):
+                slot, blob_off = struct.unpack_from('>II', data, dataoff + 12 + 8 * i)
+                if slot == 5:                               # CSSLOT_ENTITLEMENTS
+                    bmagic, blen = struct.unpack_from('>II', data, dataoff + blob_off)
+                    if bmagic != 0xFADE7171:                # CSMAGIC_EMBEDDED_ENTITLEMENTS
+                        return None
+                    body = data[dataoff + blob_off + 8:dataoff + blob_off + blen]
+                    value = plistlib.loads(body)
+                    return value if isinstance(value, dict) else None
+            return None
+        off += size
+    return None
+
+
 def add_built(root: Path, built: Path) -> se.ShellGame:
     """A built framework into the shared app's library, as the build's end does (shell_export.add_to_library)."""
     tid = se.title_id_of_framework(built)
@@ -241,8 +274,9 @@ class SharedApp(unittest.TestCase):
         self.assertFalse((tpl / 'Frameworks').exists())                  # the template stays empty
         # the signing tool asks Apple for the capabilities the executable's entitlements name: the staging signs it
         # ad hoc with the Increased Memory Limit entitlement, as the IPA export does
-        self.assertIn(b'com.apple.developer.kernel.increased-memory-limit', (app / 'DmShell').read_bytes())
-        self.assertNotIn(b'increased-memory-limit', (tpl / 'DmShell').read_bytes())
+        self.assertEqual(embedded_entitlements(app / 'DmShell'),
+                         {'com.apple.developer.kernel.increased-memory-limit': True})
+        self.assertIsNone(embedded_entitlements(tpl / 'DmShell'))
         app2 = se.assemble_app(root, '', tpl, se.present_games(root), bundle_id='org.nxnative.shell')   # a fresh copy
         self.assertEqual(app, app2)
         with self.assertRaises(ValueError):
