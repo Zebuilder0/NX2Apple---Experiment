@@ -73,6 +73,22 @@ import XCTest
         XCTAssertEqual(none.signingTeam, "", "no team at all clears it")
     }
 
+    /// The automatic re-sign's listing (LauncherView+AutoResign.swift): the devices, and nothing of the teams, so a team listing
+    /// that comes back empty cannot clear the chosen team every two minutes.
+    func testRefreshDevicesListsTheDevicesAndLeavesTheTeamsAlone() async {
+        final class Asked: @unchecked Sendable { var teams = 0 }
+        let asked = Asked(), devices = [phone]
+        let store = DeviceStore(runner: runner, xcrun: "/fake/xcrun", defaults: defaults,
+                                listDevices: { _ in devices }, readTeams: { asked.teams += 1; return [] })
+        store.signingTeam = laptopTeam.id
+        await store.refreshDevices().value
+        XCTAssertEqual(store.devices, [phone])
+        XCTAssertEqual(store.signingTeam, laptopTeam.id)
+        XCTAssertEqual(store.teams, [])
+        XCTAssertFalse(store.checked, "the full listing (devices and teams) has not run")
+        XCTAssertEqual(asked.teams, 0)
+    }
+
     func testTheChosenDeviceAndTeamAreSavedAndComeBack() {
         let store = makeStore()
         store.installDevice = "UDID-1"

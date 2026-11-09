@@ -104,6 +104,17 @@ package enum SendWhere {
         }
     }
 
+    /// The paired devices only, read in the background: what the automatic re-sign asks every two minutes
+    /// (LauncherView+AutoResign.swift). The teams stay as they are: reading them runs the keychain tools, and a team listing
+    /// that came back empty for a moment would clear the chosen team. An unchanged list is not published again.
+    @discardableResult package func refreshDevices() -> Task<Void, Never> {
+        let xcrun = xcrun, list = listDevices
+        return Task { @MainActor in
+            let devices = await Task.detached(priority: .utility) { list(xcrun) }.value
+            if devices != self.devices { self.devices = devices }
+        }
+    }
+
     // MARK: The copy flow
 
     /// Asks the player whether the game data goes over now (the card shows the plan with Continue, "Wait for a cable" and "Not now")
