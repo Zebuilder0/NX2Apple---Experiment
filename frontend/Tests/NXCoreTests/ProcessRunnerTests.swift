@@ -136,6 +136,107 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertFalse(alive, "an ended process is no longer tracked")
     }
 
+    /// The exit is reported after the last output. Here a child writes the tool's real error after the tool has exited:
+    /// reported from terminationHandler alone, the exit came first, and runTool took its failure message from what it had.
+    func testStartHandsOutTheLastOutputBeforeTheExit() throws {
+        let output = Collected(), exited = expectation(description: "exit")
+        var atExit = ""
+        _ = try real.start(ProcessLaunch(["/bin/sh", "-c", "(sleep 0.5; echo 'error: the real reason') & echo started; exit 1"]),
+                           onOutput: { output.add(String(decoding: $0, as: UTF8.self)) },
+                           onExit: { _ in atExit = output.values.joined(); exited.fulfill() })
+        wait(for: [exited], timeout: 10)
+        XCTAssertTrue(atExit.contains("error: the real reason"), "the exit came before the last output: \(atExit)")
+    }
+
+    /// The ordinary case, many times: a tool that prints a lot and its error last, then exits at once.
+    func testStartGivesEveryLineBeforeTheExitOverManyRuns() throws {
+        let script = "i=0; while [ $i -lt 1500 ]; do echo progress $i; i=$((i+1)); done; echo 'error: last' >&2; exit 2"
+        for round in 0..<30 {
+            let output = Collected(), exited = expectation(description: "exit \(round)")
+            var atExit = "", status: Int32 = -1
+            _ = try real.start(ProcessLaunch(["/bin/sh", "-c", script]), onOutput: { output.add(String(decoding: $0, as: UTF8.self)) },
+                               onExit: { atExit = output.values.joined(); status = $0; exited.fulfill() })
+            wait(for: [exited], timeout: 10)
+            XCTAssertEqual(status, 2)
+            XCTAssertTrue(atExit.hasSuffix("error: last\n"), "round \(round): the last line came after the exit")
+            XCTAssertEqual(atExit.split(separator: "\n").count, 1501, "round \(round)")
+        }
+    }
+
+    /// A child the tool leaves behind with the output open (the build's MSBuild workers) does not hold the exit back for
+    /// longer than `outputGrace`.
+    func testStartReportsTheExitWhenAChildKeepsTheOutputOpen() throws {
+        let exited = expectation(description: "exit"), began = Date()
+        var status: Int32 = -1
+        _ = try real.start(ProcessLaunch(["/bin/sh", "-c", "sleep 8 & echo started; exit 4"]), onOutput: { _ in },
+                           onExit: { status = $0; exited.fulfill() })
+        wait(for: [exited], timeout: SystemProcessRunner.outputGrace + 4)
+        XCTAssertEqual(status, 4)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(began), SystemProcessRunner.outputGrace - 0.5)
+    }
+
+    /// Every chunk decodes on its own: one large write of multi-byte characters is read in pieces that cut characters.
+    func testStartHandsOutWholeCharactersOnly() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else { throw XCTSkip("System Python is required") }
+        let output = Collected(), undecodable = Collected(), exited = expectation(description: "exit")
+        let write = "import sys; sys.stdout.buffer.write(('\\u00e9\\u4e2d\\U0001F600' * 40000).encode())"
+        _ = try real.start(ProcessLaunch(["/usr/bin/python3", "-c", write]), onOutput: { d in
+            if let s = String(data: d, encoding: .utf8) { output.add(s) } else { undecodable.add("\(d.count) bytes") }
+        }, onExit: { _ in exited.fulfill() })
+        wait(for: [exited], timeout: 30)
+        XCTAssertEqual(undecodable.values, [], "chunks that end inside a character")
+        XCTAssertEqual(output.values.joined(), String(repeating: "\u{e9}\u{4e2d}\u{1F600}", count: 40000))
+    }
+
+    func testUTF8ChunkerNeverCutsACharacter() {
+        let text = "a\u{e9}\u{4e2d}\u{1F600}b\u{4e2d}"
+        let bytes = Array(text.utf8)
+        for first in 0...bytes.count {
+            for second in first...bytes.count {
+                var chunker = UTF8Chunker()
+                var out = Data()
+                for part in [bytes[..<first], bytes[first..<second], bytes[second...]] {
+                    let chunk = chunker.feed(Data(part))
+                    XCTAssertNotNil(String(data: chunk, encoding: .utf8), "cut at \(first) and \(second)")
+                    out.append(chunk)
+                }
+                XCTAssertEqual(chunker.finish(), Data())
+                XCTAssertEqual(String(data: out, encoding: .utf8), text)
+            }
+        }
+    }
+
+    func testUTF8ChunkerPassesOnBytesThatAreNotUTF8AndKeepsAnUnfinishedEnd() {
+        var chunker = UTF8Chunker()
+        XCTAssertEqual(chunker.feed(Data([0x61, 0xFF])), Data([0x61, 0xFF]))
+        XCTAssertEqual(chunker.feed(Data([0x80, 0x80, 0x80])), Data([0x80, 0x80, 0x80]))
+        XCTAssertEqual(chunker.feed(Data([0x62, 0xE4, 0xB8])), Data([0x62]))
+        XCTAssertEqual(chunker.finish(), Data([0xE4, 0xB8]))
+        XCTAssertEqual(chunker.finish(), Data())
+    }
+
+    /// A process that exits before start() tracks its group is not tracked: its PID would stay in the set, and quitting
+    /// would signal whatever group has that number by then.
+    func testAGroupWhoseProcessExitedFirstIsNotTracked() throws {
+        let quick = Process()
+        quick.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try quick.run(); quick.waitUntilExit()
+        let early = GroupLife()
+        early.ended(quick)     // its terminationHandler ran first
+        early.started(quick)   // then start() went on
+        XCTAssertFalse(ProcessGroups.isTracked(quick.processIdentifier))
+
+        let slow = Process()
+        slow.executableURL = URL(fileURLWithPath: "/bin/sleep"); slow.arguments = ["5"]
+        try slow.run()
+        defer { slow.terminate() }
+        let life = GroupLife()
+        life.started(slow)
+        XCTAssertTrue(ProcessGroups.isTracked(slow.processIdentifier))
+        life.ended(slow)
+        XCTAssertFalse(ProcessGroups.isTracked(slow.processIdentifier))
+    }
+
     // MARK: Timeout, input and whole lines
 
     func testCaptureEndsARunThatOutlastsItsTimeout() {

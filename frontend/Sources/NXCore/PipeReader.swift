@@ -7,13 +7,14 @@ import Foundation
 /// the dispatch source fires again, which pins a CPU core (#201). So the handler removes itself the moment it
 /// reads empty data.
 package enum PipeReader {
-    /// `onData` gets each non-empty chunk on a background queue. Returns at once: the handler runs until the end of
-    /// output and then removes itself. A caller that needs every byte before it goes on (the exit of the process is not
-    /// that moment: output can still be in the pipe) reads to the end itself, as ProcessRunner.capture and stream do.
-    package static func attach(to handle: FileHandle, onData: @escaping (Data) -> Void) {
+    /// `onData` gets each non-empty chunk on a background queue, one at a time. Returns at once: the handler runs until
+    /// the end of output and then removes itself, and `onEnd` is called once then, after the last `onData`. The exit of
+    /// the process is not that moment (output can still be in the pipe): ProcessRunner.start waits for `onEnd` before it
+    /// reports the exit, and capture and stream read to the end themselves.
+    package static func attach(to handle: FileHandle, onData: @escaping (Data) -> Void, onEnd: (() -> Void)? = nil) {
         handle.readabilityHandler = { h in
             let d = h.availableData
-            if d.isEmpty { h.readabilityHandler = nil; return }
+            if d.isEmpty { h.readabilityHandler = nil; onEnd?(); return }
             onData(d)
         }
     }

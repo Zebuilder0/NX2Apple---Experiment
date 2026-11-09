@@ -39,6 +39,12 @@ package enum ProcessGroups {
         lock.lock(); groups.remove(p.processIdentifier); lock.unlock()
     }
 
+    /// The group led by `leader` is in the set (the tests read it).
+    package static func isTracked(_ leader: pid_t) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return groups.contains(leader)
+    }
+
     /// A build's process group is still running (the app update waits for it: its relaunch would end the build).
     package static var buildProcessesAlive: Bool {
         lock.lock(); defer { lock.unlock() }
