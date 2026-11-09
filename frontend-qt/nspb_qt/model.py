@@ -387,9 +387,9 @@ class Model(QObject, DeviceMixin):
             self.log_path.write_text('', encoding='utf-8')
         except OSError:
             self.log_path = None
-        problem = getattr(self.library, 'load_problem', '')
-        if problem:     # a damaged library.json was moved aside, not overwritten: say where it is
-            self.log(problem + '\n')
+        self.library.log = self.log      # what the library leaves out (a game without a title ID) is said in the log
+        if self.library.load_problem:     # a damaged library.json was moved aside, not overwritten: say where it is
+            self.log(self.library.load_problem + '\n')
         self._device_init()
         # The build's choices last from one start to the next (the Mac launcher keeps the output folder, the target and
         # the texture switch; this one also keeps prod.keys and the last game, so a new start does not ask again).
@@ -2437,7 +2437,15 @@ class Model(QObject, DeviceMixin):
             # files from different folders or a shared ROMs folder: a stable folder of links per game, so the script sees
             # one game and its fingerprints match on the next build (#58, #132)
             staging = input_staging.folder(work_dir)
-            if input_staging.sync(staged, staging, hard_links=not pu.IS_WIN) == 0:
+            try:
+                # hard links on Windows too (NTFS has them; a copy is the fallback): multi-GB copies filled disks
+                staged_count = input_staging.sync(staged, staging, hard_links=True)
+            except input_staging.StagingError as e:
+                # a file that cannot be staged stops the build: built without it, the game would lack the update or
+                # DLC that was picked, and say nothing (audit M8)
+                self.finished.emit(False, self.t('msg.stagingFileFailed', Path(e.path).name, e.reason))
+                return
+            if staged_count == 0:
                 self.finished.emit(False, self.t('msg.stagingFailed'))
                 return
             input_dir = staging

@@ -17,6 +17,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import qt_sandbox  # noqa: E402,F401  (first: the tests never touch the player's settings or state)
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'frontend-qt'))
 
@@ -200,12 +203,9 @@ class BannerDownloadTests(unittest.TestCase):
         return sorted(p.name for p in self.store.banners_dir.iterdir() if p.name != 'banners_index.json')
 
     def asking_online(self) -> None:
-        """request_banner_async does nothing on the offscreen test platform (library.py's own switch). These tests ask
-        for the download itself, so that switch is off while they run."""
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        os.environ.pop('QT_QPA_PLATFORM', None)
+        """The tests' sandbox turns banner downloads off (ArtworkStore.fetch_online, qt_sandbox.py). These tests ask for
+        the download itself, so this store may fetch (the network is mocked)."""
+        self.store.fetch_online = True
 
     def test_an_error_page_is_not_saved_as_the_banner(self) -> None:
         self.fetch(b'<!DOCTYPE html><html><body>' + b'Sign in to the network ' * 200 + b'</body></html>')

@@ -1179,6 +1179,7 @@
   "msg.shadersStale.title": "Rebuilding the shaders",
   "msg.stagedFromSharedFolder": "The folder holds other games: building from a temporary copy of this one (%@)",
   "msg.stagingFailed": "Could not create links in the staging folder (files on different volumes?)",
+  "msg.stagingFileFailed": "%@ could not be put in the staging folder (%@). The build would run without it, so it did not start.",
   "msg.stopped": "Stopped",
   "msg.toolsOld": "Build not started: the build tools are older than this app (missing %@). Update them in Settings → Build tools first",
   "msg.workdirHint": "Tip: the output folder is also where the build cache lives (<output>/<ID>_build). To reuse an existing build, point it back at the same folder, since a new folder starts over. When the output folder is on an external drive, a first build is noticeably slower (worse on exFAT or a hard disk).",

@@ -11,7 +11,6 @@ import re
 import shutil
 import stat
 import struct
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -31,8 +30,6 @@ def default_state_dir() -> Path:
     env_dir = os.environ.get('NSPB_STATE_DIR')
     if env_dir:
         return Path(env_dir)
-    if os.environ.get('QT_QPA_PLATFORM') == 'offscreen':
-        return Path(tempfile.gettempdir()) / f'nspb-offscreen-{os.getpid()}'
     if pu.IS_WIN:
         root = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
         return root / 'NS Port Builder'
@@ -1068,6 +1065,10 @@ class ArtworkStore:
     #: The largest banner kept (the Mac's limit too). A banner is a few hundred KB.
     MAX_BANNER_BYTES = 20 << 20
 
+
+    #: Whether banners are fetched from the eShop's image hosts. The tests turn it off for the whole run
+    #: (tests/qt_sandbox.py): the app itself has no test switch (it used to treat the offscreen Qt platform as one).
+    fetch_online = True
     def __init__(self, state_dir: Path | None = None, on_updated: Callable[[str], None] | None = None) -> None:
         self.state_dir = state_dir or default_state_dir()
         self.banners_dir = self.state_dir / 'banners'
@@ -1197,7 +1198,7 @@ class ArtworkStore:
         return out
 
     def request_banner_async(self, title_id: str) -> None:
-        if os.environ.get('QT_QPA_PLATFORM') == 'offscreen':
+        if not self.fetch_online:
             return
         tid = title_id.upper()
         if self.has_custom(tid) or self._cached_banner(tid):

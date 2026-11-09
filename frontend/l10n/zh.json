@@ -1180,6 +1180,7 @@
   "msg.shadersStale.title": "正在重建 shader 库",
   "msg.stagedFromSharedFolder": "文件夹里还有其他游戏：只把选中的这个游戏（%@）临时复制出去构建",
   "msg.stagingFailed": "无法在暂存文件夹里建立链接（文件在不同磁盘？）",
+  "msg.stagingFileFailed": "无法把 %@ 放进暂存文件夹（%@）。没有它构建结果会不完整，所以没有开始构建。",
   "msg.stopped": "已停止",
   "msg.toolsOld": "构建工具比本 App 旧（缺少 %@），构建未开始——先在设置 → 构建工具中更新",
   "msg.workdirHint": "提示：「输出目录」同时是构建缓存的位置（输出目录/<ID>_build）。已有构建资源时，把它选回上次的同一位置即可复用（解包、shader 不重跑），换新位置会从头再来。当「输出目录」为外置硬盘时，首次构建会明显变慢（exFAT 或机械硬盘更明显）。",
