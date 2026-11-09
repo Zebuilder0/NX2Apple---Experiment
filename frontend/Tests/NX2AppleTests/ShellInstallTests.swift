@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import Combine
 @testable import NX2Apple
 @testable import NXCore
@@ -1006,6 +1007,68 @@ import NXModel
         for item in ["Sources", "Shell", "tools"] {
             XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: f.root + "/project/" + item), checkout + "/engine/dm/ios/" + item)
         }
+    }
+
+    /// The whole iPhone build through the launcher's window: the library records the app on the device. The device check and the
+    /// script's end (the archive step after it) leave the build not running for a moment inside one turn, and the window used to
+    /// drop the build's library entry then, so an iPhone build was never recorded as installed: no Play on the device from the
+    /// library, no tools commit for the "built with older tools" note.
+    @MainActor func testAnIPhoneBuildThroughTheWindowIsRecordedAsInstalled() throws {
+        let f = try fixtureWithRomFSTool()
+        testDefaults.set(f.root, forKey: "shellRoot")
+        let modelStores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = modelStores.build
+        modelStores.repo.path = f.repo
+        model.target = "ios"
+        model.outDir = path("out")
+        modelStores.dependencies.pythonPath = "/usr/bin/python3"
+        modelStores.dependencies.dotnetPath = "/usr/bin/true"
+        modelStores.dependencies.checked = true
+        modelStores.dependencies.deps = [Dep(id: "test", name: "test", hint: "", present: true, installCmd: [])]
+        modelStores.deviceStore.installDevice = device
+        modelStores.deviceStore.signingTeam = team
+        try write(f.repo + "/dm/tools/nx_extract/Program.cs", "")
+        try write(f.repo + "/scripts/build_ipa_from_nsp.py", """
+        import sys, json, pathlib
+        work = pathlib.Path(sys.argv[sys.argv.index('--work-dir') + 1])
+        fw = pathlib.Path(sys.argv[sys.argv.index('--shell-framework') + 1]) / 'DmGame\(titleID).framework'
+        fw.mkdir(parents=True); (fw / 'game.manifest.json').write_text('{}'); (fw / 'DmGame\(titleID)').write_text('executable')
+        (work / 'extract/v0/RomFS').mkdir(parents=True); (work / 'extract/v0/RomFS/data.bin').write_bytes(b'game')
+        print(json.dumps(dict(ev='stage', k=1, n=1, name='framework')), flush=True)
+        print(json.dumps(dict(ev='stage_end', k=1, name='framework', ok=True, summary='', elapsed=1)), flush=True)
+        """)
+        let base = temporary.appendingPathComponent("Test [\(titleID)].nsp"), keys = temporary.appendingPathComponent("prod.keys")
+        try Data([0]).write(to: base); try Data().write(to: keys)
+        model.slots[0].paths = [base.path]; model.slots[3].paths = [keys.path]
+        try fm.removeItem(atPath: f.archive)   // the build's own archive step makes it
+        // xcodebuild's stand-in makes the app's folder and nothing in it. A real app has an Info.plist, which the library checks for.
+        let app = f.root + "/derived-data/Build/Products/Release-iphoneos/DmShell.app"
+        try write(app + "/Info.plist", "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>")
+
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let host = NSHostingView(rootView: LauncherView(stores: modelStores, library: library, initialPage: .builds, performStartupChecks: false))
+        let window = OffscreenWindow(size: NSSize(width: 1100, height: 800))
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let asked = modelStores.deviceStore.$shellCopy.compactMap { $0 }.prefix(1).sink { _ in modelStores.deviceStore.answerCopy(.copy) }
+        let installed = expectation(description: "Installed")
+        let token = model.$done.filter { $0 }.prefix(1).sink { _ in installed.fulfill() }
+        model.startBuild()
+        wait(for: [installed], timeout: 60)
+        withExtendedLifetime(token) {}; withExtendedLifetime(asked) {}
+        XCTAssertEqual(model.installedOn, device)
+        XCTAssertEqual(model.installedAppPath, app)
+
+        // The window records the build a turn after its end
+        let recorded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in library.games.first?.installedDevice == self.device }, object: nil)
+        wait(for: [recorded], timeout: 10)
+        XCTAssertEqual(library.games.count, 1)
+        let game = try XCTUnwrap(library.games.first)
+        XCTAssertEqual(game.titleID, titleID)
+        XCTAssertEqual(game.iosAppPath, app)
+        XCTAssertEqual(game.archivePath, model.archivePath)
+        XCTAssertTrue(game.onDevice)
     }
 
     @MainActor private func makeModel(_ f: Fixture) throws -> LauncherStores {

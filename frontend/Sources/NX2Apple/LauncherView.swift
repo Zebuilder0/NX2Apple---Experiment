@@ -260,10 +260,13 @@ struct LauncherView: View {
                 }
             }
             if !running {
+                // Handled on the next turn, once the model has set `done`. A build's own steps can set running false and true again
+                // within one turn (packArchive, the engine sync, verifyShellDevice): only the ID this build ended with is cleared.
+                let ending = activeBuildID
                 DispatchQueue.main.async {
                     guard !m.running else { return }   // a build may have started since the idle notification
                     if m.done { recordBuild() }
-                    activeBuildID = nil
+                    if activeBuildID == ending { activeBuildID = nil }
                     engine.applyPendingEngine()   // an engine installed during the build takes over once it is recorded
                 }
             }

@@ -820,6 +820,44 @@ import NXModel
         XCTAssertEqual(library.games[0].inputs["base"], [base.path])
     }
 
+    /// A build is not running for a moment inside one turn between its own steps (the script's end and the archive step of an
+    /// iPhone build, the engine sync before a build, the device check), and the window handles a build's end a turn later. It
+    /// used to drop the build's library entry then, while the build went on, so the finished build was never recorded: its card
+    /// stayed "not built". Here the moment is made by hand, so the test does not depend on timing.
+    @MainActor func testABuildKeepsItsLibraryEntryThroughAMomentItIsNotRunning() throws {
+        let modelStores = LauncherStores(defaults: testDefaults); let model = modelStores.build
+        model.lang = .en
+        modelStores.repo.path = temporary.path
+        model.target = "mac-app"
+        model.outDir = temporary.path
+        let base = temporary.appendingPathComponent("Test [\(titleID)].nsp")
+        try Data([0]).write(to: base)
+        model.slots[0].paths = [base.path]
+        let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
+        let host = NSHostingView(rootView: LauncherView(stores: modelStores, library: library, initialPage: .builds, performStartupChecks: false))
+        let window = OffscreenWindow(size: NSSize(width: 1100, height: 800))
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))   // the window is up and has handled the first value it was sent
+
+        model.running = true   // the build starts: the window gives it its library entry
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(library.games.count, 1)
+        XCTAssertEqual(library.games.first?.isReady, false)
+        model.running = false; model.running = true   // between two of the build's steps, in one turn (packArchive after the script)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))   // the turn in which the window handles that moment
+        // The app appears at the build's end: one already in the output folder would be linked when the build starts
+        // (rememberInputs, MacAppOutput.existing), and the entry would be ready without the window recording anything.
+        let app = try makeApp(titleID, name: "Test build")
+        model.macAppPath = app.path
+        model.running = false; model.done = true   // the build's real end
+        let recorded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in library.games.first?.isReady == true }, object: nil)
+        wait(for: [recorded], timeout: 10)
+        XCTAssertEqual(library.games.count, 1)
+        XCTAssertEqual(library.games.first?.appPath, app.path)
+    }
+
     /// Opt-in: the README's screenshots (frontend/screenshots/launcher-*.png), framed as macOS windows. They show a copy of
     /// the user's library with its eShop key art (never the library itself) and no personal paths.
     /// NX_LAUNCHER_README_DIR=<dir> NX_LAUNCHER_README_SETTINGS=<a Mac launcher.json> swift test --filter testReadmeScreenshots
