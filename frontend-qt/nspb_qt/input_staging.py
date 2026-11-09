@@ -48,17 +48,49 @@ def _same(src: str, dst: Path) -> bool:
         return False
 
 
+class StagingError(OSError):
+    """A picked file could not be put in the staging folder (or a file from an earlier selection could not be taken
+    out of it): the build would not be the one the player asked for. `path` is the file, `reason` why."""
+
+    def __init__(self, path: str, reason: object):
+        super().__init__(f'{path}: {reason}')
+        self.path, self.reason = str(path), str(reason)
+
+
+def _why(e: OSError) -> str:
+    return e.strerror or str(e) or type(e).__name__
+
+
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def sync(files: list[str], into: str, *, hard_links: bool = True) -> int:
-    """Make `into` hold exactly `files` (by file name), with their dates. Returns how many were linked."""
+    """Make `into` hold exactly `files` (by file name), with their dates. Returns how many were staged.
+
+    Each file is hard-linked when `hard_links` (NTFS and APFS both have them: no second copy of gigabytes), and copied
+    when it cannot be (another volume, FAT/exFAT, ReFS). A file that can be neither linked nor copied raises
+    StagingError, and half a copy is removed: the build used to go on without the picked update or DLC, with no word.
+    A stale file that cannot be removed raises it too, since the script would read it with the new selection."""
     root = Path(into)
-    root.mkdir(parents=True, exist_ok=True)
     wanted = {staged_name(Path(f).name): f for f in files if f}
-    for entry in root.iterdir():   # a stale entry from an earlier selection goes: only game files and links
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        entries = list(root.iterdir())
+    except OSError as e:
+        raise StagingError(str(root), _why(e)) from e
+    for entry in entries:   # a stale entry from an earlier selection goes: only game files and links
         if entry.is_symlink() or (entry.is_file() and entry.suffix.lower() in GAME_SUFFIXES):
             src = wanted.get(entry.name)
             if src and entry.exists() and _same(src, entry):
                 continue
-            entry.unlink(missing_ok=True)
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError as e:
+                raise StagingError(str(entry), _why(e)) from e
     linked = 0
     for name, src in wanted.items():
         dst = root / name
@@ -66,14 +98,18 @@ def sync(files: list[str], into: str, *, hard_links: bool = True) -> int:
             linked += 1
             continue
         try:
-            if hard_links:
-                os.link(src, dst)
-            else:
-                raise OSError
+            if not hard_links:
+                raise OSError('copying')
+            os.link(src, dst)
         except OSError:
             try:
-                shutil.copy2(src, dst)   # copy2 keeps the modification date
+                shutil.copyfile(src, dst)
+            except OSError as e:
+                _discard(dst)                  # half a copy (a full disk) is not the file
+                raise StagingError(src, _why(e)) from e
+            try:
+                shutil.copystat(src, dst)      # the date the script's fingerprints read (copy2's second half)
             except OSError:
-                continue
+                pass                           # a drive that keeps no dates still builds; the next one copies again
         linked += 1
     return linked

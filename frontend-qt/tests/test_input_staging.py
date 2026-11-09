@@ -77,6 +77,68 @@ class InputStagingTests(unittest.TestCase):
             self.assertEqual(input_staging.sync([upper, mixed], d, hard_links=hard), 2)   # again: nothing stale
             self.assertEqual(len(list(Path(d).iterdir())), 2)
 
+    def test_a_file_that_cannot_be_staged_stops_instead_of_being_left_out(self):
+        import errno
+        import shutil
+        from unittest import mock
+        base = make(self.root / 'a' / 'base.nsp', 100)
+        upd = make(self.root / 'b' / 'update.nsp', 100)
+        d = input_staging.folder(self.work)
+        real_copy = shutil.copyfile
+
+        def full_disk(src, dst, *a, **k):
+            if src == upd:
+                Path(dst).write_bytes(b'half')            # a copy cut off by a full disk
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real_copy(src, dst, *a, **k)
+        for hard in (True, False):   # a link that fails (another volume) falls back to the copy that fails
+            with self.subTest(hard_links=hard), \
+                    mock.patch.object(input_staging.os, 'link', side_effect=OSError('another volume')), \
+                    mock.patch.object(input_staging.shutil, 'copyfile', side_effect=full_disk):
+                with self.assertRaises(input_staging.StagingError) as cm:
+                    input_staging.sync([base, upd], d, hard_links=hard)
+                self.assertIsInstance(cm.exception, OSError)
+                self.assertEqual(cm.exception.path, upd)
+                self.assertIn('No space', cm.exception.reason)
+                self.assertFalse((Path(d) / 'update.nsp').exists(), 'half a copy was left as the update')
+
+    def test_a_link_that_fails_falls_back_to_a_copy_with_its_date(self):
+        from unittest import mock
+        base = make(self.root / 'a' / 'base.nsp', 100)
+        upd = make(self.root / 'b' / 'update.nsp', 9000)
+        d = input_staging.folder(self.work)
+        with mock.patch.object(input_staging.os, 'link', side_effect=OSError('FAT32 has no hard links')) as link:
+            self.assertEqual(input_staging.sync([base, upd], d, hard_links=True), 2)
+        self.assertEqual(link.call_count, 2, 'a hard link is tried first')
+        self.assertEqual(seen(d), [('base.nsp', 4096, os.stat(base).st_mtime_ns),
+                                   ('update.nsp', 4096, os.stat(upd).st_mtime_ns)])
+
+    def test_a_drive_that_keeps_no_dates_still_stages(self):
+        from unittest import mock
+        base = make(self.root / 'a' / 'base.nsp', 100)
+        d = input_staging.folder(self.work)
+        with mock.patch.object(input_staging.shutil, 'copystat', side_effect=PermissionError(1, 'not permitted')):
+            self.assertEqual(input_staging.sync([base], d, hard_links=False), 1)
+        self.assertEqual((Path(d) / 'base.nsp').read_bytes(), b'x' * 4096)
+
+    def test_a_stale_file_that_cannot_be_removed_stops_the_staging(self):
+        from unittest import mock
+        old_upd = make(self.root / 'b' / 'update [v65536].nsp', 100)
+        base = make(self.root / 'a' / 'base.nsp', 100)
+        d = input_staging.folder(self.work)
+        input_staging.sync([base, old_upd], d)
+        real_unlink = Path.unlink
+
+        def in_use(self, *a, **k):
+            if self.name == 'update [v65536].nsp':
+                raise PermissionError(13, 'The file is in use by another process')
+            return real_unlink(self, *a, **k)
+        with mock.patch.object(Path, 'unlink', in_use):
+            with self.assertRaises(input_staging.StagingError) as cm:
+                input_staging.sync([base], d)
+        self.assertEqual(Path(cm.exception.path).name, 'update [v65536].nsp')
+        self.assertIn('in use', cm.exception.reason)
+
 
 if __name__ == '__main__':
     unittest.main()
