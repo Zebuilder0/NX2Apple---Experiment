@@ -30,7 +30,8 @@ from nspb_qt.win import shell_export as se   # noqa: E402
 from nspb_qt.win import signer   # noqa: E402
 
 try:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication, QWidget
 except ImportError:
     QApplication = None
 
@@ -496,6 +497,59 @@ class WholeBuilds(Waits, unittest.TestCase):
         self.assertFalse(m.cancel_requested)
         self.assertFalse(m.run_stopped)
         m.end_run(True, '')
+
+
+@unittest.skipIf(QApplication is None, 'PySide6 is not installed')
+class TransferWindowLifetime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_a_closed_transfer_window_hears_nothing_more(self):
+        from PySide6.QtCore import QObject, Signal
+        from nspb_qt import transfer
+
+        class Model(QObject):
+            devicesChanged, depsChanged, stagesChanged = Signal(), Signal(), Signal()
+            runningChanged, logAppended, finished = Signal(bool), Signal(str), Signal(bool, str)
+            devices, install_udid, running, stages, device_install_ready = [], '', False, [], True
+
+            def t(self, k, *a):
+                return k
+
+            def refresh_devices(self):
+                pass
+
+            def cancel_install(self):
+                pass
+
+            def built_games(self):
+                return []
+
+            def device_titles(self, u):
+                return []
+
+            def device_by_udid(self, u):
+                return None
+
+            def device_label(self, d):
+                return ''
+        m = Model()
+        parent = QWidget()
+        d = transfer.TransferDialog(m, parent)
+        d.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+        errors = []
+        old = sys.excepthook
+        sys.excepthook = lambda *a: errors.append(a[1])
+        try:
+            m.runningChanged.emit(True)
+            m.depsChanged.emit()
+            m.finished.emit(True, '')
+            self.app.processEvents()
+        finally:
+            sys.excepthook = old
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':

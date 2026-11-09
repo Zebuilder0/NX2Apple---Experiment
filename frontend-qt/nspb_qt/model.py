@@ -502,6 +502,12 @@ class Model(QObject, DeviceMixin, QueueMixin):
             self.remember_choices()
 
     @property
+    def exports_one_game(self) -> bool:
+        """The build makes one game's own IPA with its data inside, not a framework for the shared app (Install on device
+        always builds the framework: the kind of IPA is the export's choice)."""
+        return self.ipa_kind == 'oneGame' and not self.installs_on_device
+
+    @property
     def installs_on_device(self) -> bool:
         """Windows: a build for iPhone and iPad goes into the shared app and onto the chosen device, not into an IPA."""
         return pu.IS_WIN and self.output_mode == 'device'
@@ -829,6 +835,10 @@ class Model(QObject, DeviceMixin, QueueMixin):
 
     def check_deps(self) -> None:
         self.deps_checked = False
+        # the window says "Checking…" with its wheel at once, not only when the check ends (it can take a while: the
+        # Windows rows run the compilers, the signer and Apple's USB service). Through the model's thread: the Apple ID
+        # sign-in window's end starts a check from its own thread.
+        self._emit_deps_changed()
         self.sync_engine()   # at the start: a checkout whose engine/ is missing or older than its pin (#214)
         threading.Thread(target=self._check_deps_worker, daemon=True).start()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 BG = '#000000'
 SURFACE = '#141416'
@@ -71,6 +72,9 @@ def load_font() -> str:
     return families[0] if families else ''
 
 
+#: The tick of a checked box (a dark mark on the cream box), a PNG so no image plugin is needed
+CHECK_IMAGE = str(Path(__file__).resolve().parent / 'assets' / 'check.png').replace('\\', '/')
+
 STYLESHEET = f"""
 QMainWindow, QWidget#root {{
     background: {BG};
@@ -128,6 +132,30 @@ QFrame#card {{
     background: {CARD};
     border: 1px solid {BORDER};
     border-radius: 14px;
+}}
+QCheckBox {{
+    color: {TEXT};
+    spacing: 10px;
+    font-size: 13px;
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1.5px solid rgba(255, 255, 255, 0.35);
+    background: transparent;
+}}
+QCheckBox::indicator:checked {{
+    background: {ACCENT};
+    border-color: {ACCENT};
+    image: url("{CHECK_IMAGE}");
+}}
+QCheckBox:disabled {{
+    color: {FAINT};
+}}
+QFrame#bare {{
+    background: transparent;
+    border: none;
 }}
 QFrame#subcard {{
     background: #141416;
@@ -420,6 +448,27 @@ QProgressBar {{
 QProgressBar::chunk {{
     background: {ACCENT};
     border-radius: 3px;
+}}
+QProgressBar#bigProgress {{
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 5px;
+    max-height: 10px;
+    min-height: 10px;
+}}
+QProgressBar#bigProgress::chunk {{
+    background: {ACCENT};
+    border-radius: 5px;
+}}
+QProgressBar#bigProgress[failed="true"]::chunk {{
+    background: {RED};
+}}
+QProgressBar#barProgress {{
+    max-height: 8px;
+    min-height: 8px;
+    border-radius: 4px;
+}}
+QProgressBar#barProgress::chunk {{
+    border-radius: 4px;
 }}
 """
 

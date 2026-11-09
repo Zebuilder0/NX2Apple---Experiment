@@ -2762,8 +2762,8 @@ class WindowsBuildFixesTest(unittest.TestCase):
 
         class FakeTimer:
             @staticmethod
-            def singleShot(_ms, cb):
-                cb()
+            def singleShot(_ms, context, cb=None):     # (ms, callback) or (ms, context object, callback)
+                (cb or context)()
 
         ns: dict = {'Path': Path, 'os': os, 'QTimer': FakeTimer}
         for name in ('should_show_onboarding', '_maybe_show_onboarding'):
@@ -3551,10 +3551,12 @@ class WindowsBuildFixesTest(unittest.TestCase):
             def add_divider(self):
                 self.dividers += 1
 
+        from nspb_qt import platform_util as pu
         ns: dict = {
             'Path': Path,
             'shutil': shutil,
             'style': style,
+            'pu': pu,
             'QWidget': FakeWidget,
             'QLabel': FakeWidget,
             'QPushButton': FakeWidget,
@@ -3564,7 +3566,7 @@ class WindowsBuildFixesTest(unittest.TestCase):
             'CardGroup': FakeCardGroup,
             'StatusDot': FakeWidget,
         }
-        for name in ('_clear_body', '_step1_row_meta', '_render_step'):
+        for name in ('_clear_body', '_step1_row_meta', 'steps', '_render_step'):
             fn = fn_map[name]
             for n in ast.walk(fn):
                 ast.fix_missing_locations(n)
@@ -3608,8 +3610,10 @@ class WindowsBuildFixesTest(unittest.TestCase):
                 self._install_all_running = True
 
         class FakeOnboarding:
+            from nspb_qt.device_model import DEVICE_DEP_IDS as DEVICE_IDS
             _clear_body = ns['_clear_body']
             _step1_row_meta = ns['_step1_row_meta']
+            steps = ns['steps']
             _render_step = ns['_render_step']
             _fit_dialog_height = lambda self: None
 
