@@ -618,14 +618,30 @@ class LibraryGame:
 
 
 class GameLibrary:
-    def __init__(self, state_dir: Path | None = None) -> None:
+    def __init__(self, state_dir: Path | None = None, log: Callable[[str], None] | None = None) -> None:
         self.state_dir = state_dir or default_state_dir()
         self.file_path = self.state_dir / 'library.json'
         self.games: list[LibraryGame] = []
         self.selected_id: str | None = None
         self.games_folder: str = ''
         self._extra_top: dict = {}
+        # Saves come from the window and from the build's worker thread (record_completed_ios): one change and one
+        # save at a time, so two of them can neither tear the file nor drop each other's game.
+        self._lock = threading.RLock()
+        #: The launcher's log, when there is one: why library.json was set aside, why a build was not recorded.
+        self.log = log
+        #: Why library.json could not be read ('' when it could, or when there was none). The file is kept aside as
+        #: library.json.bad-<time>, never written over: the next save would make the loss permanent.
+        self.load_problem = ''
+        self._aside_pending = False   # the unreadable file could not be moved aside yet: no save may replace it
         self.load()
+
+    def _note(self, line: str) -> None:
+        if self.log:
+            try:
+                self.log(line + '\n')
+            except Exception:      # noqa: BLE001 - a log that fails never stops a save or a build
+                pass
 
     @property
     def selected(self) -> LibraryGame | None:
@@ -639,39 +655,90 @@ class GameLibrary:
         self.selected_id = title_id.upper() if title_id else None
 
     def load(self) -> None:
+        """Read library.json. A file that cannot be read (cut off by a crash or a power cut, or not a library) is moved
+        aside as library.json.bad-<time> and named in `load_problem` and the log, never silently replaced: the first
+        save after a silent failure wrote an empty library over data that could still be recovered."""
         if not self.file_path.is_file():
             return
+        extra_top: dict = {}
+        games_folder = ''
+        selected_id = None
         try:
             raw = json.loads(self.file_path.read_text(encoding='utf-8'))
             if isinstance(raw, list):
-                self.games = [LibraryGame.from_dict(x) for x in raw if isinstance(x, dict)]
+                games = [LibraryGame.from_dict(x) for x in raw if isinstance(x, dict)]
             elif isinstance(raw, dict):
-                self.games = [LibraryGame.from_dict(x) for x in raw.get('games', []) if isinstance(x, dict)]
-                self.games_folder = str(raw.get('gamesFolder') or raw.get('folder') or '')
-                self.selected_id = raw.get('selectedID')
-                self._extra_top = {
+                games = [LibraryGame.from_dict(x) for x in raw.get('games', []) if isinstance(x, dict)]
+                games_folder = str(raw.get('gamesFolder') or raw.get('folder') or '')
+                selected_id = raw.get('selectedID')
+                extra_top = {
                     k: v for k, v in raw.items()
                     if k not in ('games', 'gamesFolder', 'selectedID')
                 }
-            if self.games and not self.selected_id:
-                self.selected_id = self.games[0].title_id
-        except Exception:
-            pass
+            else:
+                raise ValueError(f'a JSON {type(raw).__name__}, not a library')
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as e:
+            self.games, self.games_folder, self.selected_id, self._extra_top = [], '', None, {}
+            self._aside_pending = True
+            bad = self._move_aside()
+            self.load_problem = (f'{self.file_path} could not be read ({e}): it is kept as {bad.name}' if bad else
+                                 f'{self.file_path} could not be read ({e}), and could not be moved aside: it is '
+                                 'left as it is')
+            self._note(self.load_problem)
+            return
+        self.games, self.games_folder, self.selected_id, self._extra_top = games, games_folder, selected_id, extra_top
+        if self.games and not self.selected_id:
+            self.selected_id = self.games[0].title_id
+
+    def _move_aside(self) -> Path | None:
+        """Rename the unreadable library.json to library.json.bad-<time>. None when it cannot be moved (another program
+        holds it open on Windows): saves then leave it alone, and the next save tries again."""
+        bad = self.file_path.with_name(f'{self.file_path.name}.bad-{time.strftime("%Y%m%d-%H%M%S")}')
+        n = 1
+        while bad.exists():                    # two in one second: the first one is not overwritten either
+            bad = bad.with_name(f'{self.file_path.name}.bad-{time.strftime("%Y%m%d-%H%M%S")}-{n}')
+            n += 1
+        try:
+            os.replace(self.file_path, bad)
+        except FileNotFoundError:              # gone already: nothing is left to protect
+            self._aside_pending = False
+            return None
+        except OSError:
+            return None
+        self._aside_pending = False
+        return bad
 
     def save(self) -> None:
-        try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            payload = dict(self._extra_top)
-            if 'folder' in payload or self.games_folder:
-                payload['folder'] = self.games_folder or payload.get('folder', '')
-            payload.update({
-                'gamesFolder': self.games_folder,
-                'selectedID': self.selected_id,
-                'games': [g.to_dict() for g in self.games],
-            })
-            self.file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
-        except OSError:
-            pass
+        """Write library.json whole or not at all: a temporary file beside it, flushed to the disk and renamed over it in
+        one step (os.replace), one save at a time. Writing in place left half a file after a crash, and two saves at
+        once (the window and the build's thread) left one that could not be read."""
+        with self._lock:
+            tmp = self.file_path.with_name(f'{self.file_path.name}.{os.getpid()}.tmp')
+            try:
+                if self._aside_pending:
+                    self._move_aside()
+                    if self._aside_pending:
+                        return                 # the unreadable file is still there: it is not written over
+                self.state_dir.mkdir(parents=True, exist_ok=True)
+                payload = dict(self._extra_top)
+                if 'folder' in payload or self.games_folder:
+                    payload['folder'] = self.games_folder or payload.get('folder', '')
+                payload.update({
+                    'gamesFolder': self.games_folder,
+                    'selectedID': self.selected_id,
+                    'games': [g.to_dict() for g in list(self.games)],
+                })
+                data = json.dumps(payload, indent=2, ensure_ascii=False).encode('utf-8')
+                with open(tmp, 'wb') as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())       # the new text is on the disk before the name points at it
+                os.replace(tmp, self.file_path)
+            except OSError:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def set_games_folder(self, folder: str, repo_path: str = '', default_keys: str = '') -> None:
         self.games_folder = folder
@@ -681,12 +748,19 @@ class GameLibrary:
 
     def remove(self, title_id: str) -> None:
         tid = title_id.upper()
-        self.games = [g for g in self.games if g.title_id != tid]
-        if self.selected_id == tid:
-            self.selected_id = self.games[0].title_id if self.games else None
-        self.save()
+        with self._lock:
+            self.games = [g for g in self.games if g.title_id != tid]
+            if self.selected_id == tid:
+                self.selected_id = self.games[0].title_id if self.games else None
+            self.save()
 
     def upsert(self, game: LibraryGame) -> LibraryGame:
+        # Under the lock: a game inserted by another thread between finding the index and replacing it would
+        # otherwise shift the list, and the replacement would land on the wrong game.
+        with self._lock:
+            return self._upsert(game)
+
+    def _upsert(self, game: LibraryGame) -> LibraryGame:
         tid = game.title_id.upper()
         game.title_id = tid
         for i, existing in enumerate(self.games):
@@ -759,12 +833,15 @@ class GameLibrary:
             inputs['keys'] = [keys_path]
 
         out = output_dir or os.path.dirname(base_path)
-        ipa_candidate = os.path.join(out, f'{tid if title_id else name}.ipa')
+        # A build writes <output>/<title ID>.ipa (Model.start_build, one_game_ipa_path); an IPA named after the game is
+        # an older one. Looking only for the name meant a game's earlier IPA was not shown until it was built again.
+        ipa_candidate = next((c for c in (os.path.join(out, f'{tid}.ipa'), os.path.join(out, f'{name}.ipa'))
+                              if os.path.isfile(c)), '')
         archive_candidate = os.path.join(out, 'games', tid)
         game = LibraryGame(
             title_id=tid,
             name=name,
-            ipa_path=ipa_candidate if os.path.isfile(ipa_candidate) else '',
+            ipa_path=ipa_candidate,
             archive_path=archive_candidate if os.path.isdir(archive_candidate) else '',
             output_dir=output_dir,
             inputs=inputs,
@@ -808,7 +885,12 @@ class GameLibrary:
             if tid_raw:
                 tid = base_family_id(tid_raw)
         if not tid:
-            tid = '0100000000000000'
+            # Not recorded: a made-up ID (0100000000000000 before) made every game without one share, and overwrite,
+            # a single library entry.
+            what = os.path.basename(base_path or ipa_path or archive_path) or 'the build'
+            self._note(f'{what} was not added to the library: no title ID was found in its file names, its '
+                       'archive folder or the build')
+            return None
 
         resolved_name = name.strip() or GameFolder.profile_name(tid, repo_path)
         if not resolved_name:
