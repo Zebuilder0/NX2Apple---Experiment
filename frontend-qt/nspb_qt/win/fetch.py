@@ -517,8 +517,9 @@ def install_git(arch: str | None = None, dest: Path | None = None,
     without an installer and without administrator rights, which is what makes this work from a
     normal user account. After unpacking, `cmd/git.exe` sits in the target folder.
 
-    The archive hash is checked when one is pinned; an empty hash means the release was not
-    pinned yet, and the download is accepted with a note in the log rather than failing.
+    The archive is checked against its pinned SHA-256 before it runs, like every other download
+    here. The self-extractor is an executable, so an asset without a pinned hash is refused: it is
+    never downloaded, and never run unverified.
     """
     log = log or (lambda s: None)
     key = arch or (_arch_key())
@@ -528,15 +529,16 @@ def install_git(arch: str | None = None, dest: Path | None = None,
     if exe.is_file():
         log(f'git is already installed: {exe}')
         return exe
+    if not asset.get('sha256'):
+        raise DownloadError(f'{asset["name"]} has no pinned SHA-256 in toolchain.py: it is not '
+                            'downloaded and run unverified. Install git from git-scm.com, or pin '
+                            'the hash.')
     cache = tc.tools_dir() / 'downloads'
     cache.mkdir(parents=True, exist_ok=True)
     url = f'{tc.GIT_RELEASE_URL}/{asset["name"]}'
     log(f'downloading {asset["name"]} ({asset["size"] // 1048576 if asset["size"] else "~57"} MB)')
-    if asset['sha256']:
-        zpath = download(url, cache / asset['name'], asset['sha256'], asset['size'] or None,
-                         log=log, progress=progress)
-    else:
-        zpath = _download_unverified(url, cache / asset['name'], log, progress)
+    zpath = download(url, cache / asset['name'], asset['sha256'], asset['size'] or None,
+                     log=log, progress=progress)
     log(f'unpacking {zpath.name} → {target}')
     target.mkdir(parents=True, exist_ok=True)
     # The self-extractor writes the tree directly into -o<dir>; -y answers any prompt, -Install
@@ -555,40 +557,6 @@ def install_git(arch: str | None = None, dest: Path | None = None,
 def _arch_key() -> str:
     """Always AMD64: this app publishes only the x86-64 host tools (see toolchain._arch)."""
     return 'AMD64'
-
-
-def _download_unverified(url: str, dest: Path, log: Callable[[str], None],
-                         progress: Callable[[int, int], None] | None) -> Path:
-    """Fetch a file whose hash is not pinned yet (used only for PortableGit until pinned)."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 0:
-        log(f'already downloaded: {dest.name}')
-        return dest
-    tmp = dest.with_suffix(dest.suffix + '.part')
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'NS-Port-Builder'})
-        with urllib.request.urlopen(req, timeout=60) as r, open(tmp, 'wb') as f:
-            total = int(r.headers.get('Content-Length') or 0)
-            done = 0
-            last = 0.0
-            while True:
-                b = r.read(1 << 16)
-                if not b:
-                    break
-                f.write(b)
-                done += len(b)
-                if progress and total:
-                    now = time.time()
-                    if now - last > 0.3:
-                        progress(done, total)
-                        last = now
-        if progress and total:
-            progress(total, total)
-        tmp.replace(dest)
-        return dest
-    except (urllib.error.URLError, OSError) as e:
-        tmp.unlink(missing_ok=True)
-        raise DownloadError(f'download failed: {url}: {e}') from e
 
 
 def install_metal_from_zip(zip_path: Path, dest: Path | None = None,
