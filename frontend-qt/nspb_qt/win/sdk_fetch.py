@@ -30,6 +30,10 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from . import toolchain as tc
+# One rule for every archive member the app unpacks: fetch.py's four unpackers use it too (member_target).
+# It refuses empty paths, a leading slash or backslash, any ':' (drive letters, NTFS streams), NUL,
+# and `.`/`..` parts (also as Windows reads them, with trailing dots or spaces).
+from .fetch import archive_member_name as _clean_archive_relpath
 
 XIP_WANT = '/Platforms/iPhoneOS.platform/Developer/SDKs/'
 MAX_ZIP_MEMBERS = 65_536
@@ -40,23 +44,6 @@ _VALID_SDK_DIR_RE = re.compile(r'^iPhoneOS\d+(?:\.\d+)*\.sdk$')
 
 class SdkError(Exception):
     """A user-facing failure: the message says what to do next, not just what broke."""
-
-
-def _clean_archive_relpath(raw: str) -> str | None:
-    """Validate and normalize an archive member path under both POSIX and Windows rules.
-
-    Rejects empty paths, leading slashes/backslashes, drive letters or NTFS stream colons (`C:foo`,
-    `C:\\foo`, `file:stream`), control characters, and `.` or `..` segments.
-    """
-    if not raw or '\x00' in raw or ':' in raw or raw.startswith(('/', '\\')):
-        return None
-    norm = raw.replace('\\', '/').strip('/')
-    if not norm:
-        return None
-    parts = [p for p in norm.split('/') if p]
-    if not parts or any(p in ('.', '..') or ':' in p for p in parts):
-        return None
-    return '/'.join(parts)
 
 
 def _is_within(child: Path, root: Path) -> bool:

@@ -188,9 +188,56 @@ def sha256_of(path: Path, limit: int | None = None) -> str:
     return digest_of(path, 'sha256', limit)
 
 
+def archive_member_name(raw: str) -> str | None:
+    """An archive member's path below the folder it is unpacked into, '/'-separated, or None when the name is not safe
+    to write under POSIX and Windows rules alike. Every unpacker in the app uses this rule: the four here (through
+    `member_target`) and sdk_fetch's (as `_clean_archive_relpath`).
+
+    The name is read with either slash, and empty parts are dropped. Refused: an empty name, a NUL, any ':' (a drive
+    letter as in `C:x` or `C:\\x`, or an NTFS alternate stream as in `a/b:stream`), a leading slash or backslash, and
+    a part that is only dots and spaces (`.`, `..`, and `.. ` or `...`, which Windows may read as one of them)."""
+    if not raw or '\x00' in raw or ':' in raw or raw.startswith(('/', '\\')):
+        return None
+    parts = [p for p in raw.replace('\\', '/').split('/') if p]
+    if not parts or any(not p.strip('. ') for p in parts):
+        return None
+    return '/'.join(parts)
+
+
+def _unsafe(name: str) -> DownloadError:
+    return DownloadError(f'unsafe path inside the archive: {name!r}')
+
+
+def member_target(staging: Path, name: str) -> Path:
+    """Where the archive member `name` is written inside `staging`.
+
+    A name `archive_member_name` refuses, or one that resolves (through links) outside `staging` or to `staging`
+    itself, raises DownloadError("unsafe path inside the archive: …"), and the unpacker keeps nothing of the archive:
+    the downloaded ones are checked against a pinned hash first, so such a name means the archive is not the one that
+    was pinned, and the Metal zip is a file the player picked."""
+    rel = archive_member_name(name)
+    if rel is None:
+        raise _unsafe(name)
+    try:
+        root = Path(staging).resolve()
+        out = root / rel                       # inside `root` as written: no part of `rel` can climb out
+        real = out.resolve()
+    except (OSError, ValueError, RuntimeError) as e:
+        raise _unsafe(name) from e
+    if real == root or not real.is_relative_to(root):
+        raise _unsafe(name)
+    return out
+
+
 def _strip_root(member: str) -> str:
-    """The zip's members all sit under one top-level folder; return the path below it."""
-    parts = member.split('/', 1)
+    """The zip's members all sit under one top-level folder; return the path below it ('' for the folder itself).
+
+    The whole name is checked first, the top folder included, so a bad name stops the unpack even when the bad part
+    is the one that would be dropped."""
+    clean = archive_member_name(member)
+    if clean is None:
+        raise _unsafe(member)
+    parts = clean.split('/', 1)
     return parts[1] if len(parts) > 1 else ''
 
 
@@ -237,7 +284,7 @@ def install_llvm(arch: str | None = None, dest: Path | None = None,
                     rel = _strip_root(info.filename)
                     if not rel:
                         continue
-                    out = staging / rel
+                    out = member_target(staging, rel)
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with z.open(info) as src, open(out, 'wb') as dst:
                         shutil.copyfileobj(src, dst, 1 << 20)
@@ -250,6 +297,9 @@ def install_llvm(arch: str | None = None, dest: Path | None = None,
                             out.chmod(0o755)
                         except OSError:
                             pass
+        except DownloadError:             # an unsafe member (or a corrupt one): nothing of the archive is kept
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
         except zipfile.BadZipFile as e:
             shutil.rmtree(staging, ignore_errors=True)
             raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -352,16 +402,19 @@ def install_dotnet(dest: Path | None = None,
                 raise DownloadError(f'{zpath.name} is corrupt (first bad member: {bad})')
             done = 0
             for info in members:
-                out = staging / info.filename
-                # a zip member may try to escape the target (../ in the name)
-                if not str(out.resolve()).startswith(str(staging.resolve())):
-                    continue
+                # A member that would land outside staging stops the unpack. It used to be skipped, by
+                # a string-prefix test that also passed a sibling whose name starts the same
+                # (`../.unpack-dotnet-<version>x/a`).
+                out = member_target(staging, info.filename)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
                 done += info.file_size
                 if unpack_progress:
                     unpack_progress(done, grand)
+    except DownloadError:                 # an unsafe member (or a corrupt one): nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except zipfile.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -474,13 +527,19 @@ def install_zstd(dest: Path | None = None,
                 unpack_progress(0, grand)
             done = 0
             for info in members:
-                out = staging / _strip_root(info.filename)
+                rel = _strip_root(info.filename)
+                if not rel:
+                    continue
+                out = member_target(staging, rel)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
                 done += info.file_size
                 if unpack_progress:
                     unpack_progress(done, grand)
+    except DownloadError:                 # an unsafe member: nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except zipfile.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -582,10 +641,14 @@ def install_metal_from_zip(zip_path: Path, dest: Path | None = None,
     staging.mkdir(parents=True)
     try:
         with _zf.ZipFile(src) as z:
-            bad = [i.filename for i in z.infolist() if i.filename.startswith('/') or '..' in Path(i.filename).parts]
-            if bad:
-                raise DownloadError(f'unsafe paths inside {src.name}: {bad[:3]}')
+            # Every member is checked before anything is written: extractall only rewrites a bad
+            # name quietly, and a picked file has no pinned hash to vouch for it.
+            for info in z.infolist():
+                member_target(staging, info.filename)
             z.extractall(staging)
+    except DownloadError:                 # an unsafe member: nothing of the archive is kept
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     except _zf.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{src.name} is not a zip file ({e})') from e
