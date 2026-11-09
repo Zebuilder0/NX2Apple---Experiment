@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -383,13 +384,32 @@ _HOST_MAIN: Path | None = None
 
 # ---------------------------------------------------------------- link
 
+def _run_linker(args: list[str], objs: list[Path], env: dict) -> subprocess.CompletedProcess:
+    """Run the link `args` with the objects in a file list (ld64's -filelist, one path per line, which lld reads), not
+    on the command line: Windows starts no program whose command line is longer than 32,767 characters, and the
+    engine's 267 objects under a long build folder ("D:\\...\\3rd Party\\Snipperclips\\<id>_build\\...") stopped the
+    link with "[WinError 206] The filename or extension is too long". -Xlinker keeps a comma in the list's own path
+    from splitting it. The list is removed afterwards."""
+    fd, filelist = tempfile.mkstemp(prefix='nspb-link-', suffix='.filelist')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
+            f.writelines(f'{o}\n' for o in objs)
+        return subprocess.run([*args, '-Xlinker', '-filelist', '-Xlinker', filelist],
+                              capture_output=True, text=True, errors='replace', env=env)
+    finally:
+        try:
+            os.unlink(filelist)
+        except OSError:
+            pass
+
+
 def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: Path,
          deployment: str, embed_flags: list[str], rt_obj: Path | None,
          lld_dir: Path, bundle_id: str = 'org.nxnative.app') -> None:
     """Link the app, then prove the result is an arm64 iOS executable and sign its entitlements."""
     entitle = os.environ.get('NSPB_ENTITLEMENTS', '1') != '0'
     args = [str(clang), '-target', f'arm64-apple-ios{deployment}', '-isysroot', str(sdk),
-            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out), *map(str, objs),
+            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out),
             '-Wl,-rpath,@executable_path/Frameworks', '-lobjc', '-lSystem',
             *(('-Wl,-adhoc_codesign',) if entitle else ()),
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
@@ -398,7 +418,7 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     env = dict(os.environ)
     env['PATH'] = str(lld_dir) + os.pathsep + env.get('PATH', '')
     t(f'link: {len(objs)} objects, {len(frameworks)} frameworks (ld64.lld)')
-    r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
+    r = _run_linker(args, objs, env)
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('link failed (see the linker output above)')
@@ -435,7 +455,7 @@ def link_framework(clang: Path, sdk: Path, objs: list[Path], frameworks: list[st
             '-fuse-ld=lld', '-dynamiclib',
             f'-Wl,-install_name,@rpath/{fw_name}.framework/{fw_name}',
             '-Wl,-rpath,@executable_path/Frameworks',
-            '-fobjc-arc', '-o', str(out), *map(str, objs),
+            '-fobjc-arc', '-o', str(out),
             '-lobjc', '-lSystem', '-Wl,-adhoc_codesign',
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
     if rt_obj:
@@ -443,7 +463,7 @@ def link_framework(clang: Path, sdk: Path, objs: list[Path], frameworks: list[st
     env = dict(os.environ)
     env['PATH'] = str(lld_dir) + os.pathsep + env.get('PATH', '')
     t(f'link framework: {len(objs)} objects, {len(frameworks)} frameworks (ld64.lld)')
-    r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
+    r = _run_linker(args, objs, env)
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('framework link failed (see the linker output above)')
