@@ -27,6 +27,7 @@ from . import romfs_languages
 from .device_model import DeviceMixin
 from .i18n import Lang
 from .l10n import t
+from .queue_model import QueueMixin
 from .signals import emit_safely
 
 
@@ -274,7 +275,7 @@ def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, in
 
 # ---------------------------------------------------------------- the model
 
-class Model(QObject, DeviceMixin):
+class Model(QObject, DeviceMixin, QueueMixin):
     """Everything the window reads, and every action it can take.
 
     Long work runs on a thread and reports through signals, so the window never blocks: Qt
@@ -293,6 +294,7 @@ class Model(QObject, DeviceMixin):
     devicesChanged = Signal()             # the connected iPhones and iPads (device_model.refresh_devices)
     autoInstallRequested = Signal(str)    # a device to update (from the poll's thread, handled on the model's)
     newDeviceFound = Signal(str)          # a device without the launcher: the window offers to install it
+    queueChanged = Signal()               # the build queue (queue_model.py)
 
     #: Set by the window: asks for a folder (QFileDialog lives in the UI layer) and returns the
     #: path, or '' when the user cancelled. `pick_dep_folder` calls it, so the model stays UI-free.
@@ -394,6 +396,7 @@ class Model(QObject, DeviceMixin):
         # The build's choices last from one start to the next (the Mac launcher keeps the output folder, the target and
         # the texture switch; this one also keeps prod.keys and the last game, so a new start does not ask again).
         self.restore_choices()
+        self._queue_init()
 
     # ---- strings
 
