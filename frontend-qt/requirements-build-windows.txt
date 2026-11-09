@@ -1,0 +1,16 @@
+# What build-qt.yml installs to build NX2Apple.exe on its Windows runner: PySide6 goes into the shipped app, so the
+# whole set is pinned to exact versions and hashes (pip --require-hashes), like the venv wheels the zip carries.
+# Windows x64 wheels for Python 3.12. To update: pick the versions, then for each wheel of
+#   pip download --platform win_amd64 --python-version 3.12 --implementation cp --only-binary=:all: \
+#       PySide6-Essentials==<v> pyinstaller==<v> pefile pywin32-ctypes -d wheels
+# write its version and `sha256sum` here (pefile and pywin32-ctypes are PyInstaller's Windows-only dependencies,
+# which pip on another system does not list), then run the workflow.
+pyside6-essentials==6.12.0 --hash=sha256:c9a95102aa23c1f86516a30d5a9be37552d324eee7e567eb7508973f1218cb42
+shiboken6==6.12.0 --hash=sha256:a1906cb8116869178c64b6bab52623bbc8b4ceed7b30bfc3c9aa0f6e67f6438e
+pyinstaller==6.22.3 --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
+pyinstaller-hooks-contrib==2026.9 --hash=sha256:fb3e67dd64122561724c48ad0366ac9e8c16e638b63bf7d85de03bf3fdbf06c3
+altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pefile==2024.8.26 --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+pywin32-ctypes==0.2.3 --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
+setuptools==84.2.1 --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2

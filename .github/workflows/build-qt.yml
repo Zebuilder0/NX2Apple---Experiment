@@ -4,11 +4,15 @@
 # gone: the native SwiftUI app (build-mac-app.yml) is strictly better on the same machine, so a
 # second macOS download only offered a way to pick the worse one.
 #
-# Nothing here touches a release. The Windows build is still in testing — it is built on every
-# tag so the artifact is always available under Actions, and it becomes a release download only
-# once the reports from real hardware are clean.
+# The Windows build is still in testing. It is built on every tag, uploaded as a workflow artifact and attached to
+# the tag's release as NX2Apple-windows-x64.zip. It never makes a final release itself: build-mac-app.yml creates
+# that one with its reviewed notes (RELEASING.md), and this workflow waits for it, so the notes are never replaced
+# by a short body when the Windows build happens to finish first. A release candidate's pre-release may be made here
+# (build-mac-app.yml edits it and writes its notes either way). A workflow_dispatch run builds and uploads the
+# artifact only: every release step is gated on a tag ref.
 #
-#   - push a tag vX.Y.Z / workflow_dispatch → build, upload as a workflow artifact and attach to the release
+#   - push a tag vX.Y.Z → build, upload as a workflow artifact and attach to the release
+#   - workflow_dispatch → build and upload as a workflow artifact only
 name: Build NX2Apple (Qt, Windows)
 
 on:
@@ -45,11 +49,60 @@ jobs:
           path: ${{ runner.temp }}/shell_template/DmShell.app
           if-no-files-found: error
 
+  # The signing tool: Impactor's plumesign at the commit frontend-qt/impactor/pin names, with frontend-qt/impactor/
+  # hardening.patch, built from source the way Impactor's own release builds it for Windows (mingw-w64,
+  # x86_64-pc-windows-gnu). The Windows launcher signs the shared app with it (frontend-qt/nspb_qt/win/signer.py).
+  plumesign:
+    name: Build plumesign.exe (Impactor, cross-compiled)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Impactor at the pinned commit, with the patch
+        run: |
+          set -euo pipefail
+          repo=$(awk -F'\t' '$1 == "repo" {print $2}' frontend-qt/impactor/pin)
+          commit=$(awk -F'\t' '$1 == "commit" {print $2}' frontend-qt/impactor/pin)
+          git init -q impactor
+          git -C impactor fetch -q --depth 1 "$repo" "$commit"
+          git -C impactor checkout -q FETCH_HEAD
+          got=$(git -C impactor rev-parse HEAD)
+          [ "$got" = "$commit" ] || { echo "::error::Impactor is at $got, the pin says $commit"; exit 1; }
+          git -C impactor apply --check ../frontend-qt/impactor/hardening.patch
+          git -C impactor apply ../frontend-qt/impactor/hardening.patch
+          if grep -n 'danger_accept_invalid_certs(true)' impactor/3rdparty/omnisette/src/*.rs; then
+            echo "::error::the anisette clients still accept any certificate"; exit 1
+          fi
+      - name: Toolchain (mingw-w64, nasm, the Windows target)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mingw-w64 nasm
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build plumesign.exe
+        working-directory: impactor
+        run: |
+          cargo build -p plumesign --release --locked --target x86_64-pc-windows-gnu
+          mkdir -p ../plumesign-out
+          cp target/x86_64-pc-windows-gnu/release/plumesign.exe ../plumesign-out/
+          cp ../frontend-qt/impactor/LICENSE-impactor.txt ../frontend-qt/impactor/README.md ../plumesign-out/
+          sha256sum ../plumesign-out/plumesign.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plumesign
+          path: plumesign-out/
+          if-no-files-found: error
+
   build:
-    needs: shell-template
+    needs: [shell-template, plumesign]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # the job holds contents: write; nothing here pushes with git
 
       - name: Download the DmShell.app template
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -57,18 +110,24 @@ jobs:
           name: dmshell-template
           path: frontend-qt/shell_template/DmShell.app
 
+      - name: Download plumesign.exe
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plumesign
+          path: artifacts/plumesign
+
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
       - name: Install PySide6 and PyInstaller
         run: |
-          python -m pip install --upgrade pip
           # PySide6-Essentials only: no Addons, no Pdf, no WebEngine. The umbrella 'PySide6'
           # package installs all of them (WebEngine alone is 250 MB) and PyInstaller's Qt hooks
           # then copy every installed module regardless of --exclude-module — measured: a full
           # install produced a 591 MB bundle with the same exclusions in place.
-          python -m pip install PySide6-Essentials pyinstaller
+          # PySide6 goes into the shipped app: exact versions and hashes, wheels only (the file says how to update).
+          python -m pip install --require-hashes --only-binary=:all: -r frontend-qt/requirements-build-windows.txt
 
       # The build packages ride in the zip: the venv step then installs from disk (--no-index),
       # so a fresh machine needs no PyPI round-trip for lz4/capstone/fonttools/nsz. The runner's
@@ -191,6 +250,13 @@ jobs:
             --hidden-import nspb_qt.win.shell_export \
             --hidden-import nspb_qt.win.fix_ipa_modes \
             --hidden-import nspb_qt.win.doctor \
+            --hidden-import nspb_qt.signals \
+            --hidden-import nspb_qt.device_model \
+            --hidden-import nspb_qt.queue_model \
+            --hidden-import nspb_qt.transfer \
+            --hidden-import nspb_qt.win.device \
+            --hidden-import nspb_qt.win.signer \
+            --hidden-import nspb_qt.win.install \
             --collect-data PySide6 \
             --hidden-import PySide6.QtCore \
             --hidden-import PySide6.QtGui \
@@ -257,8 +323,23 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           cd frontend-qt/dist
           cp -r ../wheels "NX2Apple/wheels"
+          # The signing tool the launcher installs apps on an iPhone or iPad with (frontend-qt/nspb_qt/win/signer.py),
+          # beside NX2Apple.exe, where the launcher looks for it
+          mkdir -p NX2Apple/tools
+          cp ../../artifacts/plumesign/plumesign.exe NX2Apple/tools/
+          cp ../../artifacts/plumesign/LICENSE-impactor.txt NX2Apple/tools/plumesign-LICENSE.txt
+          cp ../../artifacts/plumesign/README.md NX2Apple/tools/plumesign-README.md
+          NX2Apple/tools/plumesign.exe --help > /dev/null
+          # `account login` alone asks for the Apple ID in its window (frontend-qt/impactor/hardening.patch): before the
+          # patch it printed its help page and quit. With no console to ask in it stops at once, and it must not print the usage
+          out=$(timeout 60 NX2Apple/tools/plumesign.exe account login < /dev/null 2>&1 || true)
+          echo "$out" | head -5
+          if echo "$out" | grep -q "Usage: plumesign"; then
+            echo "::error::plumesign account login prints its help page instead of asking for the Apple ID"; exit 1
+          fi
           # The engine tree goes inside the app folder, where the launcher finds it at
           # <exe_dir>/engine (and also at <exe_dir>/../engine) and skips the repo/sync route entirely.
           cp -r ../../engine-tree "NX2Apple/engine"
@@ -292,13 +373,16 @@ jobs:
                 --notes "Release candidate $rc of NX2Apple $ver."
             fi
           else
-            # On a final tag, wait briefly for build-mac-app.yml to create the release with its full notes if both run in parallel
-            for _ in $(seq 1 30); do
+            # A final release is build-mac-app.yml's to create, with the reviewed notes: it writes them only when the
+            # release does not exist yet, so a release made here first would ship the short body instead. Wait for it
+            # (the Mac build of a final tag takes a while), and stop with a clear error if it never comes.
+            for _ in $(seq 1 180); do
               gh release view "$TAG" >/dev/null 2>&1 && break
-              sleep 10
+              sleep 30
             done
             if ! gh release view "$TAG" >/dev/null 2>&1; then
-              gh release create "$TAG" --verify-tag --title "$TAG" --notes "NX2Apple $TAG"
+              echo "::error title=No release to attach to::build-mac-app.yml did not create the release $TAG within 90 minutes. The Windows zip is in this run's artifacts: attach it once the release exists (gh release upload $TAG NX2Apple-windows-x64.zip)."
+              exit 1
             fi
           fi
           gh release upload "$TAG" frontend-qt/NX2Apple-windows-x64.zip --clobber
