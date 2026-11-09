@@ -119,7 +119,7 @@ def read_stamp(eng):
 
 
 def write_stamp(eng, root, head, key=None):
-    (eng / '.git' / STAMP).write_text(f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n', encoding='utf-8')
+    P.write_lf(eng / '.git' / STAMP, f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n')
 
 
 def is_repo(eng):
@@ -229,7 +229,7 @@ def build(root, eng, patches, sha):
         if (eng / tool).is_file():
             r = subprocess.run([sys.executable, '-X', 'utf8', str(eng / tool)], cwd=eng, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, env=P.clean_env())
             if r.returncode: raise Fail(f'{tool} failed on the patched tree: {(r.stderr.strip().splitlines() or [str(r.returncode)])[-1]}')
-    (eng / P.FORK_PATCHES).write_text(P.fork_patch_list([p for p, _ in applied]), encoding='utf-8')
+    P.write_lf(eng / P.FORK_PATCHES, P.fork_patch_list([p for p, _ in applied]))
     git('add', '--force', '--', P.FORK_PATCHES, *(o for o, _ in P.GENERATED if (eng / o).exists()), cwd=eng)
     git(*IDENT, 'commit', '--quiet', '--allow-empty', '-m', GENERATED_SUBJECT, cwd=eng)
     return applied, landed
@@ -384,8 +384,8 @@ def cmd_tree(a):
     out.mkdir(parents=True, exist_ok=True)
     n = extract_tree(eng, out)
     eid = engine_id(root)
-    (out / '.upstream-ref').write_text(pin(root) + '\n', encoding='utf-8')
-    (out / ENGINE_ID_FILE).write_text(eid + '\n', encoding='utf-8')
+    P.write_lf(out / '.upstream-ref', pin(root) + '\n')
+    P.write_lf(out / ENGINE_ID_FILE, eid + '\n')
     if not (out / P.FORK_PATCHES).is_file(): raise Fail(f'{P.FORK_PATCHES} is missing from engine/: sync again')
     say(f'engine tree: {eid} ({n} files) in {out}')
     if a.zip:
@@ -411,7 +411,7 @@ def cmd_export(a):
     existing = P.load(root)
     pd = root / 'patches'
     n = max([int(m.group(1)) for p in existing for m in [re.match(r'(\d+)-', p.file)] if m] or [0])
-    series = (pd / 'series').read_text()
+    series = (pd / 'series').read_text(encoding='utf-8')
     if series and not series.endswith('\n'): series += '\n'
     skip = {P.FORK_PATCHES, *(o for o, _ in P.GENERATED)}
     made = []
@@ -436,7 +436,7 @@ def cmd_export(a):
         name = f'{n:04d}-{P.slug(subj)}.patch'
         (pd / name).write_bytes(text.encode(errors='surrogateescape'))
         series += name + '\n'; made.append(name)
-    (pd / 'series').write_text(series)
+    P.write_lf(pd / 'series', series)
     for m in made: say('wrote patches/' + m)
     if made:
         # engine/ already holds these changes: record that, so the next sync rebuilds it from the series instead of refusing
@@ -528,7 +528,7 @@ def relink(root, sha=None):
         text = p.read_text(encoding='utf-8')
         new = LINK_PINNED.sub(lambda m: f'{m.group(1)}/{sha}', text)
         if new != text:
-            p.write_text(new, encoding='utf-8'); changed.append(p)
+            P.write_lf(p, new); changed.append(p)
     return changed
 
 
@@ -570,7 +570,7 @@ def cmd_bump(a):
             return 1
         if a.dry: say('\n' + C.report(root, old, sha, eng)); return 0
         P.write_series(root, s.dir, applied, landed, patches)
-        (root / '.upstream-ref').write_text(sha + '\n')
+        P.write_lf(root / '.upstream-ref', sha + '\n')
         s.close()
         pages = relink(root)
         say('wrote patches/ and .upstream-ref' + (f', and moved the links into seedds/nxnative to the new pin in {", ".join(p.name for p in pages)}' if pages else '') +
@@ -605,7 +605,7 @@ def cmd_refresh(a):
     landed = [p for p in old if p.file not in used]
     say('landed upstream, dropped: ' + (', '.join(p.name for p in landed) or 'none'))
     P.write_series(root, wt, applied, landed, old)
-    (root / '.upstream-ref').write_text(sha + '\n')
+    P.write_lf(root / '.upstream-ref', sha + '\n')
     relink(root)
     say('wrote patches/ and .upstream-ref; `python3 tools/engine.py sync` builds engine/ on the new pin')
     return 0

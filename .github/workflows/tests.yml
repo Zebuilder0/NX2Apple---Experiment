@@ -353,11 +353,29 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
-      # Pure Python: the Windows toolchain, IPA and shim logic with the system calls mocked; the few tests that need PySide6 skip without it
+      # The Windows toolchain, IPA and shim logic with the system calls mocked, and the window: the queue card, the transfer
+      # window, the build button, the failure card. The window tests need PySide6 and the libraries Qt loads, offscreen.
+      # Without them every window test skipped, so this job was green without running one of them.
+      - name: PySide6 and the libraries Qt loads
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 > /dev/null
+          # with the packages the Windows app's build venv uses (the versions build-qt.yml ships): the multi-core NSO
+          # rewrite (win/mp_worker.py) needs capstone and lz4, and its tests run here
+          python -m pip install PySide6-Essentials==6.12.0 lz4==4.4.5 capstone==5.0.9
       - name: Engine (tools/engine.py sync, issue #214; some tests read engine/)
         run: python tools/engine.py sync
       - name: Tests
-        run: python -m unittest discover -s frontend-qt/tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -o pipefail
+          python -m unittest discover -s frontend-qt/tests -v 2>&1 | tee "$RUNNER_TEMP/qt-tests.log"
+          # a window test that skips for lack of PySide6 is a test that did not run: fail instead of passing quietly
+          if grep -E "skipped 'PySide6" "$RUNNER_TEMP/qt-tests.log"; then
+            echo "::error title=Window tests skipped::PySide6 did not load, so the window tests did not run"
+            exit 1
+          fi
 
   triage-scripts:
     name: Triage script tests (.github/scripts)

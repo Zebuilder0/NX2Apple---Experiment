@@ -59,6 +59,15 @@ def say(*a):
     print(*a, flush=True)
 
 
+def write_lf(path, text):
+    """Write `text` as UTF-8 with LF line ends on every system. Path.write_text turns each LF into CRLF on Windows, which
+    showed every line of patches/series, .upstream-ref and the relinked pages as changed, and made the engine tree that
+    a Windows runner builds differ from the Mac's (its .upstream-ref and .engine-id). Python 3.9 has no
+    write_text(newline=...)."""
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+
+
 # ---- the series and the headers ----
 
 class Patch:
@@ -227,9 +236,9 @@ def write_series(root, wt, applied, landed, patches):
         p.path.write_bytes(text)
     for p in landed: p.path.unlink()
     keep = {p.file for p, _ in applied}
-    lines = [l for l in (pd / 'series').read_text().splitlines()]
+    lines = [l for l in (pd / 'series').read_text(encoding='utf-8').splitlines()]
     out = [l for l in lines if l.split('#', 1)[0].strip() == '' or l.split('#', 1)[0].strip() in keep]
-    (pd / 'series').write_text('\n'.join(out) + '\n')
+    write_lf(pd / 'series', '\n'.join(out) + '\n')
 
 
 def slug(s):

@@ -333,6 +333,31 @@ class ClaudeGuard(unittest.TestCase):
     def test_unbalanced_quotes_still_catch_a_push_to_main(self):
         self.assertTrue(blocked('git push origin main "'))
 
+    def test_turning_the_hooks_off_through_core_hookspath_is_blocked(self):
+        for c in ('git -c core.hooksPath=/dev/null commit -m x', 'git -c core.hookspath= push origin feature',
+                  'git config core.hooksPath ""', 'git config --local core.hooksPath /tmp/none',
+                  'git config --unset core.hooksPath', 'git config --global --unset-all core.hooksPath'):
+            self.assertTrue(blocked(c), c)
+        for c in ('git config core.hooksPath .githooks', 'git config core.hooksPath', 'git config --get core.hooksPath',
+                  'git -c core.hooksPath=.githooks commit -m x', 'git -c user.name=x commit -m x'):
+            self.assertFalse(blocked(c), c)
+
+    def test_commit_options_are_read_as_git_reads_them(self):
+        for c in ('git commit -uno -m x', 'git commit -m -n', 'git commit -mn', 'git commit --message -n',
+                  'git commit -F notes -s'):
+            self.assertFalse(blocked(c), c)
+        for c in ('git commit -an', 'git commit -n', 'git commit -snm x'):
+            self.assertTrue(blocked(c), c)
+
+    def test_a_heredoc_is_text_unless_a_shell_reads_it(self):
+        # writing a file, or a commit message, that talks about these commands is not running them (an apostrophe in
+        # the text made the line unparseable, and the raw-text fallback then blocked it)
+        self.assertFalse(blocked("cat > notes.md <<'EOF'\nthe guard does not catch git commit --no-verify, it's text\nEOF"))
+        self.assertFalse(blocked('git commit -F - <<EOF\nnever git push origin main\nEOF'))
+        self.assertTrue(blocked('bash <<EOF\ngit push origin main\nEOF'))
+        self.assertTrue(blocked('cat <<EOF | bash\ngit commit --no-verify -m x\nEOF'))
+        self.assertTrue(blocked("cat > f <<'EOF'\ntext\nEOF\ngit push origin main"))   # the command after the heredoc
+
     def run_guard(self, payload):
         return subprocess.run([sys.executable, str(TOOLS / 'claude_guard.py')], input=payload, capture_output=True, text=True)
 

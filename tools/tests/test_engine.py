@@ -478,3 +478,19 @@ class StampKey(Fixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LineEnds(unittest.TestCase):
+    """The files the tools write into the repository and into the engine tree have LF ends on every system: the text
+    writes in engine.py and patches.py go through write_lf (Path.write_text writes CRLF on Windows)."""
+
+    def test_no_text_write_bypasses_write_lf(self):
+        for name in ('engine.py', 'patches.py'):
+            src = (TOOLS / name).read_text(encoding='utf-8')
+            code = '\n'.join(l for l in src.splitlines() if not l.strip().startswith(('#', '"', "'")))
+            self.assertNotRegex(code, r'\.write_text\(', f'{name} writes text without write_lf')
+
+    def test_write_lf_writes_utf8_with_lf(self):
+        d = Path(tempfile.mkdtemp())
+        E.P.write_lf(d / 'series', 'a\nbé\n')
+        self.assertEqual((d / 'series').read_bytes(), 'a\nbé\n'.encode('utf-8'))
