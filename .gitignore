@@ -46,3 +46,6 @@ frontend/NX2Apple.app/
 /scripts/
 /docs/
 /ref/
+
+# The audit write-up (what each finding was, why it was wrong, how it was fixed): a local report, not part of the app
+/findings.md
