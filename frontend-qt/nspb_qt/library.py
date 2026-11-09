@@ -12,6 +12,7 @@ import shutil
 import struct
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -888,6 +889,11 @@ class ArtworkStore:
         '0400D4201C6EA000': 'https://cdn2.steamgriddb.com/grid/eb3353d1afeb0b6b1c6507bb5d39c757.png',  # Mario Tennis Fever
         '0400E88025B1A000': 'https://cdn2.steamgriddb.com/grid/a82908cc940793dc1d63acfc0218b2f9.jpg',  # Star Fox
     }
+    #: The only places a banner is downloaded from, over https, as on the Mac (Artwork.swift `imageHosts`). The title list
+    #: is a public file anyone can send changes to, so a link in it is not trusted to point at an image.
+    IMAGE_HOSTS = frozenset({'img-eshop.cdn.nintendo.net', 'cdn2.steamgriddb.com'})
+    #: The largest banner kept (the Mac's limit too). A banner is a few hundred KB.
+    MAX_BANNER_BYTES = 20 << 20
 
     def __init__(self, state_dir: Path | None = None, on_updated: Callable[[str], None] | None = None) -> None:
         self.state_dir = state_dir or default_state_dir()
@@ -898,6 +904,7 @@ class ArtworkStore:
         self._fetching: set[str] = set()
         self._titledb_cache: dict[str, str] | None = None
         self._lock = threading.Lock()
+        self._checked: set[Path] = set()   # saved banners already seen to be images, this run
         self._load_custom()
 
     def _load_custom(self) -> None:
@@ -940,12 +947,8 @@ class ArtworkStore:
         custom = self.custom_paths.get(tid, '')
         if custom and os.path.isfile(custom):
             return custom
-        cached = self.banners_dir / f'{tid}.jpg'
-        if cached.is_file():
+        if cached := self._cached_banner(tid):
             return str(cached)
-        cached_png = self.banners_dir / f'{tid}.png'
-        if cached_png.is_file():
-            return str(cached_png)
         if repo_path:
             gal = self._gallery_map(repo_path)
             if tid in gal:
@@ -957,6 +960,44 @@ class ArtworkStore:
                 if os.path.isfile(bundled):
                     return bundled
         return None
+
+    @staticmethod
+    def image_kind(data: bytes) -> str | None:
+        """'png' or 'jpg' when `data` starts as that image does, else None. A server's error page, a captive portal's
+        sign-in page or an empty body is not a banner, whatever its size."""
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            return 'png'
+        if data[:3] == b'\xff\xd8\xff':
+            return 'jpg'
+        return None
+
+    def _cached_banner(self, tid: str) -> Path | None:
+        """The saved banner for `tid` when it is an image. A file that is not one (an older launcher saved whatever the
+        server sent) is removed, so the banner is fetched again instead of showing as broken for good."""
+        for ext in ('jpg', 'png'):
+            path = self.banners_dir / f'{tid}.{ext}'
+            if path in self._checked and path.is_file():
+                return path
+            try:
+                with open(path, 'rb') as f:
+                    head = f.read(8)
+            except OSError:
+                continue
+            if self.image_kind(head):
+                self._checked.add(path)
+                return path
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return None
+
+    def _allowed(self, url: str) -> bool:
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            return False
+        return parts.scheme == 'https' and (parts.hostname or '') in self.IMAGE_HOSTS
 
     def _gallery_map(self, repo_path: str) -> dict[str, str]:
         cache: dict[str, dict[str, str]] = getattr(self, '_gal_cache', {})
@@ -986,7 +1027,7 @@ class ArtworkStore:
         if not self.fetch_online:
             return
         tid = title_id.upper()
-        if self.has_custom(tid) or (self.banners_dir / f'{tid}.jpg').is_file() or (self.banners_dir / f'{tid}.png').is_file():
+        if self.has_custom(tid) or self._cached_banner(tid):
             return
         with self._lock:
             if tid in self._fetching:
@@ -1032,21 +1073,30 @@ class ArtworkStore:
 
         if not url:
             url = self.FALLBACK_BANNERS.get(tid)
-        if not url:
+        if not url or not self._allowed(url):
             return
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'NX2Apple/1.1'})
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = resp.read()
-            if len(data) > 1024:
-                self.banners_dir.mkdir(parents=True, exist_ok=True)
-                ext = 'png' if data[:8] == b'\x89PNG\r\n\x1a\n' else 'jpg'
-                dest = self.banners_dir / f'{tid}.{ext}'
-                dest.write_bytes(data)
-                if self.on_updated:
-                    self.on_updated(tid)
+                status = getattr(resp, 'status', 200)
+                data = resp.read(self.MAX_BANNER_BYTES + 1)
         except Exception:
-            pass
+            return
+        # Only an image is kept: the file is shown as the game's banner and never fetched again once it is there.
+        kind = self.image_kind(data)
+        if status != 200 or kind is None or not 1024 < len(data) <= self.MAX_BANNER_BYTES:
+            return
+        dest = self.banners_dir / f'{tid}.{kind}'
+        part = dest.with_name(dest.name + '.part')
+        try:
+            self.banners_dir.mkdir(parents=True, exist_ok=True)
+            part.write_bytes(data)
+            os.replace(part, dest)          # whole or not at all: a half-written banner would also stay for good
+        except OSError:
+            part.unlink(missing_ok=True)
+            return
+        if self.on_updated:
+            self.on_updated(tid)
 
 
 # ---------------------------------------------------------------------------

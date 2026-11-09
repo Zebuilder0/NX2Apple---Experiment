@@ -234,8 +234,8 @@ class LibraryAndSpaceTests(unittest.TestCase):
         class _FakeResp:
             def __init__(self, data: bytes) -> None:
                 self._data = data
-            def read(self) -> bytes:
-                return self._data
+            def read(self, n: int = -1) -> bytes:
+                return self._data if n < 0 else self._data[:n]
             def __enter__(self) -> _FakeResp:
                 return self
             def __exit__(self, *args: object) -> None:
@@ -266,6 +266,114 @@ class LibraryAndSpaceTests(unittest.TestCase):
             store.image_path('040074A01BF12000'),
             str(store.banners_dir / '040074A01BF12000.jpg'),
         )
+
+
+class BannerDownloadTests(unittest.TestCase):
+    """A banner is saved only when it is an image from one of the image hosts: it is shown as the game's picture and
+    never fetched again once a file is there, so anything else saved would stay broken for good."""
+
+    TID = '0400486024DEC000'   # has a fallback banner on cdn2.steamgriddb.com
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.updated: list[str] = []
+        self.store = lib.ArtworkStore(state_dir=Path(self.tmp.name) / 'art', on_updated=self.updated.append)
+        self.store.banners_dir.mkdir(parents=True)
+        (self.store.banners_dir / 'banners_index.json').write_text('{"0000000000000001": "x"}', encoding='utf-8')
+        self.urls: list[str] = []
+        self.reads: list[int] = []
+
+    def fetch(self, body: bytes, status: int = 200, tid: str = TID) -> None:
+        from unittest import mock
+        test = self
+
+        class Resp:
+            def __init__(self) -> None:
+                self.status = status
+            def read(self, n: int = -1) -> bytes:
+                test.reads.append(n)
+                return body if n < 0 else body[:n]
+            def __enter__(self):
+                return self
+            def __exit__(self, *a: object) -> None:
+                pass
+
+        def urlopen(req, timeout=15):
+            self.urls.append(req.full_url)
+            return Resp()
+
+        with mock.patch('urllib.request.urlopen', side_effect=urlopen):
+            self.store._fetch_one(tid)
+
+    def saved(self) -> list[str]:
+        return sorted(p.name for p in self.store.banners_dir.iterdir() if p.name != 'banners_index.json')
+
+    def test_an_error_page_is_not_saved_as_the_banner(self) -> None:
+        self.fetch(b'<!DOCTYPE html><html><body>' + b'Sign in to the network ' * 200 + b'</body></html>')
+        self.assertEqual(self.saved(), [])
+        self.assertEqual(self.updated, [])
+        self.assertIsNone(self.store.image_path(self.TID))
+
+    def test_an_image_with_an_error_status_is_not_saved(self) -> None:
+        self.fetch(b'\x89PNG\r\n\x1a\n' + b'P' * 4096, status=203)
+        self.assertEqual(self.saved(), [])
+
+    def test_a_png_and_a_jpeg_are_saved_whole_under_their_own_kind(self) -> None:
+        png = b'\x89PNG\r\n\x1a\n' + b'P' * 4096
+        self.fetch(png)
+        self.assertEqual(self.saved(), [f'{self.TID}.png'])
+        self.assertEqual((self.store.banners_dir / f'{self.TID}.png').read_bytes(), png)
+        self.assertEqual(self.updated, [self.TID])
+        jpg_tid = '0400E88025B1A000'
+        self.fetch(b'\xff\xd8\xff\xe0' + b'J' * 4096, tid=jpg_tid)
+        self.assertEqual(self.store.image_path(jpg_tid), str(self.store.banners_dir / f'{jpg_tid}.jpg'))
+
+    def test_the_download_is_read_only_up_to_the_limit(self) -> None:
+        self.fetch(b'\x89PNG\r\n\x1a\n' + b'P' * (lib.ArtworkStore.MAX_BANNER_BYTES + 10))
+        self.assertEqual(self.reads, [lib.ArtworkStore.MAX_BANNER_BYTES + 1])
+        self.assertEqual(self.saved(), [])
+
+    def test_a_link_to_another_host_or_over_http_is_not_downloaded(self) -> None:
+        tid = '0100000000010000'
+        for link in ('https://example.com/banner.jpg', 'http://img-eshop.cdn.nintendo.net/i/a.jpg',
+                     'https://img-eshop.cdn.nintendo.net.example.com/a.jpg', 'file:///etc/passwd'):
+            with self.subTest(link):
+                (self.store.banners_dir / 'banners_index.json').write_text(f'{{"{tid}": "{link}"}}', encoding='utf-8')
+                self.fetch(b'\x89PNG\r\n\x1a\n' + b'P' * 4096, tid=tid)
+                self.assertEqual(self.urls, [])
+        (self.store.banners_dir / 'banners_index.json').write_text(
+            f'{{"{tid}": "https://img-eshop.cdn.nintendo.net/i/a.jpg"}}', encoding='utf-8')
+        self.fetch(b'\xff\xd8\xff\xe0' + b'J' * 4096, tid=tid)
+        self.assertEqual(self.urls, ['https://img-eshop.cdn.nintendo.net/i/a.jpg'])
+
+    def test_a_page_an_older_launcher_saved_is_removed_and_fetched_again(self) -> None:
+        bad = self.store.banners_dir / f'{self.TID}.jpg'
+        bad.write_bytes(b'<html>' + b'x' * 4096)
+        self.assertIsNone(self.store.image_path(self.TID))
+        self.assertFalse(bad.exists())
+        self.store.fetch_online = True
+        from unittest import mock
+        with mock.patch.object(lib.threading, 'Thread') as thread:
+            self.store.request_banner_async(self.TID)
+        thread.assert_called_once()
+
+    def test_a_saved_image_is_not_fetched_again(self) -> None:
+        (self.store.banners_dir / f'{self.TID}.png').write_bytes(b'\x89PNG\r\n\x1a\n' + b'P' * 4096)
+        self.store.fetch_online = True
+        from unittest import mock
+        with mock.patch.object(lib.threading, 'Thread') as thread:
+            self.store.request_banner_async(self.TID)
+        thread.assert_not_called()
+
+    def test_the_image_hosts_are_the_macs(self) -> None:
+        import re
+        swift = (ROOT / 'frontend' / 'Sources' / 'NX2Apple' / 'Artwork.swift').read_text(encoding='utf-8')
+        hosts = re.search(r'static let imageHosts: Set<String> = \[([^\]]*)\]', swift)
+        self.assertIsNotNone(hosts)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', hosts.group(1))), set(lib.ArtworkStore.IMAGE_HOSTS))
+        for url in lib.ArtworkStore.FALLBACK_BANNERS.values():
+            self.assertTrue(self.store._allowed(url), url)
 
 
 class ParityWindowTests(unittest.TestCase):
