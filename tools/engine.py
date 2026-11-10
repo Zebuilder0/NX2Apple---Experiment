@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -318,12 +319,25 @@ def engine_id(root):
 
 def extract_tree(eng, out):
     """The files of engine/'s HEAD under TREE_PATHS into `out`: `git archive`, so no .git and nothing untracked or ignored."""
-    import tarfile
     names = [n for n in TREE_PATHS if git('cat-file', '-e', f'HEAD:{n}', cwd=eng, check=False).returncode == 0]
     if not names: raise Fail(f'{eng} holds none of {", ".join(TREE_PATHS)}: not an engine checkout')
-    proc = subprocess.Popen(['git', 'archive', '--format=tar', 'HEAD', '--', *names], cwd=eng, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=P.clean_env())
+    # Into a file, not through a pipe: tar stops reading at the archive's first empty block, and git may still be writing
+    # the rest (a whole 10 KB record of zeros when the last one has room for one empty block only). Into a closed pipe git
+    # quits without a word, exit 141; a Windows pipe holds 4 KB, so the Windows build stopped there (run 42769539950).
+    with tempfile.TemporaryDirectory(prefix='engine-tree-', dir=out.parent) as tmp:
+        archive = Path(tmp) / 'engine.tar'
+        r = subprocess.run(['git', 'archive', '--format=tar', f'--output={archive}', 'HEAD', '--', *names], cwd=eng,
+                           capture_output=True, env=P.clean_env(), check=False)
+        if r.returncode:
+            raise Fail(f'git archive failed (exit {r.returncode}): {r.stderr.decode(errors="replace").strip()[-500:]}')
+        return _unpack(archive, out)
+
+
+def _unpack(archive, out):
+    """The regular files and links of the tar `archive` into `out`; returns how many."""
+    import tarfile
     count = 0
-    with tarfile.open(fileobj=proc.stdout, mode='r|') as tar:
+    with tarfile.open(archive, mode='r:') as tar:
         for m in tar:
             dest = out / m.name
             if m.isdir(): dest.mkdir(parents=True, exist_ok=True)
@@ -336,8 +350,6 @@ def extract_tree(eng, out):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(m.linkname, dest)
                 count += 1
-    proc.stdout.close()
-    if proc.wait(): raise Fail(f'git archive failed: {proc.stderr.read().decode(errors="replace").strip()[-500:]}')
     return count
 
 

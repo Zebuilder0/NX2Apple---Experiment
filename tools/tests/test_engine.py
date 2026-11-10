@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -463,6 +464,53 @@ class Tree(Fixture):
         self.assertIn('not an engine tree', self.tool('tree', '--out', str(keep), expect=2))
         self.assertEqual((keep / 'x').read_text(), 'mine')
         self.make('again'); self.make('again')                              # an earlier tree is replaced
+
+
+class TreeArchiveEnd(unittest.TestCase):
+    """git archive ends a tar with a whole 10 KB record of zeros when the last record has room for one empty block only.
+    tar stops reading at the first empty block; read through a pipe, git was then left writing that record into a pipe
+    that was closed, and quit without a word (exit 141). A Windows pipe holds 4 KB: run 42769539950 stopped at
+    `engine.py: git archive failed: ` with nothing after it."""
+
+    def engine_ending_in_an_extra_record(self, eng):
+        git(eng, 'init', '-q')
+        (eng / 'AGENTS.md').write_text('x\n')
+        for size in range(0, 20 * 512, 512):
+            (eng / 'dm').mkdir(exist_ok=True)
+            (eng / 'dm' / 'pad.bin').write_bytes(b'p' * size)
+            git(eng, 'add', '-A')
+            git(eng, 'commit', '-q', '--allow-empty', '-m', f'pad {size}')
+            data = subprocess.run(['git', 'archive', '--format=tar', 'HEAD', '--', 'dm', 'AGENTS.md'], cwd=eng, capture_output=True,
+                                  env=BASE_ENV, check=True).stdout
+            import io, tarfile
+            with tarfile.open(fileobj=io.BytesIO(data), mode='r:') as tar:
+                end = max(m.offset_data + (m.size + 511) // 512 * 512 for m in tar.getmembers())
+            if len(data) - end > 10240:
+                return
+        self.fail('no file size makes git archive end in an extra record')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'the pipe size is set with fcntl F_SETPIPE_SZ (Linux)')
+    def test_the_tree_is_whole_when_git_ends_the_archive_with_an_extra_record(self):
+        import fcntl
+        tmp = Path(tempfile.mkdtemp(prefix='test-engine-tree-end-'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        eng = tmp / 'engine'
+        eng.mkdir()
+        self.engine_ending_in_an_extra_record(eng)
+        real = subprocess.Popen
+
+        class WindowsSizedPipes(real):          # every pipe 4 KB, as on Windows
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                for f in (self.stdout, self.stderr):
+                    if f is not None:
+                        fcntl.fcntl(f.fileno(), 1031, 4096)   # F_SETPIPE_SZ
+        out = tmp / 'out'
+        out.mkdir()
+        with mock.patch.object(E.subprocess, "Popen", WindowsSizedPipes):
+            n = E.extract_tree(eng, out)
+        self.assertEqual(n, 2)
+        self.assertEqual((out / 'dm' / 'pad.bin').stat().st_size, (eng / 'dm' / 'pad.bin').stat().st_size)
 
 
 class StampKey(Fixture):
