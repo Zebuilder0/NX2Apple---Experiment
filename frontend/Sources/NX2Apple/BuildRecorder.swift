@@ -49,10 +49,13 @@ import NXLauncher
             }
         }
         if !running {
+            // Handled on the next turn, once the model has set `done`. A build's own steps can set running false and true again
+            // within one turn (packArchive, the engine sync, verifyShellDevice): only the ID this build ended with is cleared.
+            let ending = activeBuildID
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.build.running else { return }   // a build may have started since the idle notification
                 if self.build.done { self.record() }
-                self.activeBuildID = nil
+                if self.activeBuildID == ending { self.activeBuildID = nil }
                 self.engine.applyPendingEngine()   // an engine installed during the build takes over once it is recorded
             }
         }
