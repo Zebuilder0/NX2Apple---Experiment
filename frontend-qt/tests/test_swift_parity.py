@@ -339,6 +339,8 @@ class SharedShellParityTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
             m = Model()
+            # the IPA export: a launcher on Windows installs on the device unless the player chose an IPA
+            m.output_mode = 'ipa'
             m.repo_path = str(eng if real_bundle else ROOT)
             m.python_path = sys.executable
             m.deps_checked = True
@@ -1735,6 +1737,7 @@ class ParityWindowTests(unittest.TestCase):
             self.addCleanup(p.stop)
 
             m = Model()
+            m.output_mode = 'ipa'     # the IPA export: a launcher on Windows installs on the device unless told otherwise
             m.repo_path = str(ROOT)
             m.deps_checked = True
             m.deps = [model_mod.Dep('python', 'dep.python', 'dep.python.hint', model_mod.DepState.OK)]
