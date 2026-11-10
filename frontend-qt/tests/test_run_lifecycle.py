@@ -170,6 +170,35 @@ class Sandbox(unittest.TestCase):
         self.assertTrue(str(m.settings.fileName()).startswith(qt_sandbox.STATE_DIR))
         self.assertEqual(Path(m.log_path).parent, Path(qt_sandbox.STATE_DIR) / 'logs')
 
+    def test_the_windows_folders_are_in_the_sandbox_too(self):
+        """Audit 2, T2: a test that runs the Windows branch (pu.IS_WIN patched, or a real Windows PC) writes the shim,
+        the downloaded tools and the signing tool's session into the sandbox, never into the player's own folders."""
+        from nspb_qt.win import shim, toolchain
+        state = Path(qt_sandbox.STATE_DIR)
+        for folder in (shim.shim_dir(), toolchain.tools_dir(), signer.data_dir()):
+            with self.subTest(folder=folder):
+                self.assertTrue(Path(folder).is_relative_to(state), folder)
+        self.assertTrue(Path(os.environ['APPDATA']).is_relative_to(state))     # what data_dir reads on Windows
+
+
+@unittest.skipIf(QApplication is None, 'PySide6 is not installed')
+class DepMarkers(unittest.TestCase):
+    def test_every_device_row_marker_reads_as_text(self):
+        """Audit 2, D3: the iPhone and iPad rows' details are markers (win.dep.*); Settings showed them as they are."""
+        from nspb_qt.model import Model
+        QApplication.instance() or QApplication([])
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        self.addCleanup(m.deleteLater)
+        source = (ROOT / 'frontend-qt/nspb_qt/device_model.py').read_text(encoding='utf-8')
+        markers = sorted(set(re.findall(r"'(win\.dep\.[A-Za-z0-9_.]+)'", source)))
+        self.assertTrue(markers)
+        for marker in markers:
+            with self.subTest(marker=marker):
+                text = m.format_dep_detail(marker)
+                self.assertNotEqual(text, marker)
+                self.assertEqual(text, m.t(marker))
+
 
 class Waits:
     def wait(self, cond, seconds=10.0):
@@ -243,6 +272,26 @@ class ModelRuns(Waits, unittest.TestCase):
         self.assertEqual(calls, [('U', True, 'install')])     # the same run, now labelled an install
         self.assertEqual(out, (True, 'installed'))
         self.assertEqual(self.ends, [])                        # the build's worker ends the run, not this step
+
+    def test_a_built_game_whose_install_fails_is_in_the_library(self):
+        """Audit 2, P7: the game is built and in the shared app; a failed install (the device unplugged) left it out of
+        the library, so its card said it was not built."""
+        m = self.model()
+        m.begin_run('build')
+        recorded = []
+        lib = se.ShellLibrary(games=[se.ShellGame('0100ABCD00000000', 'Game', '/fw')])
+        with mock.patch.object(se, 'add_to_library', return_value=(lib, [], '')), \
+                mock.patch.object(m, '_record_library_ios_completion',
+                                  side_effect=lambda tid, **k: recorded.append((tid, k.get('ipa_path')))), \
+                mock.patch.object(type(m), 'device_install_ready', new_callable=mock.PropertyMock, return_value=True):
+            m.install_udid = 'U'
+            m.device_by_udid = lambda u: object()
+            m.device_titles = lambda u: []
+            m._install = lambda udid, **k: (False, 'the device went away', False)
+            ok, _note = m.after_framework_build(Path('/fw'), '0100ABCD00000000', 'Game', '')
+        self.assertFalse(ok)
+        self.assertEqual(recorded, [('0100ABCD00000000', '')])
+        m.end_run(False, '')
 
     def test_a_built_game_goes_where_it_was_meant_to_when_build_was_pressed(self):
         """N2: Play on switched to Export as IPA while the build ran: the game still installs, as chosen at the start."""
@@ -389,6 +438,26 @@ class ModelRuns(Waits, unittest.TestCase):
             self.assertTrue(self.wait(lambda: len(answers) == 2))
         self.assertEqual(sorted(answers), [('first', False), ('second', False)])
 
+    def test_a_request_as_the_sync_ends_is_answered(self):
+        """Audit 2, P10: a caller that saw the sync running joined the waiters just as the sync's end took them, and
+        was never answered (a lost Build press). The end here comes from the worker in that very moment."""
+        m = self.model()
+        m._engine_syncing = True
+        answers, ender = [], []
+
+        class Waiters(list):
+            def append(self, cb):
+                t = threading.Thread(target=m._end_sync, args=(None, True))
+                ender.append(t)
+                t.start()
+                t.join(0.3)            # the sync's end, between the check and the append
+                super().append(cb)
+        m._sync_waiters = Waiters()
+        m.sync_engine(lambda ok: answers.append(ok))
+        ender[0].join(5)
+        self.assertEqual(answers, [True])
+        self.assertFalse(m._engine_syncing)
+
 
 @unittest.skipIf(QApplication is None, 'PySide6 is not installed')
 class WholeBuilds(Waits, unittest.TestCase):
@@ -410,7 +479,11 @@ class WholeBuilds(Waits, unittest.TestCase):
         keys = tmp / 'prod.keys'
         for f in (self.base_a, self.upd_a, self.base_b, keys):
             f.write_bytes(b'x')
-        with mock.patch.object(Model, 'check_deps', lambda self: None):
+        from nspb_qt import library as lib
+        # a library of its own: the sandbox's state folder is shared by every test of a run, and these tests ask what
+        # this build recorded (audit T2)
+        with mock.patch.object(Model, 'check_deps', lambda self: None), \
+                mock.patch.object(lib, 'default_state_dir', return_value=tmp / 'state'):
             self.m = Model()
         self.addCleanup(self.m.deleteLater)
         m = self.m
@@ -428,9 +501,10 @@ class WholeBuilds(Waits, unittest.TestCase):
         class Build:
             pid = 0
 
-            def __init__(self, *a, **k):
+            def __init__(self, args, **k):
                 self.returncode = None
                 self.stdout = self.lines()
+                self.out = args[args.index('-o') + 1] if '-o' in args else ''   # the one-game IPA it writes
 
             def lines(self):
                 yield '[1/1] build\n'
@@ -439,6 +513,9 @@ class WholeBuilds(Waits, unittest.TestCase):
             def wait(self, timeout=None):
                 if self.returncode is None:
                     self.returncode = -15 if test.stopped else 0
+                    if self.returncode == 0 and self.out:
+                        Path(self.out).parent.mkdir(parents=True, exist_ok=True)
+                        Path(self.out).write_bytes(b'IPA')
                 return self.returncode
 
             def poll(self):
@@ -479,6 +556,35 @@ class WholeBuilds(Waits, unittest.TestCase):
         self.assertFalse(any(g.title_id == '0100000000020000' for g in m.library.games),
                          'the game picked during the build was recorded as the one built')
 
+    def test_a_library_game_opened_during_the_build_keeps_its_entry(self):
+        """Audit 2, D1: the run's outputs (its IPA, its data folder) are the run's, not the page's, which a library game
+        opened during the build changes. Before, game B's entry got A's files and A's entry lost its IPA."""
+        from nspb_qt import library as lib
+        m = self.m
+        out_b = self.b / 'out'
+        arch_b = out_b / 'games' / '0100000000020000'
+        arch_b.mkdir(parents=True)
+        (arch_b / 'romfs.img').write_bytes(b'x')
+        ipa_b = out_b / '0100000000020000.ipa'
+        ipa_b.write_bytes(b'ipa')
+        m.library.upsert(lib.LibraryGame(title_id='0100000000020000', name='Game B', ipa_path=str(ipa_b),
+                                         archive_path=str(arch_b), output_dir=str(out_b),
+                                         inputs={'base': [str(self.base_b)]}, last_built_at=1.0))
+        p1, p2, p3, p4 = self.start()
+        with p1, p2, p3, p4:
+            m.start_build()
+            self.assertTrue(m.running)
+            m.load_game_from_library(next(g for g in m.library.games if g.title_id == '0100000000020000'))
+            self.release.set()
+            self.assertTrue(self.wait(lambda: bool(self.ends)))
+        self.assertEqual(self.ends, [True])
+        b = next(g for g in m.library.games if g.title_id == '0100000000020000')
+        self.assertEqual(b.inputs.get('base'), [str(self.base_b)], "B's entry was overwritten by A's build")
+        self.assertEqual((b.ipa_path, b.archive_path), (str(ipa_b), str(arch_b)))
+        a = next(g for g in m.library.games if g.title_id == '0100000000010000')
+        self.assertEqual(a.inputs.get('base'), [str(self.base_a)])
+        self.assertEqual(a.ipa_path, str(Path(m.run_inputs.out_dir, '0100000000010000.ipa')))
+
     def test_a_stopped_build_ends_as_stopped_not_as_a_failure(self):
         m = self.m
         p1, p2, p3, p4 = self.start()
@@ -497,6 +603,94 @@ class WholeBuilds(Waits, unittest.TestCase):
         self.assertFalse(m.cancel_requested)
         self.assertFalse(m.run_stopped)
         m.end_run(True, '')
+
+    def test_a_stop_while_the_build_script_starts_ends_it(self):
+        """Audit 2, D7: Stop pressed while the script's process is being created (a big Python on Windows, a virus scan)
+        found no process to end; the script then ran to its own end. It is ended once it is there."""
+        from nspb_qt import model as mm
+        m = self.m
+        Build = self.script(self)
+        creating = threading.Event()
+
+        class SlowStart(Build):
+            def __init__(self, *a, **k):
+                creating.set()
+                time.sleep(0.3)
+                super().__init__(*a, **k)
+        p1, p2, p3, _ = self.start()
+        with p1, p2, p3, mock.patch.object(mm.subprocess, 'Popen', SlowStart):
+            m.start_build()
+            self.assertTrue(creating.wait(5))
+            m.cancel_build()                         # Stop, while the process is being created
+            self.assertTrue(self.wait(lambda: bool(self.ends), 15))
+        self.assertTrue(self.stopped, 'the script was never ended: it ran to its own end after Stop')
+        self.assertEqual(self.ends, [False])
+        self.assertTrue(m.run_stopped)
+
+    def test_a_build_refused_after_a_stopped_one_is_a_failure_not_a_stop(self):
+        """Audit 2, D5: a Build that fails before its run begins kept the stopped run's flag: the window showed it as
+        "Stopped" and did not open the log."""
+        m = self.m
+        p1, p2, p3, p4 = self.start()
+        with p1, p2, p3, p4:
+            m.start_build()
+            self.assertTrue(self.wait(lambda: m._proc is not None))
+            m.cancel_build()
+            self.assertTrue(self.wait(lambda: bool(self.ends)))
+        self.assertTrue(m.run_stopped)
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=False):
+            self.assertFalse(m.start_build())
+        self.assertEqual(self.ends, [False, False])
+        self.assertFalse(m.run_stopped)
+
+    def test_a_failed_engine_sync_does_not_end_a_run_begun_meanwhile(self):
+        """Audit 2, D10: Build pressed on an engine that needs a sync, and an install begun during the sync: the sync's
+        failure was heard as that install's end (the transfer window showed Failed while the install went on)."""
+        m = self.m
+        self.assertTrue(m.begin_run('install'))
+        m._build_after_sync(False, '')
+        self.assertEqual(self.ends, [])
+        self.assertTrue(m.running)
+        m.end_run(True, 'installed')
+        self.assertEqual(self.ends, [True])
+        m._build_after_sync(False, '')               # with nothing running it is the Build's own failure
+        self.assertEqual(self.ends, [True, False])
+
+
+@unittest.skipIf(QApplication is None, 'PySide6 is not installed')
+class IpaExportData(unittest.TestCase):
+    def test_a_game_exported_in_the_shared_ipa_takes_its_data_to_a_device_later(self):
+        """Audit 2, D3: a game exported in the shared IPA is in the shared app's library, so the Library offers it for a
+        transfer to a device. Its data folder was not remembered, and that transfer installed the game without it."""
+        QApplication.instance() or QApplication([])
+        from nspb_qt import model as mm
+        from nspb_qt.model import Model, RunInputs
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        self.addCleanup(m.deleteLater)
+        root = tmp / 'shell'
+        m.settings.setValue('shellRoot', str(root))
+        tid = '0100ABCD00000000'
+        work = tmp / 'work'
+        fw = make_framework(work / 'shell-framework', tid, 'Game')
+        archive = tmp / 'out' / 'games' / tid
+        archive.mkdir(parents=True)
+        (archive / 'romfs.img').write_bytes(b'data' * 100)
+        self.assertTrue(m.begin_run('build'))
+        m.run_inputs = RunInputs(work_dir=str(work), tid_hex=tid, output_mode='ipa')
+
+        def export(**k):     # the real export's first step (the game joins the shared app), then an IPA
+            se.add_to_library(k['root'], k['framework'], k['title_id'], k['name'])
+            return True, str(tmp / 'NX2Apple.ipa'), 'done', []
+        with mock.patch.object(mm.pu, 'IS_WIN', True), mock.patch.object(se, 'export_shell', side_effect=export), \
+                mock.patch.object(m, '_record_library_ios_completion'):
+            ok, _ = m._export_shell_after_archive(True, '', archive=str(archive))
+        m.end_run(ok, '')
+        self.assertTrue(ok)
+        self.assertEqual([g.title_id for g in m.built_games()], [tid])
+        self.assertTrue(wi.pending_data(root, se.present_games(root), {}),
+                        'a transfer to a device would install the game without its data')
 
 
 @unittest.skipIf(QApplication is None, 'PySide6 is not installed')
@@ -550,6 +744,30 @@ class TransferWindowLifetime(unittest.TestCase):
         finally:
             sys.excepthook = old
         self.assertEqual(errors, [])
+
+    def test_the_corner_card_follows_the_window_once(self):
+        """Audit 2, P11: each minimize connected the card to the window again, and it updated once more per minimize."""
+        from PySide6.QtCore import QObject, Signal
+        from nspb_qt import transfer
+
+        class Dialog(QObject):
+            progressed = Signal()
+        parent = QWidget()
+        self.addCleanup(parent.deleteLater)
+        toast = transfer.TransferToast(parent)
+        updates = []
+        toast.update_from_dialog = lambda: updates.append(1)
+        first, second = Dialog(), Dialog()
+        for _ in range(3):                        # minimized three times
+            toast.follow(first)
+        updates.clear()
+        first.progressed.emit()
+        self.assertEqual(updates, [1])
+        toast.follow(second)                      # a later transfer's window
+        updates.clear()
+        first.progressed.emit()
+        second.progressed.emit()
+        self.assertEqual(updates, [1])
 
 
 if __name__ == '__main__':

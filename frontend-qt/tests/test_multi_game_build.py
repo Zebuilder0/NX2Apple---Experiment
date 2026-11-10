@@ -156,7 +156,7 @@ class MultiGameBuild(unittest.TestCase):
         self.m.runningChanged.connect(transitions.append)
         self.m.finished.connect(lambda ok, note: results.append((ok, note)))
 
-        def fail(*args):
+        def fail(*args, **kwargs):     # _record_library_ios_completion also takes the run's outputs by keyword
             self.assertTrue(self.m.running)
             raise RuntimeError('fixture failed')
 

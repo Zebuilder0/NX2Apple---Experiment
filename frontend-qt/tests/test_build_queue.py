@@ -213,6 +213,9 @@ class Queue(unittest.TestCase):
         m.start_build = lambda: None
         m.start_queue()
         self.assertEqual((m.output_mode, m.bc_on_cpu), ('ipa', True))   # the queued game's, while it builds
+        # audit 2, P5: the page holds the game being built; Add to queue would queue it again and empty its rows
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True):
+            self.assertFalse(m.can_queue)
         m.remember_choices()                                       # the window does this on every refresh
         self.assertEqual(m.settings.value('outputMode'), 'device')  # not saved as the player's
         m._queue_on_finished(True, '')
@@ -230,6 +233,73 @@ class Queue(unittest.TestCase):
         m.settings.sync()
         again = self.model()                                       # a new start reads the queue back
         self.assertEqual([(i.key, i.state) for i in again.queue], [('0100000000000A00', 'waiting')])
+
+    def test_a_queued_game_the_build_refuses_fails_and_the_queue_goes_on(self):
+        """Audit 2, D2: a queued folder that no longer reads as a game made the real start_build return with no end
+        to hear. The game stayed 'running' and the queue stood still until some other run ended, taken as its end."""
+        from nspb_qt import inputs
+        m = self.model()
+        folder = self.tmp / 'Game folder'
+        folder.mkdir()
+        m.queue.append(qm.QueueItem(id='q1', name='G', key='0100000000010000', folder=str(folder), out_dir=str(self.out)))
+        m.queue.append(qm.QueueItem(id='q2', name='H', key='0100000000020000', base=str(self.tmp / 'gone.nsp'),
+                                    out_dir=str(self.out)))
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True), \
+                mock.patch.object(inputs, 'scan_game_folder', return_value=inputs.GameFolderProblem('noBaseFolder')):
+            m.start_queue()
+            deadline = time.time() + 5
+            while m.queue_running and time.time() < deadline:
+                self.app.processEvents()
+                time.sleep(0.02)
+        self.assertFalse(m.queue_running, 'the queue stood still after a game the build refused')
+        self.assertEqual([i.state for i in m.queue], ['failed', 'failed'])
+        self.assertTrue(m.queue[0].note)
+        self.assertFalse(m.running)
+
+    def test_the_activity_bars_stop_stops_the_queue_too(self):
+        """Audit 2, D4: the Stop on every other page (the activity bar's, Model.cancel_build) ended the game building
+        now, and the queue started the next one 1.5 s later."""
+        m = self.model()
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True):
+            for tid in ('0100000000000A00', '0100000000000B00'):
+                self.game(m, tid)
+                m.add_to_queue()
+        built = []
+        m.start_build = lambda: built.append(m.base_path)
+        m.start_queue()
+        self.assertEqual(len(built), 1)
+        m.cancel_build()
+        m._queue_on_finished(False, 'Stopped')
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            self.app.processEvents()
+            time.sleep(0.02)
+        self.assertEqual(len(built), 1, 'the next game started after Stop')
+        self.assertFalse(m.queue_running)
+        self.assertEqual([i.state for i in m.queue], ['failed', 'waiting'])
+
+    def test_stop_after_this_game_still_installs_what_the_queue_built(self):
+        """Audit 2, D5: Stop after this game ended the queue without its install: the shared-app games built for the
+        device so far were never put on it."""
+        m = self.model()
+        with mock.patch.object(type(m), 'repo_ok', new_callable=mock.PropertyMock, return_value=True):
+            for tid in ('0100000000000A00', '0100000000000B00'):
+                self.game(m, tid)
+                m.add_to_queue()
+        m.start_build = lambda: None
+        installs = []
+        m.install_on_device = lambda udid, titles=None, **k: installs.append((udid, titles)) or True
+        with mock.patch.object(type(m), 'device_install_ready', new_callable=mock.PropertyMock, return_value=True):
+            m.install_udid = 'UDID1'
+            m.device_by_udid = lambda u: object()
+            m.device_titles = lambda u: ['0100000000000F00']
+            m.start_queue()
+            m.queue_built('0100000000000A00')      # A is in the shared app: its install waits for the queue's end
+            m.stop_queue()                          # Stop after this game
+            m._queue_on_finished(True, 'A is built.')
+        self.assertFalse(m.queue_running)
+        self.assertEqual([i.state for i in m.queue], ['done', 'waiting'])
+        self.assertEqual(installs, [('UDID1', ['0100000000000A00', '0100000000000F00'])])
 
     def test_a_game_whose_files_are_gone_is_skipped(self):
         m = self.model()

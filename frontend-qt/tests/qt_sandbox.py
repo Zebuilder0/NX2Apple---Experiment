@@ -17,6 +17,11 @@ from pathlib import Path
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 STATE_DIR = os.environ.setdefault('NSPB_STATE_DIR', tempfile.mkdtemp(prefix='nspb-tests-'))
+# The per-user folders the Windows code paths write to (the shim and tools under %LOCALAPPDATA%, Impactor's session under
+# %APPDATA%, its Linux/macOS twin under XDG_CONFIG_HOME): a test that runs them with the Windows branch switched on, or on
+# a real Windows PC, writes into the sandbox, never into the player's own folders. A test that needs other values sets them.
+for _var in ('LOCALAPPDATA', 'APPDATA', 'XDG_CONFIG_HOME'):
+    os.environ[_var] = os.path.join(STATE_DIR, _var.lower())
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nspb_qt import library as _library   # noqa: E402

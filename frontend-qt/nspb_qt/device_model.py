@@ -264,6 +264,8 @@ class DeviceMixin:
         if archive and Path(archive).is_dir():
             from .win import install as wi
             wi.remember_data(root, title_id, Path(archive))
+        # the game is built: the library says so whatever the install below does (a device unplugged is not a failed build)
+        self._record_library_ios_completion(title_id, name=name, ipa_path='', archive_path=archive)
         if self.cancel_requested:
             return False, ''
         if getattr(self, 'queue_defers_install', lambda: False)():
@@ -328,6 +330,8 @@ class DeviceMixin:
 
         def started(p) -> None:
             self._proc = p
+            if self.cancel_requested:     # Stop came while the signing tool started: end it now
+                self.cancel_run()
 
         rate = wi.CopyRate()
         self.transfer_info = None

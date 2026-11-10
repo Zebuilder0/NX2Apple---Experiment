@@ -516,8 +516,15 @@ class TransferToast(QFrame):
         parent.installEventFilter(self)
 
     def follow(self, dialog: TransferDialog) -> None:
-        self.dialog = dialog
-        dialog.progressed.connect(self.update_from_dialog)
+        # once per dialog: each minimize calls this again, and a second connection would update the card twice
+        if self.dialog is not dialog:
+            if self.dialog is not None:
+                try:
+                    self.dialog.progressed.disconnect(self.update_from_dialog)
+                except (RuntimeError, TypeError):      # that dialog is gone already
+                    pass
+            self.dialog = dialog
+            dialog.progressed.connect(self.update_from_dialog)
         self.update_from_dialog()
         self.place()
         self.show()

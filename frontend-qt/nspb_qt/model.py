@@ -326,6 +326,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         self.run_stopped = False        # the last run ended because the player stopped it (not a failure)
         self._cancel_requested = False  # Stop was pressed during this run (cancel_run)
         self._sync_waiters: list[Callable[[bool], None]] = []   # callers waiting for the engine sync that runs
+        self._sync_lock = threading.Lock()   # a caller joins the waiters, or the sync's end takes them: never between
         self.run_inputs: RunInputs | None = None   # what the build that runs (or ran last) was started with
         self.log_tail = ''
         self.engine_syncing = False   # tools/engine.py sync runs: the window shows a status line
@@ -722,12 +723,13 @@ class Model(QObject, DeviceMixin, QueueMixin):
     def sync_engine(self, then: Callable[[bool], None] | None = None) -> None:
         """Run `tools/engine.py sync` on a thread when engine/ is stale (after a pull, at the start, before a build that
         needs it). A no-op for a checkout from before #214 or a current engine/. `then(ok)` runs after it."""
-        if getattr(self, '_engine_syncing', False):
-            # a sync runs: this caller hears how that one ends (a build pressed meanwhile must not find the engine
-            # still stale and say it is invalid)
-            if then:
-                self._sync_waiters.append(then)
-            return
+        with self._sync_lock:
+            if getattr(self, '_engine_syncing', False):
+                # a sync runs: this caller hears how that one ends (a build pressed meanwhile must not find the engine
+                # still stale and say it is invalid)
+                if then:
+                    self._sync_waiters.append(then)
+                return
         if not engine.is_stale(self.repo_path):
             self.engine_failure = None
             if then: then(True)
@@ -767,7 +769,9 @@ class Model(QObject, DeviceMixin, QueueMixin):
         threading.Thread(target=work, daemon=True).start()
 
     def _end_sync(self, then: Callable[[bool], None] | None, ok: bool) -> None:
-        waiters, self._sync_waiters = self._sync_waiters, []
+        with self._sync_lock:      # a caller that saw the sync running is in this list, not in the next one
+            self._engine_syncing = False
+            waiters, self._sync_waiters = self._sync_waiters, []
         for cb in ([then] if then else []) + waiters:
             try:
                 cb(ok)
@@ -1559,6 +1563,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if detail.startswith('dep.metal.other:'):
             _, got, tested = detail.split(':', 2)
             return self.t('dep.metal.other', got, tested)
+        if detail.startswith('win.dep.') and ' ' not in detail:   # the device rows' markers (device_model.py)
+            return self.t(detail)
         return detail
 
     def _clear_installing(self, dep: Dep) -> None:
@@ -2219,7 +2225,21 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if ok and not engine.needs_sync_before_build(self.repo_path):
             self.start_build(title_id=title_id or None)
         else:
-            self.finished.emit(False, self.t('msg.repoInvalidEmpty'))
+            self._build_refused(self.t('msg.repoInvalidEmpty'))
+
+    def _build_refused(self, note: str, *, announce: bool = True) -> bool:
+        """A Build that does not become a run. The window hears it as a build that failed at once (`finished`), except
+        while another run goes on (an install begun during the engine sync): that run's end stays its own. The queue
+        hears it either way: through `finished`, else directly (it would wait for this game for good). Never a stop.
+        Returns False, start_build's "no run began"."""
+        self.run_stopped = False
+        if announce and not self.running:
+            self.finished.emit(False, note)
+        else:
+            if note:
+                self.log(note + '\n')
+            self._queue_build_refused(note)
+        return False
 
     @Slot(str)
     def _emit_log(self, s: str) -> None:
@@ -2373,28 +2393,34 @@ class Model(QObject, DeviceMixin, QueueMixin):
             return self.failure.title_ids
         return ()
 
-    def start_build(self, *, title_id: str | None = None) -> None:
-        if self.running or (title_id is not None and title_id not in self.selectable_titles):
-            return
+    def start_build(self, *, title_id: str | None = None) -> bool:
+        """Start a build of the game on the page. Returns whether it began (a run, or the engine sync it waits for); a
+        refusal is said through _build_refused."""
+        if self.running:
+            # an install that began while the engine synced for this build: this build cannot start now
+            return self._build_refused(self.t('queue.busy'), announce=False)
+        if title_id is not None and title_id not in self.selectable_titles:
+            return False
         self._last_error = ''
         self.failure = None
         if not self.repo_ok:
-            self.finished.emit(False, self.t('msg.repoInvalidEmpty'))
-            return
+            return self._build_refused(self.t('msg.repoInvalidEmpty'))
         if self.game_folder is None and not self.base_path:
-            return
+            # nothing to build: the Build button is off then, but a queued game whose folder no longer reads as a game
+            # lands here (its rows were emptied by take_game_folder), and the queue must hear it
+            return self._build_refused(self.game_folder_problem or self.t('queue.notStarted'),
+                                       announce=self.queue_drives_inputs())
         if engine.needs_sync_before_build(self.repo_path):
             # engine/ is the only engine and is stale or missing: make it, then build (a failed sync names its fix in the log)
             self.sync_engine(lambda ok: QMetaObject.invokeMethod(
                 self, '_build_after_sync', Qt.QueuedConnection, Q_ARG(bool, ok), Q_ARG(str, title_id or '')))
-            return
+            return True
         py = self.python_path or ('python' if pu.IS_WIN else '/usr/bin/python3')
         folder = self.game_folder
         if folder is not None:
             why = self.game_folder_engine_problem(folder)
             if why:
-                self.finished.emit(False, why)
-                return
+                return self._build_refused(why)
         base_dir = folder.folder if folder is not None else str(Path(self.base_path).parent)
         # a game folder or a NUP goes to the script as it is: nothing is staged and no file is a package
         all_files = [] if folder is not None else [f for f in ([self.base_path, self.update_path] + list(self.dlc_paths)) if f]
@@ -2456,11 +2482,9 @@ class Model(QObject, DeviceMixin, QueueMixin):
             except input_staging.StagingError as e:
                 # a file that cannot be staged stops the build: built without it, the game would lack the update or
                 # DLC that was picked, and say nothing (audit M8)
-                self.finished.emit(False, self.t('msg.stagingFileFailed', Path(e.path).name, e.reason))
-                return
+                return self._build_refused(self.t('msg.stagingFileFailed', Path(e.path).name, e.reason))
             if staged_count == 0:
-                self.finished.emit(False, self.t('msg.stagingFailed'))
-                return
+                return self._build_refused(self.t('msg.stagingFailed'))
             input_dir = staging
             if unpicked:
                 self.log(self.t('msg.stagedFromSharedFolder', Path(self.base_path).name) + '\n')
@@ -2470,8 +2494,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if compressed and not pu._runs(py, ['-c', 'import nsz']):
             self.log(self.t('msg.installingNsz') + '\n')
             if not pu._runs(py, ['-m', 'pip', 'install', 'nsz']):
-                self.finished.emit(False, self.t('msg.nszFailed', py))
-                return
+                return self._build_refused(self.t('msg.nszFailed', py))
 
         # On Windows the upstream script is started through the driver, which loads it as a
         # module and replaces the steps that assume a Mac (see nspb_qt/win/driver.py). The
@@ -2508,8 +2531,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             from .win import shell_export as se
             tpl = se.find_shell_template(self.engine_path, root=self.shell_cache_path, log=self.log)
             if tpl is None or not (tpl / se.SCHEME).is_file():
-                self.finished.emit(False, self.t('shell.exportFailed', f'missing {se.APP_NAME} template'))
-                return
+                return self._build_refused(self.t('shell.exportFailed', f'missing {se.APP_NAME} template'))
             sf_dir = Path(self.effective_work_dir, 'shell-framework')
             if sf_dir.is_dir():
                 for old_fw in sf_dir.glob('DmGame*.framework'):
@@ -2549,7 +2571,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
                         output_mode=self.output_mode if pu.IS_WIN else 'ipa', ipa_path=self.ipa_path)
         mac_app_path = self.mac_app_path
         if not self.begin_run('build'):
-            return
+            return self._build_refused(self.t('queue.busy'), announce=False)
         self.run_inputs = run
         self._stop_pso_poll()
         with self._ensure_pso_lock():
@@ -2594,6 +2616,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
                                               text=True, encoding='utf-8', errors='replace',
                                               bufsize=1, env=env,
                                               **pu.no_window_kwargs())
+                if self._cancel_requested:     # Stop came while it started: cancel_run had no process to end yet
+                    self.cancel_run()
                 assert self._proc.stdout is not None
                 for line in self._proc.stdout:
                     self._on_line(line.rstrip('\n'))
@@ -2621,10 +2645,11 @@ class Model(QObject, DeviceMixin, QueueMixin):
                 emit_safely(self.stagesChanged)
                 if run.ipa_kind != 'oneGame':
                     return self.pack_archive(title_id, export_shell=use_shell_fw)
-                if not self.ipa_path:
-                    self.ipa_path = str(Path(base_dir, f'{tid_hex}.ipa'))
-                self._record_library_ios_completion(title_id)
-                note = self.t('shell.oneGameDone', self.ipa_path)
+                # the run's own IPA (the page may show another game's by now: a library game opened meanwhile)
+                ipa = run.ipa_path or str(Path(base_dir, f'{tid_hex}.ipa'))
+                self.ipa_path = ipa
+                self._record_library_ios_completion(title_id, ipa_path=ipa, archive_path='')
+                note = self.t('shell.oneGameDone', ipa)
             else:
                 if self.stages:
                     self.stages[-1].state = 'failed'
@@ -2710,7 +2735,10 @@ class Model(QObject, DeviceMixin, QueueMixin):
                                  install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
-        """The Build button and the activity bar's Stop: the same as every Stop (cancel_run)."""
+        """The Build button and the activity bar's Stop: the same as every Stop (cancel_run), and during the queue the
+        queue stops too (the next game must not start 1.5 s later)."""
+        if getattr(self, 'queue_running', False):
+            self.stop_queue()
         self.cancel_run()
 
     # ---- the script's own progress lines
@@ -3080,7 +3108,7 @@ class Model(QObject, DeviceMixin, QueueMixin):
             versions.sort(key=lambda x: x[0])
         if not versions:
             if export_shell:
-                return self._export_shell_after_archive(True, self.t('msg.archiveSkipped', str(extract)))
+                return self._export_shell_after_archive(True, self.t('msg.archiveSkipped', str(extract)), archive='')
             return True, self.t('msg.archiveSkipped', str(extract))
         ver_dir = versions[-1][1]
         romfs_img = ver_dir / 'RomFS.img'
@@ -3133,6 +3161,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
                                      text=True, encoding='utf-8', errors='replace', env=env,
                                      **pu.no_window_kwargs())
                 self._proc = p            # Stop reaches the packer too (cancel_run): it can take minutes
+                if self._cancel_requested:    # Stop came while it started
+                    self.cancel_run()
                 try:
                     assert p.stdout is not None
                     for line in p.stdout:
@@ -3162,17 +3192,23 @@ class Model(QObject, DeviceMixin, QueueMixin):
             ok = False
         if self.stages:
             self.stages[-1].state = 'done' if ok else ('stopped' if self._cancel_requested else 'failed')
-        self.archive_path = dest if ok else ''
+        self.archive_path = dest if ok else ''      # what the window shows; the run passes `dest` on itself
         emit_safely(self.stagesChanged)
         if self._cancel_requested:
             return False, ''
         if ok and export_shell:
-            return self._export_shell_after_archive(True, '')
+            return self._export_shell_after_archive(True, '', archive=dest)
         if ok:
-            self._record_library_ios_completion(tid if (title_id or re.fullmatch(r'[0-9A-Fa-f]{16}', tid)) else None)
+            self._record_library_ios_completion(tid if (title_id or re.fullmatch(r'[0-9A-Fa-f]{16}', tid)) else None,
+                                                ipa_path=r.ipa_path, archive_path=dest)
         return ok, '' if ok else self.t('msg.archiveFailed')
 
-    def _export_shell_after_archive(self, archive_ok: bool, archive_note: str) -> tuple[bool, str]:
+    def _export_shell_after_archive(self, archive_ok: bool, archive_note: str, *, archive: str | None = None
+                                    ) -> tuple[bool, str]:
+        """The shared-app game of a build: its IPA (upstream's export) or the install on the device. `archive` is this
+        run's game data folder (pack_archive's), not the page's."""
+        if archive is None:
+            archive = self.archive_path
         if not archive_ok:
             return False, archive_note or self.t('msg.archiveFailed')
         from .win import shell_export as se
@@ -3214,10 +3250,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if r.output_mode == 'device' and pu.IS_WIN:
             # Install on device: the game goes into the shared app's library and onto the chosen device, as the rest of
             # this run; no IPA is zipped
-            ok, msg = self.after_framework_build(fw, tid, game_name, self.archive_path)
-            if ok:
-                self._record_library_ios_completion(tid, name=game_name)
-            return ok, msg
+            # (the library records the game once it is in the shared app, whatever the install does next)
+            return self.after_framework_build(fw, tid, game_name, archive)
 
         py = self.python_path or sys.executable
         picked = self.artwork.custom_paths.get(tid.upper())
@@ -3236,12 +3270,24 @@ class Model(QObject, DeviceMixin, QueueMixin):
         )
         if ok:
             self.ipa_path = out_ipa
-            self._record_library_ios_completion(tid, name=game_name)
+            if archive and os.path.isdir(archive):
+                # the game's data folder, so a Transfer to a device later copies it (the game is in the shared app now)
+                from .win import install as wi
+                wi.remember_data(Path(self.shell_cache_path), tid, Path(archive))
+            self._record_library_ios_completion(tid, name=game_name, ipa_path=out_ipa, archive_path=archive)
         return ok, msg
 
-    def _record_library_ios_completion(self, title_id: str | None = None, name: str = '') -> None:
-        """The built game in the library, with the files the build was started with (RunInputs), not the page's."""
+    def _record_library_ios_completion(self, title_id: str | None = None, name: str = '', *,
+                                       ipa_path: str | None = None, archive_path: str | None = None) -> None:
+        """The built game in the library, with the files the build was started with (RunInputs) and the outputs the run
+        made (`ipa_path`, `archive_path`), not the page's: a library game opened during the build changes those."""
         r = self._run_inputs()
+        if ipa_path is None:
+            ipa_path = self.ipa_path
+        if archive_path is None:
+            archive_path = self.archive_path
+        if not title_id and re.fullmatch(r'[0-9A-Fa-f]{16}', r.tid_hex or ''):
+            title_id = r.tid_hex.upper()     # the run's game, not one guessed from a folder name
         inputs_map: dict[str, list[str]] = {}
         if r.base:
             inputs_map['base'] = [r.base]
@@ -3252,8 +3298,8 @@ class Model(QObject, DeviceMixin, QueueMixin):
         if r.keys:
             inputs_map['keys'] = [r.keys]
         g = self.library.record_completed_ios(
-            ipa_path=self.ipa_path,
-            archive_path=self.archive_path,
+            ipa_path=ipa_path,
+            archive_path=archive_path,
             base_path=r.base,
             output_dir=r.out_dir,
             inputs=inputs_map,

@@ -221,9 +221,10 @@ class QueueMixin:
 
     @property
     def can_queue(self) -> bool:
-        """The game chosen on the page can be queued (a build may run meanwhile)."""
+        """The game chosen on the page can be queued (a build may run meanwhile). Not while the queue has loaded one
+        of its own games on the page: that game would be queued again, and its rows emptied during its build."""
         inputs_ready = self.game_folder is not None or (bool(self.base_path) and bool(self.keys_path))
-        return self.repo_ok and inputs_ready and not self.game_folder_problem
+        return self.repo_ok and inputs_ready and not self.game_folder_problem and not self.queue_drives_inputs()
 
     def current_queue_item(self) -> QueueItem | None:
         """The game chosen on the page as a queue item, None when nothing is chosen."""
@@ -332,7 +333,7 @@ class QueueMixin:
         nothing of the queue runs any more."""
         self.queue_running = False
         if not self._queue_current:
-            self._queue_release()
+            self._queue_end()      # between two games: what was built still goes onto the device
         emit_safely(self.queueChanged)
 
     # ---------------------------------------------------------------- the page's own choices
@@ -451,4 +452,22 @@ class QueueMixin:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(1500, self._queue_next)       # after the window has taken in this build's end
         else:
-            self._queue_release()                           # stopped: the game that was building is done now
+            # stopped: the game that was building is done now. The games built so far still go onto the device, as the
+            # queue told them (audit 2, D5)
+            self._queue_end()
+
+    def _queue_build_refused(self, note: str) -> None:
+        """start_build did not start the queued game, and `finished` will not say so (another run goes on, or the page
+        had nothing to build): the game failed, and the queue goes on (audit 2, D2: it waited for that game for good)."""
+        item = next((i for i in self.queue if i.id == self._queue_current), None)
+        if item is None or item.state != 'running':
+            return
+        self._queue_current = ''
+        item.state, item.note, item.seconds = 'failed', note or self.t('queue.notStarted'), 0.0
+        self._queue_save()
+        if not self.queue_running:
+            self._queue_end()
+        elif not self.running:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1500, self._queue_next)
+        # else: the run going on ends with `finished`, and _queue_on_finished starts the next game then
