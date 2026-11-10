@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -367,6 +368,9 @@ def install(root: Path, udid: str, *, data: list[tuple[str, Path]] | None = None
         if step:
             stage('win.install.stage.sign', 'running', step, last_pct[0])
     r = signer.sign_and_install(app, dev.device_id, log=sign_log, exe=exe, started=started, progress=on_progress)
+    # The signed copy carries the provisioning profile Apple made for this Apple ID and device. It is on the device now
+    # (or the signing failed); the next install assembles a new one. The export removes its own stage the same way.
+    shutil.rmtree(app.parent, ignore_errors=True)
     if not r.ok and cancelled():
         # Stop ends the signing tool (device_model.cancel_install): its exit is the stop, not a failure to explain.
         # A stop that came after the tool finished keeps its install: the app is on the device, so it is remembered

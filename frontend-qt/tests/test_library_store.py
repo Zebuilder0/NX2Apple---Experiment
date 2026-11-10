@@ -175,12 +175,14 @@ class BannerDownloadTests(unittest.TestCase):
         self.urls: list[str] = []
         self.reads: list[int] = []
 
-    def fetch(self, body: bytes, status: int = 200, tid: str = TID) -> None:
+    def fetch(self, body: bytes, status: int = 200, tid: str = TID, final_url: str | None = None) -> None:
         test = self
 
         class Resp:
             def __init__(self) -> None:
                 self.status = status
+                if final_url is not None:
+                    self.url = final_url        # where urllib ended up after the redirects
 
             def read(self, n: int = -1) -> bytes:
                 test.reads.append(n)
@@ -226,6 +228,16 @@ class BannerDownloadTests(unittest.TestCase):
         jpg_tid = '0400E88025B1A000'
         self.fetch(b'\xff\xd8\xff\xe0' + b'J' * 4096, tid=jpg_tid)
         self.assertEqual(self.store.image_path(jpg_tid), str(self.store.banners_dir / f'{jpg_tid}.jpg'))
+
+    def test_a_redirect_to_another_host_or_to_http_is_not_saved(self) -> None:
+        """Audit 2, P12: only the first link was checked; urllib follows a redirect anywhere."""
+        png = b'\x89PNG\r\n\x1a\n' + b'P' * 4096
+        for final in ('https://example.com/banner.png', 'http://img-eshop.cdn.nintendo.net/i/a.png'):
+            with self.subTest(final):
+                self.fetch(png, final_url=final)
+                self.assertEqual(self.saved(), [])
+        self.fetch(png, final_url='https://img-eshop.cdn.nintendo.net/i/b.png')   # to an image host: kept
+        self.assertEqual(self.saved(), [f'{self.TID}.png'])
 
     def test_a_tiny_image_is_not_saved(self) -> None:
         self.fetch(b'\x89PNG\r\n\x1a\n' + b'P' * 100)

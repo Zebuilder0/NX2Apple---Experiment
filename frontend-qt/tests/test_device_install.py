@@ -519,6 +519,8 @@ class InstallEndToEnd(DeviceTestCase):
         finally:
             signer.sign_and_install = orig
         self.assertTrue(out.ok, out)
+        # audit 2, P9: the signed copy (with its provisioning profile) is not left behind
+        self.assertFalse(se.install_stage(self.root).parent.exists())
         self.assertEqual(out.message[0], 'win.install.firstTime')   # trust the Apple ID, Developer Mode
         self.assertEqual(self.dev.revealed, 1)                       # its switch is shown, as Xcode does
         self.assertEqual(out.bundle_id, SHELL_ID)

@@ -1252,6 +1252,11 @@ class ArtworkStore:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'NX2Apple/1.1'})
             with urllib.request.urlopen(req, timeout=15) as resp:
+                # urllib follows redirects to any host and from https to http: the address the picture came from
+                # must pass the same rule as the link
+                final = getattr(resp, 'url', None)
+                if isinstance(final, str) and final and not self._allowed(final):
+                    return
                 status = getattr(resp, 'status', 200)
                 data = resp.read(self.MAX_BANNER_BYTES + 1)   # one byte over the limit tells a larger body apart
         except Exception:
