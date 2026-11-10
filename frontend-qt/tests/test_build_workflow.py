@@ -59,6 +59,16 @@ class BuildWorkflowTests(unittest.TestCase):
         self.assertIn('cp ../../artifacts/plumesign/plumesign.exe NX2Apple/tools/', wf)
         self.assertIn('Usage: plumesign', wf)
 
+    def test_the_windows_artifact_is_the_zip_itself_not_a_zip_in_a_zip(self) -> None:
+        """GitHub zips an artifact for its download unless it is uploaded with archive: false: the app's zip came as a zip
+        inside a zip. The zip goes up as it is (the artifact then takes the file's name, NX2Apple-windows-x64.zip)."""
+        build = _job(_workflow(), 'build')
+        steps = re.findall(r'(?ms)^      - uses: actions/upload-artifact@\S+[^\n]*\n(.*?)(?=^      - |\Z)', build)
+        upload = [s for s in steps if 'path: frontend-qt/NX2Apple-windows-x64.zip' in s]
+        self.assertEqual(len(upload), 1, steps)
+        self.assertRegex(upload[0], r'(?m)^          archive: false\b')
+        self.assertNotRegex(upload[0], r'(?m)^          name:')     # ignored with archive: false, the file's name is used
+
     def test_the_build_needs_the_shell_template(self) -> None:
         self.assertRegex(_job(_workflow(), 'build'), r'(?m)^    needs: \[[^\]]*\bshell-template\b[^\]]*\]')
 
