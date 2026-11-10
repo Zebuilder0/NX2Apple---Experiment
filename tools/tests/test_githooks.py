@@ -358,6 +358,25 @@ class ClaudeGuard(unittest.TestCase):
         self.assertTrue(blocked('cat <<EOF | bash\ngit commit --no-verify -m x\nEOF'))
         self.assertTrue(blocked("cat > f <<'EOF'\ntext\nEOF\ngit push origin main"))   # the command after the heredoc
 
+    def test_only_a_text_reader_makes_a_heredoc_text(self):
+        """A heredoc's body is text only for cat, tee and git commit -F, with nothing that runs it downstream. Upstream's
+        guard blocked each of these; the first heredoc rule let them through (wrappers, source, a substitution in
+        command position)."""
+        for c in ('env bash <<EOF\ngit commit --no-verify -m x\nEOF',
+                  'sudo bash <<EOF\ngit commit -n -m x\nEOF',
+                  'sudo -E env X=1 bash <<EOF\ngit commit -n -m x\nEOF',
+                  'cat <<EOF | env bash\ngit push origin HEAD:main\nEOF',
+                  'source /dev/stdin <<EOF\ngit commit --no-verify\nEOF',
+                  '. /dev/stdin <<EOF\ngit commit --no-verify\nEOF',
+                  'bash -c "$(cat <<\'EOF\'\ngit commit --no-verify\nEOF\n)"',
+                  "$(cat <<'EOF'\ngit commit --no-verify\nEOF\n)",
+                  'python3 - <<EOF\ngit commit --no-verify\nEOF'):
+            self.assertTrue(blocked(c), c)
+        for c in ("git commit -m \"$(cat <<'EOF'\nGuard: block --no-verify and git push origin main\nEOF\n)\"",
+                  "cat <<'EOF' | git commit -F -\nexplains -n and --no-verify\nEOF",
+                  'cat <<EOF | tee a.txt\ngit commit --no-verify\nEOF'):
+            self.assertFalse(blocked(c), c)
+
     def run_guard(self, payload):
         return subprocess.run([sys.executable, str(TOOLS / 'claude_guard.py')], input=payload, capture_output=True, text=True)
 

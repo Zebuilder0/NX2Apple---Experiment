@@ -2,7 +2,7 @@
 """Claude Code PreToolUse hook for the Bash tool (.claude/settings.json). Reads the call as JSON on stdin and exits 2, with the reason
 on stderr, for a `git push` to main or master, for `--no-verify` on `git commit` and `git push`, and for anything else that turns
 the hooks off: `git -c core.hooksPath=<other>` on a commit or push, and `git config core.hooksPath <other>` or its --unset. Exit 0
-lets the call go on. The body of a heredoc is text (a file being written, a commit message), not commands, unless a shell reads it.
+lets the call go on. The body of a heredoc is text only when a text reader takes it (cat, tee, git commit -F): see heredoc_is_text.
 """
 import json
 import os
@@ -21,7 +21,8 @@ HOOKS_DIR = '.githooks'
 COMMIT_VALUE_SHORT = set('mFCctuS')
 COMMIT_VALUE_LONG = ('--message', '--file', '--reuse-message', '--reedit-message', '--fixup', '--squash', '--author', '--date',
                      '--template', '--cleanup', '--trailer', '--pathspec-from-file', '--gpg-sign')
-PIPE_TO_SHELL = re.compile(r'\|\s*(?:sudo\s+)?(?:\S*/)?(?:sh|bash|zsh)\b')
+# Commands that only copy a heredoc's text somewhere (a file, a pipe). Anything else that reads one may run it.
+TEXT_READERS = ('cat', 'tee')
 HEREDOC = re.compile(r"""<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2""")
 
 NO_PR = 'Patches and code go through a PR: push a branch and open a pull request. Nothing is pushed to main or master directly.'
@@ -29,9 +30,57 @@ NO_VERIFY = 'The pre-commit and pre-push hooks stay on. Fix what they report ins
 NO_HOOKS_PATH = 'The hooks stay on: core.hooksPath stays .githooks (AGENTS.md). Fix what the hooks report instead of turning them off.'
 
 
+def _command_words(text):
+    """The words of one simple command with its wrappers (sudo, env, ...), their options and VAR=value assignments left
+    out: `sudo -E env X=1 bash` is `bash`."""
+    try:
+        words = shlex.split(text, posix=True)
+    except ValueError:              # an unbalanced quote: the part before a command substitution
+        words = text.split()
+    i = 0
+    while i < len(words) and (words[i] in WRAPPERS or re.fullmatch(r'\w+=.*', words[i])):
+        i += 1
+        while i < len(words) and words[i].startswith('-'):
+            i += 1
+    return words[i:]
+
+
+def _commit_message_from_file(words):
+    """`git commit -F -` and the like: git reads the message, it runs nothing."""
+    return (len(words) > 1 and os.path.basename(words[0]) == 'git' and 'commit' in words
+            and any(w in ('-F', '--file') or w.startswith(('-F', '--file=')) for w in words))
+
+
+def heredoc_is_text(before, after):
+    """Whether a heredoc's body is only text: a file being written (`cat > f <<EOF`, `tee`), a commit message
+    (`git commit -F - <<EOF`, `git commit -m "$(cat <<'EOF'`). Conservative: any other reader (a shell, with or without
+    sudo or env, source or `.`, eval, python, ...) may run it, and so may whatever the text is piped into; then the body
+    is kept and checked like the rest of the command."""
+    seg = re.split(r'\|\||&&|[;&|]', before)[-1]          # the simple command the heredoc belongs to
+    if '$(' in seg or '`' in seg:
+        # in a command substitution: its command reads the text, and what it prints is an argument of the outer command
+        inner = _command_words(re.split(r'\$\(|`', seg)[-1])
+        outer = _command_words(re.split(r'\$\(|`', seg)[0])
+        if not inner or os.path.basename(inner[0]) not in TEXT_READERS:
+            return False
+        # in command position (no outer command) the shell runs what the substitution prints; a shell, source or eval
+        # outside runs it too
+        if not outer or os.path.basename(outer[0]) in SHELLS + ('source', '.', 'eval'):
+            return False
+    else:
+        words = _command_words(seg)
+        if not words or (os.path.basename(words[0]) not in TEXT_READERS and not _commit_message_from_file(words)):
+            return False
+    for down in re.split(r'\|(?!\|)', after)[1:]:        # where the reader's output goes
+        dw = _command_words(down)
+        if dw and os.path.basename(dw[0]) not in TEXT_READERS and not _commit_message_from_file(dw):
+            return False
+    return True
+
+
 def without_heredocs(command):
-    """The command line without the bodies of its heredocs, which are text, not commands: a file being written, a commit
-    message. A heredoc fed to a shell (bash <<EOF) is kept, since the shell runs it."""
+    """The command line without the bodies of its heredocs that are only text (heredoc_is_text): a file being written, a
+    commit message. Any other heredoc is kept: a shell or another program may run it."""
     lines, out, pending = command.split('\n'), [], []
     for line in lines:
         if pending:
@@ -43,10 +92,7 @@ def without_heredocs(command):
             continue
         out.append(line)
         for m in HEREDOC.finditer(line):
-            head = line[:m.start()].split('|')[-1].split()
-            # a shell reads the body: `bash <<EOF`, or `cat <<EOF | bash`
-            runs = (bool(head) and os.path.basename(head[0]) in SHELLS) or bool(PIPE_TO_SHELL.search(line[m.end():]))
-            pending.append((m.group(1) == '-', m.group(3), runs))
+            pending.append((m.group(1) == '-', m.group(3), not heredoc_is_text(line[:m.start()], line[m.end():])))
     return '\n'.join(out)
 
 
