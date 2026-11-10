@@ -149,7 +149,7 @@ def py(*args, env=None, capture=True) -> str:
 #: file to either line, silently missing it here would produce a link error or a subtly
 #: incomplete host.
 WANT_SRC = ('SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m '
-            'haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S')
+            'haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S')
 WANT_GFX = ('GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S '
             '../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))')
 _GFX_PATS = ('../gfx/*.c', '../gfx/nvn/*.c', '../gfx/nvn/*.m', '../gfx/nvn/*.S',
@@ -178,7 +178,7 @@ def host_sources(repo: Path, game_h_dir: Path) -> tuple[list[Path], list[Path]]:
                 f'frontend-qt/nspb_qt/win/build_app.py to match')
 
     src = [host / n for n in 'main.c loader.c hle.c crash.c probe.c thread.c save_sync.c '
-                            'memstat.m haptics_apple.m'.split()]
+                            'memstat.m haptics_apple.m pad_switch2_apple.m'.split()]
     src += sorted(host.glob('hle_*.c'), key=lambda p: p.name)
     src += [host / 'front_mac.m', host / 'controllers_mac.m', host / 'web_apple.m', host / 'entry.S']
     gfx: list[Path] = []
@@ -384,23 +384,26 @@ _HOST_MAIN: Path | None = None
 
 # ---------------------------------------------------------------- link
 
-def _run_linker(args: list[str], objs: list[Path], env: dict) -> subprocess.CompletedProcess:
-    """Run the link `args` with the objects in a file list (ld64's -filelist, one path per line, which lld reads), not
-    on the command line: Windows starts no program whose command line is longer than 32,767 characters, and the
-    engine's 267 objects under a long build folder ("D:\\...\\3rd Party\\Snipperclips\\<id>_build\\...") stopped the
-    link with "[WinError 206] The filename or extension is too long". -Xlinker keeps a comma in the list's own path
-    from splitting it. The list is removed afterwards."""
-    fd, filelist = tempfile.mkstemp(prefix='nspb-link-', suffix='.filelist')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
-            f.writelines(f'{o}\n' for o in objs)
-        return subprocess.run([*args, '-Xlinker', '-filelist', '-Xlinker', filelist],
-                              capture_output=True, text=True, errors='replace', env=env)
-    finally:
-        try:
-            os.unlink(filelist)
-        except OSError:
-            pass
+# CreateProcess takes at most 32767 characters of command line. A link names every object file by
+# its full path, so a long work folder goes over it: WinError 206. Past this size the arguments go
+# into a response file, which clang reads with `@file`.
+MAX_COMMAND_LINE = 24000
+
+
+def response_file_args(args: list[str], rsp: Path, limit: int = MAX_COMMAND_LINE) -> list[str]:
+    """Return `args` as they are, or the program plus `@rsp` when the command line is too long.
+
+    Each argument is double-quoted and written with forward slashes, which both the GNU and the
+    Windows response file readers of clang take the same way.
+    """
+    if sum(len(a) + 1 for a in args) <= limit:
+        return args
+    lines = []
+    for a in args[1:]:
+        a = a.replace('\\', '/').replace('"', '\\"')
+        lines.append(f'"{a}"')
+    rsp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return [args[0], f'@{rsp.as_posix()}']
 
 
 def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: Path,
@@ -409,7 +412,7 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     """Link the app, then prove the result is an arm64 iOS executable and sign its entitlements."""
     entitle = os.environ.get('NSPB_ENTITLEMENTS', '1') != '0'
     args = [str(clang), '-target', f'arm64-apple-ios{deployment}', '-isysroot', str(sdk),
-            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out),
+            '-fuse-ld=lld', '-fobjc-arc', '-o', str(out), *map(str, objs),
             '-Wl,-rpath,@executable_path/Frameworks', '-lobjc', '-lSystem',
             *(('-Wl,-adhoc_codesign',) if entitle else ()),
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
@@ -418,7 +421,8 @@ def link(clang: Path, sdk: Path, objs: list[Path], frameworks: list[str], out: P
     env = dict(os.environ)
     env['PATH'] = str(lld_dir) + os.pathsep + env.get('PATH', '')
     t(f'link: {len(objs)} objects, {len(frameworks)} frameworks (ld64.lld)')
-    r = _run_linker(args, objs, env)
+    args = response_file_args(args, (objs[0].parent if objs else Path(tempfile.gettempdir())) / f'{out.name}.link.rsp')
+    r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('link failed (see the linker output above)')
@@ -455,7 +459,7 @@ def link_framework(clang: Path, sdk: Path, objs: list[Path], frameworks: list[st
             '-fuse-ld=lld', '-dynamiclib',
             f'-Wl,-install_name,@rpath/{fw_name}.framework/{fw_name}',
             '-Wl,-rpath,@executable_path/Frameworks',
-            '-fobjc-arc', '-o', str(out),
+            '-fobjc-arc', '-o', str(out), *map(str, objs),
             '-lobjc', '-lSystem', '-Wl,-adhoc_codesign',
             *[x for fw in frameworks for x in ('-framework', fw)], *embed_flags]
     if rt_obj:
@@ -463,7 +467,8 @@ def link_framework(clang: Path, sdk: Path, objs: list[Path], frameworks: list[st
     env = dict(os.environ)
     env['PATH'] = str(lld_dir) + os.pathsep + env.get('PATH', '')
     t(f'link framework: {len(objs)} objects, {len(frameworks)} frameworks (ld64.lld)')
-    r = _run_linker(args, objs, env)
+    args = response_file_args(args, (objs[0].parent if objs else Path(tempfile.gettempdir())) / f'{out.name}.link.rsp')
+    r = subprocess.run(args, capture_output=True, text=True, errors='replace', env=env)
     if r.returncode:
         print((r.stderr or r.stdout)[-6000:], file=sys.stderr)
         die('framework link failed (see the linker output above)')

@@ -1,11 +1,12 @@
-"""The Windows link of the app and of a game's framework (win/build_app.py link, link_framework): the objects go to the
-linker in a file list, and the framework's source list follows the engine's project-framework.yml. No compiler and no
-SDK: the commands are checked, not run."""
+"""The Windows link of the app and of a game's framework (win/build_app.py link, link_framework): a long command line
+goes through the response file, and the framework's source list follows the engine's project-framework.yml. No
+compiler and no SDK: the commands are checked, not run."""
 from __future__ import annotations
 
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,37 +19,41 @@ sys.path.insert(0, str(QT))
 
 from nspb_qt.win import build_app  # noqa: E402
 
-# 267 objects under a long build folder passed Windows' 32,767-character limit (WinError 206, a Snipperclips build)
-FOLDER = 'D:\\Local-Switch\\Switch Games\\3rd Party\\Snipperclips\\0100704000B3A000_build\\build\\ios\\win\\obj_fw'
-OBJS = [Path(f'{FOLDER}\\module_{i:03}_with_a_long_name-0123456789abcdef.o') for i in range(267)]
+class LinksGoThroughTheResponseFile(unittest.TestCase):
+    """Both links (the app's and a game framework's) name the engine's 267 objects by their full paths: under a long work
+    folder that passes Windows' 32,767-character limit (WinError 206, a Snipperclips build, upstream #870). Upstream's
+    response_file_args (test_link_response_file.py) moves them into an @file; this checks that each link uses it."""
 
-
-class ObjectsInAFileList(unittest.TestCase):
     def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name, 'Local-Switch', 'Switch Games', '3rd Party', 'Snipperclips - Cut it out, together',
+                      '0100704000B3A000_build', 'build', 'ios', 'win', 'obj_fw')
+        folder.mkdir(parents=True)
+        self.objs = [folder / f'module_{i:03}_with_a_long_name-0123456789abcdef.o' for i in range(267)]
+        self.assertGreater(len(subprocess.list2cmdline([str(o) for o in self.objs])), 32767)   # the case it fixes
         self.seen: dict = {}
 
     def run_linker(self, args, **kw):
-        self.seen['args'] = args
-        fl = args[args.index('-filelist') + 2]
-        self.seen['list'] = Path(fl).read_text(encoding='utf-8')
-        self.seen['path'] = fl
+        self.seen['args'] = list(args)
+        rsp = Path(args[-1][1:])
+        self.seen['rsp'] = rsp.read_text(encoding='utf-8').splitlines()
         return mock.Mock(returncode=0, stdout='', stderr='')
 
     def check(self):
         args = self.seen['args']
-        self.assertEqual(args[args.index('-filelist') - 1], '-Xlinker')
-        self.assertEqual(args[args.index('-filelist') + 1], '-Xlinker')
-        self.assertEqual(self.seen['list'].splitlines(), [str(o) for o in OBJS])
-        self.assertFalse(any(str(o) in args for o in OBJS))
-        self.assertLess(len(subprocess.list2cmdline(args)), 2000)
-        self.assertFalse(Path(self.seen['path']).exists())       # removed after the link
+        self.assertEqual(len(args), 2)
+        self.assertTrue(args[1].startswith('@'))
+        self.assertLess(len(subprocess.list2cmdline(args)), 32767)
+        listed = set(self.seen['rsp'])
+        for o in self.objs:
+            self.assertIn(f'"{o.as_posix()}"', listed)
 
     def test_the_app_link(self):
-        self.assertGreater(len(subprocess.list2cmdline([str(o) for o in OBJS])), 32767)   # the case it fixes
         with mock.patch.object(build_app.subprocess, 'run', side_effect=self.run_linker), \
                 mock.patch.object(build_app, 'check_executable'), \
                 mock.patch.object(build_app.macho_sign, 'sign', return_value=0):
-            build_app.link(Path('clang'), Path('sdk'), OBJS, ['UIKit'], Path('out/DmIOS'), '26.0', [], None,
+            build_app.link(Path('clang'), Path('sdk'), self.objs, ['UIKit'], Path('out/DmIOS'), '26.0', [], None,
                            Path('lld'))
         self.check()
 
@@ -56,18 +61,10 @@ class ObjectsInAFileList(unittest.TestCase):
         with mock.patch.object(build_app.subprocess, 'run', side_effect=self.run_linker), \
                 mock.patch.object(build_app, 'check_dylib'), \
                 mock.patch.object(build_app.macho_sign, 'sign', return_value=0):
-            build_app.link_framework(Path('clang'), Path('sdk'), OBJS, ['UIKit'], Path('out/DmGameX'), 'DmGameX',
+            build_app.link_framework(Path('clang'), Path('sdk'), self.objs, ['UIKit'], Path('out/DmGameX'), 'DmGameX',
                                      '26.0', [], None, Path('lld'))
         self.check()
-        self.assertIn('-dynamiclib', self.seen['args'])
-
-    def test_a_failed_link_removes_its_list_too(self):
-        def boom(args, **kw):
-            self.seen['path'] = args[args.index('-filelist') + 2]
-            raise OSError('no clang')
-        with mock.patch.object(build_app.subprocess, 'run', side_effect=boom), self.assertRaises(OSError):
-            build_app.link(Path('clang'), Path('sdk'), OBJS, [], Path('out/DmIOS'), '26.0', [], None, Path('lld'))
-        self.assertFalse(Path(self.seen['path']).exists())
+        self.assertIn('"-dynamiclib"', self.seen['rsp'])
 
 
 @unittest.skipUnless((ENGINE / 'dm' / 'ios' / 'project-framework.yml').is_file(),
