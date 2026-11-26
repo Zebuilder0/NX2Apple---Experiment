@@ -16,7 +16,10 @@ let package = Package(
         .testTarget(name: "NXCoreTests", dependencies: ["NXCore"]),
         // Tests of the stores: they link NXModel and NXCore, never SwiftUI.
         .testTarget(name: "NXModelTests", dependencies: ["NXModel", "NXCore"]),
-        .testTarget(name: "NX2AppleTests", dependencies: ["NX2Apple", "NXLauncher", "NXModel", "NXCore"])
+        .testTarget(name: "NX2AppleTests", dependencies: ["NX2Apple", "NXLauncher", "NXModel", "NXCore"]),
+        // NX2Apple Resigner (frontend/resigner/ARCHITECTURE.md): the same layers. ResignerCore imports Foundation and NXCore only.
+        .target(name: "ResignerCore", dependencies: ["NXCore"], path: "Sources/ResignerCore"),
+        .testTarget(name: "ResignerCoreTests", dependencies: ["ResignerCore", "NXCore"], resources: [.copy("Fixtures")])
     ],
     swiftLanguageModes: [.v5]
 )

@@ -1,0 +1,16 @@
+{
+  "result": {
+    "devices": [
+      {
+        "identifier": "8E5F6071-1111-2222-3333-444455556666",
+        "properties": {
+          "connection": {"pairingState": "paired", "transportType": "localNetwork", "tunnelState": "connected"},
+          "hardware": {"deviceType": "iPad", "marketingName": "iPad Air 11-inch (M3)", "platform": "iOS", "productType": "iPad15,3",
+                       "reality": "physical", "udid": "00008122-000E1F2A3B4C5D6E"},
+          "software": {"osVersionNumber": {"stringValue": "26.2", "major": 26, "minor": 2}},
+          "state": {"name": "Air", "developerModeStatus": "enabled", "ddiServicesAvailable": false, "bootState": "booted"}
+        }
+      }
+    ]
+  }
+}

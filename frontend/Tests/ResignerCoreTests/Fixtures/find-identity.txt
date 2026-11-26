@@ -1,0 +1,10 @@
+Policy: Code Signing
+  Matching identities
+  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Jane Appleseed (ABCDE12345)"
+  2) 89ABCDEF0123456789ABCDEF0123456789ABCDEF "Apple Development: Jane Appleseed (ABCDE12345)" (CSSMERR_TP_CERT_EXPIRED)
+  3) FEDCBA9876543210FEDCBA9876543210FEDCBA98 "iPhone Distribution: Example Ltd (TEAM654321)" (CSSMERR_TP_NOT_TRUSTED)
+     3 identities found
+
+  Valid identities only
+  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Jane Appleseed (ABCDE12345)"
+     1 valid identities found

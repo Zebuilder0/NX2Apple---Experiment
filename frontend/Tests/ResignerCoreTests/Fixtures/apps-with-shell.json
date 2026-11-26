@@ -1,0 +1,4 @@
+{"result": {"apps": [
+  {"bundleIdentifier": "com.apple.mobilesafari", "name": "Safari", "removable": false},
+  {"bundleIdentifier": "org.nxnative.shell", "name": "NX2Apple", "bundleVersion": "1.0", "version": "1.0", "removable": true}
+]}}
