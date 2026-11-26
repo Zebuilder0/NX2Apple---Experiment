@@ -56,6 +56,19 @@ package struct ResignRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// What a run reports while it works, and how it is asked to stop. The store hands these to the pipeline.
+package struct PipelineHooks {
+    package var log: (String) -> Void
+    package var step: (ResignStep, StepState, LocalText?) -> Void
+    package var cancelled: () -> Bool
+    package var processStarted: (RunningProcess) -> Void
+
+    package init(log: @escaping (String) -> Void = { _ in }, step: @escaping (ResignStep, StepState, LocalText?) -> Void = { _, _, _ in },
+                 cancelled: @escaping () -> Bool = { false }, processStarted: @escaping (RunningProcess) -> Void = { _ in }) {
+        self.log = log; self.step = step; self.cancelled = cancelled; self.processStarted = processStarted
+    }
+}
+
 /// The re-sign, start to end, blocking (the store runs it off the main thread). Each step reports itself, a tool's output goes to
 /// `log`, and a failing step ends the run with a `ResignFailure` that says why in the user's terms. The pipeline never uninstalls
 /// and never changes the bundle ID: see frontend/resigner/ARCHITECTURE.md, "Data on the device".
@@ -75,6 +88,13 @@ package struct ResignPipeline {
 
     package init(runner: ProcessRunner = SystemProcessRunner(), home: String = NSHomeDirectory(), fm: FileManager = .default) {
         self.runner = runner; self.home = home; self.fm = fm
+    }
+
+    /// The run with the store's hooks.
+    package func run(_ request: ResignRequest, hooks: PipelineHooks) -> ResignOutcome {
+        var p = self
+        p.log = hooks.log; p.step = hooks.step; p.cancelled = hooks.cancelled; p.processStarted = hooks.processStarted
+        return p.run(request)
     }
 
     var probe: EnvironmentProbe {

@@ -19,7 +19,11 @@ let package = Package(
         .testTarget(name: "NX2AppleTests", dependencies: ["NX2Apple", "NXLauncher", "NXModel", "NXCore"]),
         // NX2Apple Resigner (frontend/resigner/ARCHITECTURE.md): the same layers. ResignerCore imports Foundation and NXCore only.
         .target(name: "ResignerCore", dependencies: ["NXCore"], path: "Sources/ResignerCore"),
-        .testTarget(name: "ResignerCoreTests", dependencies: ["ResignerCore", "NXCore"], resources: [.copy("Fixtures")])
+        .target(name: "ResignerModel", dependencies: ["ResignerCore", "NXModel", "NXCore"], path: "Sources/ResignerModel"),
+        .executableTarget(name: "NX2AppleResigner", dependencies: ["ResignerModel", "ResignerCore", "NXLauncher", "NXModel", "NXCore"],
+                          path: "Sources/NX2AppleResigner"),
+        .testTarget(name: "ResignerCoreTests", dependencies: ["ResignerCore", "NXCore"], resources: [.copy("Fixtures")]),
+        .testTarget(name: "ResignerModelTests", dependencies: ["ResignerModel", "ResignerCore", "NXModel", "NXCore"])
     ],
     swiftLanguageModes: [.v5]
 )
