@@ -44,7 +44,7 @@ swift run --package-path frontend/resigner/app
 Without a checkout at hand, the **build resigner** workflow in the repository's Actions (Run workflow, on your branch) builds the same
 app on GitHub's Mac and attaches it to the run as `NX2Apple-Resigner-macOS-arm64`.
 
-The tests run with the launcher's: `cd frontend && swift test` (the `ResignerCoreTests` and `ResignerModelTests` targets).
+The tests run with the launcher's: `cd frontend && swift test` (the `ResignerCoreTests`, `ResignerModelTests` and `ResignerUITests` targets).
 
 ## Use it
 
@@ -102,13 +102,15 @@ worked. It was not verified on a device for this app (see below).
 
 Tested:
 
-- `ResignerCoreTests`, 94 tests, on Linux (Swift 6.2, NXCore without its Darwin-only files) and on the repository's macOS CI (Xcode 27.2):
+- `ResignerCoreTests`, 96 tests, on Linux (Swift 6.2, NXCore without its Darwin-only files) and on the repository's macOS CI (Xcode 27.2):
   every case of the dependency check (Xcode missing, installed, outdated, the Command Line Tools selected, no license, no first launch,
   no iOS platform, no xcrun, no codesign, no identity, an invalid, revoked, untrusted or expired one, a certificate without its key,
   no profile, an expired one, one for another device, team or bundle ID, the Increased Memory Limit, no device, an untrusted, a
   disconnected or an old one, NX2Apple missing on the device or under another bundle ID, no shell folder, a broken project), and the
   whole run against a scripted stand-in for Apple's tools (both ways to sign, every stop, every install failure, the checks after it).
 - `ResignerModelTests` on macOS CI: the settings, the check, Stop, the two questions, the record of the last renewal, the export.
+- `ResignerUITests` on macOS CI: every page drawn in a hidden window before the first check, with a blocking row, after the Increased
+  Memory Limit question and after a renewal, and in all seven languages (a page missing an environment object would crash there).
 - The package builds in release mode on macOS CI, and the app bundle is built by the **build resigner** workflow.
 
 Not tested, because neither a Mac with your Apple ID nor a device was available when this was written:
