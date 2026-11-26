@@ -11,8 +11,8 @@ func onMain(_ body: @escaping @MainActor () -> Void) {
 /// The Resigner's choices, kept in its own defaults. The first time, the shell folder, the device and the team come from the
 /// launcher's settings (`org.nxnative.NSPortBuilder`), which are only read, never written.
 @MainActor package final class ResignerSettings: ObservableObject {
-    package static let launcherDomain = "org.nxnative.NSPortBuilder"
-    package static let configurations = ["Release", "Debug"]
+    nonisolated package static let launcherDomain = "org.nxnative.NSPortBuilder"
+    nonisolated package static let configurations = ["Release", "Debug"]
 
     enum Key {
         static let route = "route", shellRoot = "shellRoot", developerDir = "developerDir", configuration = "configuration"
