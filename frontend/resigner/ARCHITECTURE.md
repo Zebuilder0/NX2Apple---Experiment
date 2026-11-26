@@ -69,13 +69,18 @@ Nothing in NXCore, NXModel or NXLauncher changes. The launcher builds and behave
 
 ### Layers
 
-Three targets, the same rules as the launcher's (`frontend/ARCHITECTURE.md`):
+Three targets in the frontend package, the same rules as the launcher's (`frontend/ARCHITECTURE.md`), and an executable of its own:
 
 | Target | Holds | May import |
 |---|---|---|
 | `ResignerCore` | pure logic and services: the checks, the parsers, the matcher, the signing and install pipeline, the redaction | Foundation, NXCore |
 | `ResignerModel` | `@MainActor` stores | Foundation, Combine, NXCore, NXModel, ResignerCore |
-| `NX2AppleResigner` (app) | entry point, wiring, views, the `.p12` import (Security framework), the panels | all, NXLauncher for the styles |
+| `ResignerUI` (library) | the app: wiring, views, the `.p12` import (Security framework), the panels. Its one public name is `ResignerMain.run()` | all but NX2Apple, NXLauncher for the styles |
+| `NX2AppleResigner` (package `frontend/resigner/app`) | `@main`, which calls `ResignerMain.run()` | ResignerUI |
+
+Why the executable is a package of its own: a second executable in the frontend package would make a plain `swift run` there fail
+("multiple executable products"), and `frontend/README.md`, `Onboarding.md` and `Console.md` start the launcher that way. In the
+frontend package the Resigner still reaches the launcher's `package` types, which another package could not.
 
 `ResignerCore` imports no SwiftUI, AppKit or Combine, and most of it builds on Linux too, which is how its tests were first run.
 `ResignerModelTests` has a test that reads the imports, as `LayerImportsTests` does for the launcher.
@@ -128,7 +133,9 @@ the developer folder) is a button that asks for an administrator's password thro
 - The log is redacted as it is written: the home folder, the user name, email addresses, device UDIDs (all but the last four characters)
   and certificate holders' names. The diagnostics export is that log plus the dependency rows. It holds no key, certificate, profile
   or password.
-- Temporary folders are made with `FileManager.url(for: .itemReplacementDirectory, ...)` and removed when the run ends, failed or not.
+- The profile route's copy and the trial signature's file are in folders of their own (mode 0700) in the user's temporary folder, named
+  with a UUID, and removed when the run ends, failed or not. The Xcode route signs the launcher's own build in place, as the launcher's
+  Re-sign does, and writes nothing else.
 
 ## Limits
 

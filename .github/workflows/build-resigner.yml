@@ -1,0 +1,50 @@
+# NX2Apple Resigner (frontend/resigner/README.md): the macOS app built from a branch, as an artifact (NX2Apple-Resigner-macOS-arm64).
+# It runs only when started by hand (Actions → build resigner → Run workflow), so it is never a check of a pull request and nothing
+# is published. The Resigner's tests run in tests.yml with the rest of the Mac package (swift test in frontend/). The app is signed
+# ad hoc: on another Mac it opens with right-click, Open the first time.
+name: build resigner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: NX2Apple Resigner (macOS app)
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      # The toolchain tests.yml names: its actool compiles frontend/AppIcon.icon
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the app
+        run: frontend/tools/build_resigner.sh "$RUNNER_TEMP/resigner"
+      - name: Check the bundle
+        run: |
+          APP="$RUNNER_TEMP/resigner/NX2Apple Resigner.app"
+          codesign --verify --deep --strict "$APP"
+          test -x "$APP/Contents/MacOS/NX2AppleResigner"
+          test -f "$APP/Contents/Resources/l10n/en.json" && test -f "$APP/Contents/Resources/l10n/zh.json"
+          plutil -p "$APP/Contents/Info.plist"
+          # The Resigner links no engine and no game: nothing of either is in the bundle. An if, because bash -e ignores a failing !
+          if find "$APP" \( -name '*.nsp' -o -name '*.xci' -o -name 'prod.keys' -o -name 'romfs.img' \) | grep -q .; then
+            echo "::error::the Resigner bundle holds game files"; exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: NX2Apple-Resigner-macOS-arm64
+          path: ${{ runner.temp }}/resigner/NX2Apple-Resigner-macOS-arm64.zip
+          retention-days: 14

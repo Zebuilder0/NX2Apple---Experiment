@@ -39,9 +39,7 @@ struct SettingsPage: View {
     private var signingGroup: some View {
         CardGroup(loc.t("resigner.ui.settings.signing"), footnote: importNote ?? "") {
             CardRow(loc.t("resigner.ui.settings.route"), detail: routeNote) {
-                LauncherSegmented(options: SigningRoute.allCases.map { (value: $0.rawValue, label: $0.title(loc)) }, selection: settings.route.rawValue) {
-                    settings.route = SigningRoute(rawValue: $0) ?? .automatic
-                }
+                LauncherSegmented(options: routeOptions, selection: settings.route.rawValue) { settings.route = SigningRoute(rawValue: $0) ?? .automatic }
                 .frame(width: 300)
             }
             CardDivider()
@@ -61,6 +59,14 @@ struct SettingsPage: View {
                 Button(loc.t("resigner.ui.settings.p12Choose")) { chooseP12() }
             }
         }
+    }
+
+    private var routeOptions: [(value: String, label: String)] {
+        SigningRoute.allCases.map { route -> (value: String, label: String) in (value: route.rawValue, label: route.title(loc)) }
+    }
+
+    private var configurationOptions: [(value: String, label: String)] {
+        ResignerSettings.configurations.map { name -> (value: String, label: String) in (value: name, label: name) }
     }
 
     private var routeNote: String {
@@ -178,9 +184,7 @@ struct SettingsPage: View {
             }
             CardDivider()
             CardRow(loc.t("resigner.ui.settings.configuration"), detail: loc.t("resigner.ui.settings.configurationNote")) {
-                LauncherSegmented(options: ResignerSettings.configurations.map { (value: $0, label: $0) }, selection: settings.configuration) {
-                    settings.configuration = $0
-                }
+                LauncherSegmented(options: configurationOptions, selection: settings.configuration) { settings.configuration = $0 }
                 .frame(width: 184)
             }
         }

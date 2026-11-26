@@ -89,3 +89,10 @@ The app is `NX2Apple.app`, and the target, the sources folder and the tests carr
 - `CFBundleIdentifier` `org.nxnative.NSPortBuilder`. The settings in UserDefaults belong to it, and the updater rejects a bundle with another identifier.
 - `CFBundleExecutable` `NSPortBuilder`. The build copies `.build/release/NX2Apple` to `Contents/MacOS/NSPortBuilder`.
 - The data folder `~/Library/Application Support/NS Port Builder/` with the venv, the artwork and `library.json`.
+
+## The Resigner
+
+NX2Apple Resigner is a second app in this package: `ResignerCore`, `ResignerModel` and the `ResignerUI` library, with the same import
+rules, and an executable in `frontend/resigner/app` so that NX2Apple stays the package's only executable. It reuses NXCore's shell,
+device and signing tools and NXLauncher's styles, and changes nothing of the launcher. [resigner/ARCHITECTURE.md](resigner/ARCHITECTURE.md)
+has its layers and decisions.

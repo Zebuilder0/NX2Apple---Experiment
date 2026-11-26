@@ -70,67 +70,83 @@ struct HeroCard: View {
 
     private var canStart: Bool { resign.canStart && environment.facts != nil && blockers.isEmpty && !environment.checking }
 
+    // The body is cut into small pieces: as one expression it is more than the type checker takes in reasonable time.
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .center, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 10) {
-                        Circle().fill(dotColor).frame(width: 10, height: 10)
-                        Text(headline).font(.manrope(26, .bold)).tracking(-0.6).fixedSize(horizontal: false, vertical: true)
-                    }
-                    if !subline.isEmpty { Text(subline).font(.manrope(14)).foregroundStyle(.secondary) }
-                    Text(String(format: loc.t("resigner.ui.hero.route"), (environment.facts?.resolvedRoute ?? settings.route).title(loc)))
-                        .font(.manrope(12.5)).foregroundStyle(.secondary)
-                }
+                status
                 Spacer(minLength: 12)
-                VStack(alignment: .trailing, spacing: 10) {
-                    if resign.running {
-                        Button { resign.stop() } label: { Label(loc.t("resigner.ui.stop"), systemImage: "stop.fill") }
-                            .buttonStyle(LauncherSecondaryButtonStyle(accent: LauncherPalette.danger))
-                            .disabled(!resign.canStop)
-                            .help(resign.canStop ? loc.t("resigner.ui.stopHelp") : loc.t("resigner.ui.stopInstalling"))
-                    } else {
-                        Button { resign.start() } label: {
-                            LauncherHeroActionLabel(title: loc.t("resigner.ui.resign"), symbol: "signature")
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canStart)
-                        .opacity(canStart ? 1 : 0.45)
-                        .keyboardShortcut(.return, modifiers: .command)
-                        .help(canStart ? loc.t("resigner.ui.resignHelp") : loc.t("resigner.ui.resignBlocked"))
-                        .accessibilityLabel(loc.t("resigner.ui.resign"))
-                    }
-                }
+                action
             }
-            if resign.running {
-                LauncherProgressBar(value: resign.progress, height: 8)
-            }
-            if !resign.running, resign.outcome?.ok != true, !blockers.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(blockers.prefix(3)) { item in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(item.status.color).font(.system(size: 12))
-                            Text(item.name.resolve(loc.t) + ": " + item.explanation.resolve(loc.t)).font(.manrope(13))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Button(loc.t("resigner.ui.openDiagnostics")) { open(.diagnostics) }.buttonStyle(LauncherSecondaryButtonStyle())
-                }
-            }
-            if let outcome = resign.outcome, outcome.ok {
-                ForEach(Array((outcome.notes + droppedNotes(outcome)).enumerated()), id: \.offset) { _, note in
-                    Label(note.resolve(loc.t), systemImage: "info.circle").font(.manrope(12.5)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if outcome.firstInstall {
-                    Label(loc.t("resigner.ui.trustDeveloper"), systemImage: "hand.raised").font(.manrope(12.5)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+            if resign.running { LauncherProgressBar(value: resign.progress, height: 8) }
+            if !resign.running, resign.outcome?.ok != true, !blockers.isEmpty { blockerList }
+            if let outcome = resign.outcome, outcome.ok { notes(outcome) }
         }
         .padding(24)
         .background(LauncherPalette.surface.opacity(0.75), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Color.white.opacity(0.06)))
+    }
+
+    private var routeLine: String {
+        let route: SigningRoute = environment.facts?.resolvedRoute ?? settings.route
+        return String(format: loc.t("resigner.ui.hero.route"), route.title(loc))
+    }
+
+    private var status: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Circle().fill(dotColor).frame(width: 10, height: 10)
+                Text(headline).font(.manrope(26, .bold)).tracking(-0.6).fixedSize(horizontal: false, vertical: true)
+            }
+            if !subline.isEmpty { Text(subline).font(.manrope(14)).foregroundStyle(.secondary) }
+            Text(routeLine).font(.manrope(12.5)).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var action: some View {
+        if resign.running { stopButton } else { resignButton }
+    }
+
+    private var stopButton: some View {
+        let help: String = resign.canStop ? loc.t("resigner.ui.stopHelp") : loc.t("resigner.ui.stopInstalling")
+        return Button { resign.stop() } label: { Label(loc.t("resigner.ui.stop"), systemImage: "stop.fill") }
+            .buttonStyle(LauncherSecondaryButtonStyle(accent: LauncherPalette.danger))
+            .disabled(!resign.canStop)
+            .help(help)
+    }
+
+    private var resignButton: some View {
+        let ready: Bool = canStart
+        let title: String = loc.t("resigner.ui.resign")
+        let help: String = ready ? loc.t("resigner.ui.resignHelp") : loc.t("resigner.ui.resignBlocked")
+        return Button { resign.start() } label: { LauncherHeroActionLabel(title: title, symbol: "signature") }
+            .buttonStyle(.plain)
+            .disabled(!ready)
+            .opacity(ready ? 1 : 0.45)
+            .keyboardShortcut(.return, modifiers: .command)
+            .help(help)
+            .accessibilityLabel(title)
+    }
+
+    private var blockerList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(blockers.prefix(3))) { item in BlockerLine(item: item) }
+            Button(loc.t("resigner.ui.openDiagnostics")) { open(.diagnostics) }.buttonStyle(LauncherSecondaryButtonStyle())
+        }
+    }
+
+    private func notes(_ outcome: ResignOutcome) -> some View {
+        let lines: [String] = (outcome.notes + droppedNotes(outcome)).map { $0.resolve(loc.t) }
+        return VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                Label(line, systemImage: "info.circle").font(.manrope(12.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if outcome.firstInstall {
+                Label(loc.t("resigner.ui.trustDeveloper"), systemImage: "hand.raised").font(.manrope(12.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func droppedNotes(_ outcome: ResignOutcome) -> [LocalText] {
@@ -141,6 +157,20 @@ struct HeroCard: View {
         if resign.running { return LauncherPalette.building }
         if let outcome = resign.outcome { return outcome.ok ? LauncherPalette.ready : LauncherPalette.danger }
         return blockers.isEmpty && environment.facts != nil ? LauncherPalette.ready : LauncherPalette.building
+    }
+}
+
+/// One thing that stops a re-sign, under the hero's status.
+struct BlockerLine: View {
+    let item: DependencyItem
+    @EnvironmentObject var loc: Localizer
+
+    var body: some View {
+        let text: String = item.name.resolve(loc.t) + ": " + item.explanation.resolve(loc.t)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(item.status.color).font(.system(size: 12))
+            Text(text).font(.manrope(13)).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
@@ -215,52 +245,68 @@ struct DeviceCard: View {
     @ObservedObject var environment: EnvironmentStore
     @EnvironmentObject var loc: Localizer
 
+    private var device: DeviceStatus? { environment.facts?.device }
+
     var body: some View {
-        let facts = environment.facts
-        let device = facts?.device
         CardGroup(loc.t("resigner.ui.device.title")) {
-            CardRow(loc.t("resigner.ui.device.name"), detail: device.map { [$0.model, $0.deviceType].filter { !$0.isEmpty }.joined(separator: " · ") } ?? loc.t("resigner.dep.device.none"),
-                    dot: device == nil ? LauncherPalette.danger : LauncherPalette.ready) {
-                LauncherDropdown(options: deviceOptions(facts), selection: settings.device, label: loc.t("resigner.ui.device.name")) { settings.device = $0 }
-                    .disabled((facts?.devices ?? []).isEmpty)
+            CardRow(loc.t("resigner.ui.device.name"), detail: summary, dot: device == nil ? LauncherPalette.danger : LauncherPalette.ready) {
+                LauncherDropdown(options: options, selection: settings.device, label: loc.t("resigner.ui.device.name")) { settings.device = $0 }
+                    .disabled((environment.facts?.devices ?? []).isEmpty)
             }
-            if let device {
-                CardDivider()
-                CardRow(loc.t("resigner.ui.device.os"), detail: device.osVersion.isEmpty ? "-" : device.osVersion) { EmptyView() }
-                CardDivider()
-                CardRow(loc.t("resigner.ui.device.connection"), detail: connection(device), dot: device.connected ? LauncherPalette.ready : LauncherPalette.danger) { EmptyView() }
-                CardDivider()
-                CardRow(loc.t("resigner.ui.device.trust"), detail: loc.t(device.paired ? "resigner.ui.device.trusted" : "resigner.ui.device.untrusted"),
-                        dot: device.paired ? LauncherPalette.ready : LauncherPalette.danger) { EmptyView() }
-                CardDivider()
-                CardRow(loc.t("resigner.ui.device.developerMode"), detail: developerMode(device),
-                        dot: device.developerMode == false ? LauncherPalette.danger : (device.developerMode == true ? LauncherPalette.ready : LauncherPalette.unbuilt)) { EmptyView() }
-                if let installed = environment.items.first(where: { $0.id == "device.installed" }) {
-                    CardDivider()
-                    CardRow(loc.t("resigner.ui.device.installed"), detail: installed.explanation.resolve(loc.t), detail2: installed.version, dot: installed.status.color) { EmptyView() }
-                }
-            }
+            if let device { DeviceDetailRows(device: device, installed: environment.items.first { $0.id == "device.installed" }) }
         }
     }
 
-    private func deviceOptions(_ facts: EnvironmentFacts?) -> [(value: String, label: String)] {
-        let devices = facts?.devices ?? []
-        var options = devices.map { (value: $0.udid, label: $0.name) }
-        if options.isEmpty { options = [(value: settings.device, label: loc.t("resigner.ui.device.noneShort"))] }
-        return options
+    private var summary: String {
+        guard let device else { return loc.t("resigner.dep.device.none") }
+        return [device.model, device.deviceType].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
-    private func connection(_ device: DeviceStatus) -> String {
+    private var options: [(value: String, label: String)] {
+        let devices: [DeviceStatus] = environment.facts?.devices ?? []
+        if devices.isEmpty { return [(value: settings.device, label: loc.t("resigner.ui.device.noneShort"))] }
+        return devices.map { (value: $0.udid, label: $0.name) }
+    }
+}
+
+/// The rows of a found device: system, connection, trust, Developer Mode and NX2Apple on it.
+struct DeviceDetailRows: View {
+    let device: DeviceStatus
+    let installed: DependencyItem?
+    @EnvironmentObject var loc: Localizer
+
+    private func good(_ ok: Bool) -> Color { ok ? LauncherPalette.ready : LauncherPalette.danger }
+
+    private var connection: String {
         if device.wired { return loc.t("resigner.ui.device.cable") }
         if device.connected { return loc.t("resigner.ui.device.network") }
         return loc.t("resigner.ui.device.notConnected")
     }
 
-    private func developerMode(_ device: DeviceStatus) -> String {
+    private var developerMode: (text: String, dot: Color) {
         switch device.developerMode {
-        case true?: return loc.t("resigner.ui.device.on")
-        case false?: return loc.t("resigner.ui.device.off")
-        case nil: return loc.t("resigner.ui.device.unknown")
+        case true?: return (loc.t("resigner.ui.device.on"), LauncherPalette.ready)
+        case false?: return (loc.t("resigner.ui.device.off"), LauncherPalette.danger)
+        case nil: return (loc.t("resigner.ui.device.unknown"), LauncherPalette.unbuilt)
+        }
+    }
+
+    private var trust: String { loc.t(device.paired ? "resigner.ui.device.trusted" : "resigner.ui.device.untrusted") }
+
+    var body: some View {
+        let mode = developerMode
+        CardDivider()
+        CardRow(loc.t("resigner.ui.device.os"), detail: device.osVersion.isEmpty ? "-" : device.osVersion) { EmptyView() }
+        CardDivider()
+        CardRow(loc.t("resigner.ui.device.connection"), detail: connection, dot: good(device.connected)) { EmptyView() }
+        CardDivider()
+        CardRow(loc.t("resigner.ui.device.trust"), detail: trust, dot: good(device.paired)) { EmptyView() }
+        CardDivider()
+        CardRow(loc.t("resigner.ui.device.developerMode"), detail: mode.text, dot: mode.dot) { EmptyView() }
+        if let installed {
+            CardDivider()
+            CardRow(loc.t("resigner.ui.device.installed"), detail: installed.explanation.resolve(loc.t), detail2: installed.version,
+                    dot: installed.status.color) { EmptyView() }
         }
     }
 }
@@ -310,12 +356,24 @@ struct DependenciesSummaryCard: View {
     let open: (ResignerPage) -> Void
     @EnvironmentObject var loc: Localizer
 
+    private var title: String {
+        String(format: loc.t("resigner.ui.deps.summary"), String(environment.okCount), String(environment.items.count))
+    }
+
+    private var checked: String {
+        guard let date = environment.lastChecked else { return loc.t("resigner.ui.checking") }
+        return String(format: loc.t("resigner.ui.deps.checkedAt"), date.shownMoment)
+    }
+
+    private var dot: Color {
+        if environment.items.isEmpty { return LauncherPalette.unbuilt }
+        if !environment.blockers.isEmpty { return LauncherPalette.danger }
+        return environment.problems.isEmpty ? LauncherPalette.ready : LauncherPalette.building
+    }
+
     var body: some View {
         CardGroup(loc.t("resigner.ui.deps.title")) {
-            let problems = environment.problems.count
-            CardRow(String(format: loc.t("resigner.ui.deps.summary"), String(environment.okCount), String(environment.items.count)),
-                    detail: environment.lastChecked.map { String(format: loc.t("resigner.ui.deps.checkedAt"), $0.shownMoment) } ?? loc.t("resigner.ui.checking"),
-                    dot: environment.items.isEmpty ? LauncherPalette.unbuilt : (environment.blockers.isEmpty ? (problems == 0 ? LauncherPalette.ready : LauncherPalette.building) : LauncherPalette.danger)) {
+            CardRow(title, detail: checked, dot: dot) {
                 HStack(spacing: 10) {
                     Button(loc.t("resigner.action.recheck")) { environment.check() }.disabled(environment.checking)
                     Button(loc.t("resigner.ui.openDiagnostics")) { open(.diagnostics) }

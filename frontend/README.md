@@ -338,6 +338,10 @@ That copy shares settings and Application Support with an installed NX2Apple. Th
 
 SwiftUI, macOS 13+.
 
+NX2Apple Resigner, which renews the signature of NX2Apple on an iPhone or iPad without any game file, is a second app in this
+package. It is built with `frontend/tools/build_resigner.sh`, and a plain `swift run` here still starts the launcher.
+[resigner/README.md](resigner/README.md) has the rest.
+
 ### Why the dependency check does not use `which`
 
 A GUI app does not inherit the shell's PATH. On a machine where a terminal sees

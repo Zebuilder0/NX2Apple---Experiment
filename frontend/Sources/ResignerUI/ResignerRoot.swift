@@ -120,7 +120,7 @@ struct RunIndicator: View {
 
 // MARK: Shared pieces
 
-extension DependencyStatus {
+extension DependencyState {
     var color: Color {
         switch self {
         case .ok: return LauncherPalette.ready
@@ -168,7 +168,7 @@ extension SigningRoute {
 
 /// A small coloured capsule with the status's word.
 struct StatusChip: View {
-    let status: DependencyStatus
+    let status: DependencyState
     @EnvironmentObject var loc: Localizer
 
     var body: some View {
@@ -181,7 +181,7 @@ struct StatusChip: View {
 
 /// What a row's button does, for the actions the app itself carries out (links, Finder, pages). Tools go through the store.
 @MainActor
-func perform(_ action: RemediationAction, row: String, environment: EnvironmentStore, open: (ResignerPage) -> Void) {
+func runRemediation(_ action: RemediationAction, row: String, environment: EnvironmentStore, open: (ResignerPage) -> Void) {
     switch action {
     case .openURL(let link): if let url = URL(string: link) { NSWorkspace.shared.open(url) }
     case .openApp(let path): NSWorkspace.shared.open(URL(fileURLWithPath: path))

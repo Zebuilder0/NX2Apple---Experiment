@@ -1,7 +1,7 @@
 import Foundation
 import NXCore
 
-package enum DependencyStatus: String, Equatable, Sendable, CaseIterable {
+package enum DependencyState: String, Equatable, Sendable, CaseIterable {
     /// Installed and working.
     case ok
     /// Installed but set up wrong.
@@ -48,14 +48,14 @@ package struct DependencyItem: Equatable, Sendable, Identifiable {
     package var name: LocalText
     /// What was found, as found ("27.2 (17C50)", a path, a certificate's name). Not translated.
     package var version: String
-    package var status: DependencyStatus
+    package var status: DependencyState
     package var explanation: LocalText
     package var remediation: LocalText?
     package var actions: [RemediationButton]
     /// A problem here stops a re-sign on the route in use.
     package var blocking: Bool
 
-    package init(id: String, category: DependencyCategory, name: LocalText, version: String = "", status: DependencyStatus,
+    package init(id: String, category: DependencyCategory, name: LocalText, version: String = "", status: DependencyState,
                  explanation: LocalText, remediation: LocalText? = nil, actions: [RemediationButton] = [], blocking: Bool = true) {
         self.id = id; self.category = category; self.name = name; self.version = version; self.status = status
         self.explanation = explanation; self.remediation = remediation; self.actions = actions; self.blocking = blocking
@@ -448,7 +448,7 @@ package enum DependencyEvaluator {
         let minimum = f.shell.app?.minimumOS ?? ""
         let issues = DeviceReadiness.issues(device, minimumOS: minimum)
         if let first = issues.first(where: \.blocking) {
-            let status: DependencyStatus = { switch first { case .osTooOld: return .outdated
+            let status: DependencyState = { switch first { case .osTooOld: return .outdated
                                                             case .notConnected: return .missing
                                                             default: return .needsAction } }()
             rows.append(DependencyItem(id: "device.selected", category: .device, name: name, version: label, status: status,
@@ -551,7 +551,7 @@ package enum DependencyEvaluator {
                                   explanation: LocalText(project.derivedDataExists ? "resigner.dep.project.ok" : "resigner.dep.project.noDerived"),
                                   blocking: xcodeRoute)
         }
-        let status: DependencyStatus = project.exists ? .misconfigured : .missing
+        let status: DependencyState = project.exists ? .misconfigured : .missing
         let explanation: LocalText
         if !project.exists { explanation = LocalText("resigner.dep.project.missing") }
         else if !project.brokenLinks.isEmpty { explanation = LocalText("resigner.dep.project.links", project.brokenLinks.joined(separator: ", ")) }

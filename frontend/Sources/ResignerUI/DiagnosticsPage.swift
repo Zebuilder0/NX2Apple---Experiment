@@ -40,13 +40,18 @@ struct DiagnosticsPage: View {
                     CardGroup(category.title(loc)) {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, item in
                             if index > 0 { CardDivider() }
-                            DependencyRowView(item: item, busy: environment.fixing == item.id || (item.id == "signing.test" && environment.testing),
-                                              act: { action in perform(action, row: item.id, environment: environment, open: open) })
+                            DependencyRowView(item: item, busy: busy(item),
+                                              act: { action in runRemediation(action, row: item.id, environment: environment, open: open) })
                         }
                     }
                 }
             }
         }
+    }
+
+    private func busy(_ item: DependencyItem) -> Bool {
+        if environment.fixing == item.id { return true }
+        return item.id == "signing.test" && environment.testing
     }
 }
 
@@ -76,7 +81,7 @@ struct DependencyRowView: View {
                 if item.status.isProblem, let fix = item.remediation {
                     Text(fix.resolve(loc.t)).font(.manrope(12.5)).foregroundStyle(Color.white.opacity(0.85)).fixedSize(horizontal: false, vertical: true)
                 }
-                if !item.actions.isEmpty && (item.status.isProblem || item.status == .notChecked || item.actions.contains { $0.action == .testSign }) {
+                if showsActions {
                     HStack(spacing: 8) {
                         ForEach(Array(item.actions.enumerated()), id: \.offset) { _, button in
                             Button(button.label.resolve(loc.t)) { act(button.action) }
@@ -93,6 +98,13 @@ struct DependencyRowView: View {
         }
         .padding(.horizontal, 18).padding(.vertical, 13)
         .frame(minHeight: 52)
+    }
+
+    /// The buttons show for a problem, a row not checked yet, and the trial signature, which can always run again.
+    private var showsActions: Bool {
+        guard !item.actions.isEmpty else { return false }
+        if item.status.isProblem || item.status == .notChecked { return true }
+        return item.actions.contains(where: { $0.action == .testSign })
     }
 
     private func help(_ action: RemediationAction) -> String {

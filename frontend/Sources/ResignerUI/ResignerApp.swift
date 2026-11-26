@@ -6,9 +6,15 @@ import NXLauncher
 import ResignerCore
 import ResignerModel
 
+/// The Resigner's one public name: the executable (frontend/resigner/app, a package of its own) calls it. The app lives in this library
+/// of the frontend package so it reaches the launcher's `package` types, while the frontend package keeps a single executable and a
+/// plain `swift run` there still starts the launcher.
+public enum ResignerMain {
+    @MainActor public static func run() { NX2AppleResignerApp.main() }
+}
+
 /// NX2Apple Resigner: renews the signature of the NX2Apple shell the launcher built and installs it over the copy on an iPhone or
 /// iPad (frontend/resigner/README.md). It shares the launcher's code and look and is a separate app.
-@main
 struct NX2AppleResignerApp: App {
     @NSApplicationDelegateAdaptor private var delegate: ResignerAppDelegate
     @StateObject private var stores = ResignerStores()
