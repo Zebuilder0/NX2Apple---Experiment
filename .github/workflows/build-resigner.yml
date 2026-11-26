@@ -1,10 +1,19 @@
 # NX2Apple Resigner (frontend/resigner/README.md): the macOS app built from a branch, as an artifact (NX2Apple-Resigner-macOS-arm64).
-# It runs only when started by hand (Actions → build resigner → Run workflow), so it is never a check of a pull request and nothing
-# is published. The Resigner's tests run in tests.yml with the rest of the Mac package (swift test in frontend/). The app is signed
-# ad hoc: on another Mac it opens with right-click, Open the first time.
+# It runs when a push changes the Resigner's own files, and when started by hand (Actions → build resigner → Run workflow, which GitHub
+# offers once this file is on the default branch). It is not a required check and nothing is published, so a push that does not touch
+# the Resigner skipping it holds nothing up. The Resigner's tests run in tests.yml with the rest of the Mac package (swift test in
+# frontend/). The app is signed ad hoc: on another Mac it opens with right-click, Open the first time.
 name: build resigner
 
 on:
+  push:
+    paths:
+      - 'frontend/resigner/**'
+      - 'frontend/Sources/ResignerCore/**'
+      - 'frontend/Sources/ResignerModel/**'
+      - 'frontend/Sources/ResignerUI/**'
+      - 'frontend/tools/build_resigner.sh'
+      - '.github/workflows/build-resigner.yml'
   workflow_dispatch:
 
 permissions:
