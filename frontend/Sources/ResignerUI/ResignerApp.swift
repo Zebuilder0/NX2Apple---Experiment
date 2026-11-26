@@ -51,12 +51,18 @@ final class ResignerStores: ObservableObject {
     let resign: ResignStore
     let padFocus = PadFocus()
 
-    init(defaults: UserDefaults = .standard) {
+    /// `read` and `perform` are the real probe and pipeline by default. The render tests pass stand-ins, so no tool runs.
+    init(defaults: UserDefaults = .standard, launcher: UserDefaults? = UserDefaults(suiteName: ResignerSettings.launcherDomain),
+         read: ((ProbeRequest) -> EnvironmentFacts)? = nil, perform: ((ResignRequest, PipelineHooks) -> ResignOutcome)? = nil) {
         loc = Localizer()
-        settings = ResignerSettings(defaults: defaults)
+        settings = ResignerSettings(defaults: defaults, launcher: launcher)
         log = ResignLog()
-        environment = EnvironmentStore(settings: settings)
-        resign = ResignStore(settings: settings, environment: environment, log: log, defaults: defaults)
+        environment = EnvironmentStore(settings: settings, read: read)
+        if let perform {
+            resign = ResignStore(settings: settings, environment: environment, log: log, defaults: defaults, perform: perform)
+        } else {
+            resign = ResignStore(settings: settings, environment: environment, log: log, defaults: defaults)
+        }
         let log = log
         environment.log = { line in onMainQueue { log.append(line) } }
     }

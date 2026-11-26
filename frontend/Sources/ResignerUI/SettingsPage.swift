@@ -88,7 +88,7 @@ struct SettingsPage: View {
 
     private var certificateOptions: [(value: String, label: String)] {
         let certificates = (facts?.certificates ?? []).filter { settings.team.isEmpty || $0.team == settings.team }
-        return [(value: "", label: loc.t("resigner.ui.settings.newestCertificate"))] + certificates.map { c in
+        return [(value: "", label: loc.t("resigner.ui.settings.newestCertificate"))] + certificates.map { c -> (value: String, label: String) in
             var label = c.commonName
             if let until = c.notAfter { label += " · " + until.shownDay }
             if !c.hasPrivateKey { label += " · " + loc.t("resigner.ui.settings.noKey") }

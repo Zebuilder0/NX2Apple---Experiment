@@ -30,7 +30,9 @@ let package = Package(
         .target(name: "ResignerUI", dependencies: ["ResignerModel", "ResignerCore", "NXLauncher", "NXModel", "NXCore"],
                 path: "Sources/ResignerUI"),
         .testTarget(name: "ResignerCoreTests", dependencies: ["ResignerCore", "NXCore"], resources: [.copy("Fixtures")]),
-        .testTarget(name: "ResignerModelTests", dependencies: ["ResignerModel", "ResignerCore", "NXModel", "NXCore"])
+        .testTarget(name: "ResignerModelTests", dependencies: ["ResignerModel", "ResignerCore", "NXModel", "NXCore"]),
+        // Every page drawn offscreen in every state, with made-up facts: a missing environment object crashes there, not at a user's
+        .testTarget(name: "ResignerUITests", dependencies: ["ResignerUI", "ResignerModel", "ResignerCore", "NXLauncher", "NXModel", "NXCore"])
     ],
     swiftLanguageModes: [.v5]
 )
