@@ -234,6 +234,26 @@ final class ResignPipelineTests: XCTestCase {
         XCTAssertEqual(outcome.notes.map(\.key), ["resigner.note.strict"])
     }
 
+    func testAGameLostWhileSigningStopsTheInstall() {
+        let game = mac.appPath + "/Frameworks/DmGame\(TestMac.titleID).framework"
+        mac.runner.on("xcodebuild -project", out: "** BUILD SUCCEEDED **", action: { _ in try? FileManager.default.removeItem(atPath: game) })
+        let outcome = resign(.xcode)
+        XCTAssertEqual(outcome.failure?.message.key, "resigner.fail.gamesChanged")
+        XCTAssertTrue(commands(containing: "install app").isEmpty, "the device keeps the app with its game")
+    }
+
+    func testAGameTheProjectAddsIsKept() {
+        let added = mac.appPath + "/Frameworks/DmGame0100000000020000.framework"
+        mac.runner.on("xcodebuild -project", out: "** BUILD SUCCEEDED **", action: { [mac] _ in
+            mac!.write(added + "/game.manifest.json", #"{"title_id": "0100000000020000", "name": "Second", "framework_executable": "DmGame0100000000020000"}"#)
+            mac!.write(added + "/DmGame0100000000020000", "binary")
+        })
+        let outcome = resign(.xcode)
+        XCTAssertTrue(outcome.ok, "\(String(describing: outcome.failure))")
+        XCTAssertEqual(outcome.games, 2)
+        XCTAssertTrue(log.contains("DmGame0100000000020000.framework is new in the signed app"))
+    }
+
     func testTheSignedAppHasAnotherApplicationIdentifier() {
         mac.runner.on("--entitlements - --xml", out: mac.plist(["application-identifier": "OTHER12345." + TestMac.bundleID]))
         XCTAssertEqual(resign(.xcode).failure?.message.key, "resigner.fail.appIdentifier")

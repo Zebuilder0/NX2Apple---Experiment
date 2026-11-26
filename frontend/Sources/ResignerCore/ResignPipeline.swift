@@ -393,9 +393,15 @@ package struct ResignPipeline {
         }
         guard let built = ShellInspector.readApp(app, fm: fm) else { return fail("resigner.dep.app.missing", app) }
         if built.bundleID != f.targetBundleID { return fail("resigner.dep.app.bundle", "", built.bundleID, f.targetBundleID) }
-        if built.games.map(\.framework).sorted() != r.gamesBefore {
-            return fail("resigner.fail.gamesChanged", "", String(r.gamesBefore.count), String(built.games.count))
+        // A game the app had and lost would be gone from the device. One the launcher's project adds (a game added since the last
+        // install) is what the project holds now, and is kept.
+        let after = Set(built.games.map(\.framework))
+        let lost = Set(r.gamesBefore).subtracting(after)
+        if !lost.isEmpty {
+            return fail("resigner.fail.gamesChanged", lost.sorted().joined(separator: ", "), String(r.gamesBefore.count), String(after.count))
         }
+        for added in after.subtracting(r.gamesBefore).sorted() { log("verify: \(added) is new in the signed app (the launcher's project has it)\n") }
+        r.outcome.games = after.count
         let signed = probe.entitlements(ofApp: app, tools: tools)
         let expectedID = f.selectedTeam + "." + f.targetBundleID
         guard case .string(let appID)? = signed["application-identifier"], appID == expectedID else {
